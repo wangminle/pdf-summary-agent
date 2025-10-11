@@ -278,6 +278,36 @@ class DrawItem:
     orient: str  # 'H' | 'V' | 'O'
 
 
+# --- Caption candidate structures (for smart caption detection) ---
+@dataclass
+class CaptionCandidate:
+    """表示一个 caption 候选项（可能是真实图注，也可能是正文引用）"""
+    rect: fitz.Rect          # 文本行的边界框
+    text: str                # 完整文本内容
+    number: str              # 提取的编号（如 '1', '2', 'S1'）
+    kind: str                # 'figure' | 'table'
+    page: int                # 页码（0-based）
+    block_idx: int           # 所在 block 索引
+    line_idx: int            # 在 block 中的 line 索引
+    spans: List[Dict]        # spans 信息（字体、flags 等）
+    block: Dict              # 所在 block 的完整信息
+    score: float = 0.0       # 评分（越高越可能是真实图注）
+    
+    def __repr__(self):
+        return f"CaptionCandidate({self.kind} {self.number}, page={self.page}, score={self.score:.1f}, y={self.rect.y0:.1f})"
+
+
+@dataclass
+class CaptionIndex:
+    """全文 caption 索引，记录每个编号的所有出现位置"""
+    candidates: Dict[str, List[CaptionCandidate]]  # key: 'figure_1' | 'table_2'
+    
+    def get_candidates(self, kind: str, number: str) -> List[CaptionCandidate]:
+        """获取指定编号的所有候选项"""
+        key = f"{kind}_{number}"
+        return self.candidates.get(key, [])
+
+
 def collect_draw_items(page: "fitz.Page") -> List[DrawItem]:
     """Collect simplified drawing items (lines/rects/paths) as oriented boxes.
     Orientation by aspect ratio of bbox: H (wide), V (tall), O (other).
@@ -423,6 +453,212 @@ def _trim_clip_head_by_text(
         new_bottom = max(new_bottom, clip.y1 - max(min_h, max_trim_ratio * base_h))
         if new_bottom - new_top >= min_h:
             clip.y1 = new_bottom
+    # Clamp to page
+    clip = fitz.Rect(clip.x0, max(page_rect.y0, clip.y0), clip.x1, min(page_rect.y1, clip.y1))
+    return clip
+
+
+def _trim_clip_head_by_text_v2(
+    clip: fitz.Rect,
+    page_rect: fitz.Rect,
+    caption_rect: fitz.Rect,
+    direction: str,
+    text_lines: List[Tuple[fitz.Rect, float, str]],
+    *,
+    width_ratio: float = 0.5,
+    font_min: float = 7.0,
+    font_max: float = 16.0,
+    gap: float = 6.0,
+    adjacent_th: float = 24.0,
+    far_text_th: float = 300.0,
+    far_text_para_min_ratio: float = 0.30,
+    far_text_trim_mode: str = "aggressive",
+) -> fitz.Rect:
+    """
+    Enhanced dual-threshold text trimming.
+    
+    Phase A: Trim adjacent text (<adjacent_th, default 24pt) using original logic
+    Phase B: Detect and remove far-distance text blocks (adjacent_th ~ far_text_th)
+    
+    Args:
+        far_text_th: Maximum distance to detect far text (default 300pt)
+        far_text_para_min_ratio: Minimum paragraph coverage ratio to trigger far-text trim (default 0.30)
+        far_text_trim_mode: 'aggressive' (remove all far paragraphs) or 'conservative' (only if continuous)
+    """
+    if clip.height <= 1 or clip.width <= 1:
+        return clip
+    
+    # Save original clip for far-text detection
+    original_clip = fitz.Rect(clip)
+    
+    # === Phase A: Apply original adjacent-text trim ===
+    clip = _trim_clip_head_by_text(
+        clip, page_rect, caption_rect, direction, text_lines,
+        width_ratio=width_ratio, font_min=font_min, font_max=font_max,
+        gap=gap, adjacent_th=adjacent_th
+    )
+    
+    # === Phase B: Detect and trim far-distance text ===
+    near_is_top = (direction == 'below')
+    
+    # Collect far-distance paragraph lines (use ORIGINAL clip, not Phase A result)
+    far_para_lines: List[Tuple[fitz.Rect, float, str]] = []
+    for (lb, size_est, text) in text_lines:
+        if not text.strip():
+            continue
+        # Must overlap horizontally with ORIGINAL clip
+        inter = lb & original_clip
+        if inter.width <= 0 or inter.height <= 0:
+            continue
+        # Filter by paragraph heuristics
+        width_ok = (inter.width / max(1.0, original_clip.width)) >= width_ratio
+        size_ok = (font_min <= size_est <= font_max)
+        if not (width_ok and size_ok):
+            continue
+        
+        # Distance to caption (far-distance range: adjacent_th ~ far_text_th)
+        if near_is_top:
+            dist = caption_rect.y0 - lb.y1
+        else:
+            dist = lb.y0 - caption_rect.y1
+        
+        # Must be in far-distance range
+        if adjacent_th < dist <= far_text_th:
+            # Also check if line is in the near-side region (use ORIGINAL clip)
+            if near_is_top:
+                top_thresh = original_clip.y0 + max(40.0, 0.5 * original_clip.height)
+                if lb.y1 <= top_thresh:
+                    far_para_lines.append((lb, size_est, text))
+            else:
+                bot_thresh = original_clip.y1 - max(40.0, 0.5 * original_clip.height)
+                if lb.y0 >= bot_thresh:
+                    far_para_lines.append((lb, size_est, text))
+    
+    # (Near-side far-text detection completed)
+    
+    # Phase B trimming (near-side far text)
+    if far_para_lines and para_coverage_ratio >= far_text_para_min_ratio:
+        pass  # Will be handled below
+    
+    # === Phase C: Detect and trim far-side large paragraphs ===
+    far_is_top = not near_is_top  # Opposite side from caption
+    far_side_para_lines: List[Tuple[fitz.Rect, float, str]] = []
+    
+    for (lb, size_est, text) in text_lines:
+        if not text.strip():
+            continue
+        # Must overlap horizontally with ORIGINAL clip
+        inter = lb & original_clip
+        if inter.width <= 0 or inter.height <= 0:
+            continue
+        # Filter by paragraph heuristics
+        width_ok = (inter.width / max(1.0, original_clip.width)) >= width_ratio
+        size_ok = (font_min <= size_est <= font_max)
+        if not (width_ok and size_ok):
+            continue
+        
+        # Distance to caption (far side, >100pt away)
+        if far_is_top:
+            dist = caption_rect.y0 - lb.y1
+        else:
+            dist = lb.y0 - caption_rect.y1
+        
+        # Must be far from caption (>100pt)
+        if dist > 100.0:
+            # Check if line is in the far-side region
+            if far_is_top:
+                # Far side is TOP, check if in top half of original clip
+                mid_point = original_clip.y0 + 0.5 * original_clip.height
+                if lb.y0 < mid_point:
+                    far_side_para_lines.append((lb, size_est, text))
+            else:
+                # Far side is BOTTOM, check if in bottom half of original clip
+                mid_point = original_clip.y0 + 0.5 * original_clip.height
+                if lb.y1 > mid_point:
+                    far_side_para_lines.append((lb, size_est, text))
+    
+    # DEBUG: Report far-side detection
+    if far_side_para_lines:
+        far_side_para_lines.sort(key=lambda x: x[0].y0)
+        # Calculate far-side paragraph coverage
+        if far_is_top:
+            far_side_region_start = original_clip.y0
+            far_side_region_end = original_clip.y0 + 0.5 * original_clip.height
+        else:
+            far_side_region_start = original_clip.y0 + 0.5 * original_clip.height
+            far_side_region_end = original_clip.y1
+        
+        far_side_region_height = max(1.0, far_side_region_end - far_side_region_start)
+        far_side_total_para_height = sum(lb.height for (lb, _, _) in far_side_para_lines)
+        far_side_para_coverage = far_side_total_para_height / far_side_region_height
+        
+        # Decision: trim far-side if coverage >= 20% (covers edge cases at 0.25)
+        if far_side_para_coverage >= 0.20:
+            if far_is_top:
+                # Move clip.y0 down to after last far-side paragraph
+                last_para_y1 = max(lb.y1 for (lb, _, _) in far_side_para_lines)
+                new_y0 = last_para_y1 + gap
+                # Safety: don't trim more than 50% of original clip height
+                max_trim = original_clip.y0 + 0.5 * original_clip.height
+                clip.y0 = min(new_y0, max_trim)
+            else:
+                # Move clip.y1 up to before first far-side paragraph
+                first_para_y0 = min(lb.y0 for (lb, _, _) in far_side_para_lines)
+                new_y1 = first_para_y0 - gap
+                # Safety: don't trim more than 50% of original clip height
+                min_trim = original_clip.y1 - 0.5 * original_clip.height
+                clip.y1 = max(new_y1, min_trim)
+    
+    # Now handle Phase B (near-side far text) if applicable
+    if far_para_lines and para_coverage_ratio >= far_text_para_min_ratio:
+        if far_text_trim_mode == "aggressive":
+            # Trim to the start of the first far paragraph (based on ORIGINAL clip)
+            if near_is_top:
+                # Move clip.y0 down to after the last far paragraph
+                last_para_y1 = max(lb.y1 for (lb, _, _) in far_para_lines)
+                new_y0 = last_para_y1 + gap
+                # Safety: don't trim more than 60% of original clip height
+                max_trim = original_clip.y0 + 0.6 * original_clip.height
+                clip.y0 = min(new_y0, max_trim)
+            else:
+                # Move clip.y1 up to before the first far paragraph
+                first_para_y0 = min(lb.y0 for (lb, _, _) in far_para_lines)
+                new_y1 = first_para_y0 - gap
+                # Safety: don't trim more than 60% of original clip height
+                min_trim = original_clip.y1 - 0.6 * original_clip.height
+                clip.y1 = max(new_y1, min_trim)
+        elif far_text_trim_mode == "conservative":
+            # Only trim if paragraphs are continuous (gap between lines < 20pt)
+            is_continuous = True
+            for i in range(len(far_para_lines) - 1):
+                gap_between = far_para_lines[i+1][0].y0 - far_para_lines[i][0].y1
+                if gap_between > 20.0:
+                    is_continuous = False
+                    break
+            if is_continuous:
+                # Apply same trim as aggressive (based on ORIGINAL clip)
+                if near_is_top:
+                    last_para_y1 = max(lb.y1 for (lb, _, _) in far_para_lines)
+                    new_y0 = last_para_y1 + gap
+                    max_trim = original_clip.y0 + 0.6 * original_clip.height
+                    clip.y0 = min(new_y0, max_trim)
+                else:
+                    first_para_y0 = min(lb.y0 for (lb, _, _) in far_para_lines)
+                    new_y1 = first_para_y0 - gap
+                    min_trim = original_clip.y1 - 0.6 * original_clip.height
+                    clip.y1 = max(new_y1, min_trim)
+    
+    # Enforce minimum height
+    min_h = 40.0
+    if clip.height < min_h:
+        # Revert to Phase A result
+        return _trim_clip_head_by_text(
+            fitz.Rect(page_rect.x0, caption_rect.y0 - 600, page_rect.x1, caption_rect.y1 + 600) & page_rect,
+            page_rect, caption_rect, direction, text_lines,
+            width_ratio=width_ratio, font_min=font_min, font_max=font_max,
+            gap=gap, adjacent_th=adjacent_th
+        )
+    
     # Clamp to page
     clip = fitz.Rect(clip.x0, max(page_rect.y0, clip.y0), clip.x1, min(page_rect.y1, clip.y1))
     return clip
@@ -696,6 +932,467 @@ def snap_clip_edges(
     return clip
 
 
+# ============================================================================
+# Caption Detection Helper Functions (for smart caption identification)
+# ============================================================================
+
+def get_page_images(page: "fitz.Page") -> List[fitz.Rect]:
+    """提取页面中所有图像对象的边界框"""
+    images: List[fitz.Rect] = []
+    try:
+        dict_data = page.get_text("dict")
+        for blk in dict_data.get("blocks", []):
+            if blk.get("type", 0) == 1 and "bbox" in blk:  # type=1 表示图像
+                images.append(fitz.Rect(*blk["bbox"]))
+    except Exception:
+        pass
+    return images
+
+
+def get_page_drawings(page: "fitz.Page") -> List[fitz.Rect]:
+    """提取页面中所有绘图对象的边界框"""
+    drawings: List[fitz.Rect] = []
+    try:
+        for dr in page.get_drawings():
+            r = dr.get("rect")
+            if r and isinstance(r, fitz.Rect):
+                drawings.append(r)
+    except Exception:
+        pass
+    return drawings
+
+
+def get_next_line_text(block: Dict, current_line_idx: int) -> str:
+    """获取当前行的下一行文本"""
+    lines = block.get("lines", [])
+    if current_line_idx + 1 < len(lines):
+        next_line = lines[current_line_idx + 1]
+        text = "".join(sp.get("text", "") for sp in next_line.get("spans", []))
+        return text.strip()
+    return ""
+
+
+def get_paragraph_length(block: Dict) -> int:
+    """计算 block 中所有文本的总长度"""
+    total_len = 0
+    for ln in block.get("lines", []):
+        for sp in ln.get("spans", []):
+            total_len += len(sp.get("text", ""))
+    return total_len
+
+
+def is_bold_text(spans: List[Dict]) -> bool:
+    """判断文本是否加粗（检查 font flags）"""
+    # Font flags bit 4 (value 16) 表示 bold
+    return any(sp.get("flags", 0) & 16 for sp in spans)
+
+
+def min_distance_to_rects(rect: fitz.Rect, rect_list: List[fitz.Rect]) -> float:
+    """计算 rect 到 rect_list 中所有矩形的最小距离"""
+    if not rect_list:
+        return float('inf')
+    
+    min_dist = float('inf')
+    for r in rect_list:
+        # 计算垂直距离（caption 通常在图像的上方或下方）
+        dist_above = abs(rect.y0 - r.y1)  # caption 在图下方
+        dist_below = abs(rect.y1 - r.y0)  # caption 在图上方
+        dist = min(dist_above, dist_below)
+        min_dist = min(min_dist, dist)
+    
+    return min_dist
+
+
+def is_likely_reference_context(text: str) -> bool:
+    """判断文本是否像正文引用（而非图注描述）"""
+    text_lower = text.lower()
+    
+    # 正文引用特征关键词
+    reference_patterns = [
+        r'as shown in', r'see (figure|table)', r'refer to',
+        r'shown in (figure|table)', r'listed in (table)',
+        r'如.*所示', r'见.*图', r'参见', r'如.*表.*所示',
+        r'according to', r'based on', r'from (figure|table)',
+    ]
+    
+    for pat in reference_patterns:
+        if re.search(pat, text_lower):
+            return True
+    
+    return False
+
+
+def is_likely_caption_context(text: str) -> bool:
+    """判断文本是否像图注描述（而非正文引用）"""
+    text_lower = text.lower()
+    
+    # 图注特征关键词
+    caption_patterns = [
+        r'^(figure|table|fig\.|图|表)\s+\d+[:：.]',  # 以 "Figure 1:" 开头
+        r'shows?', r'illustrates?', r'depicts?', r'displays?',
+        r'compares?', r'presents?', r'demonstrates?',
+        r'显示', r'展示', r'说明', r'比较', r'给出', r'呈现',
+    ]
+    
+    for pat in caption_patterns:
+        if re.search(pat, text_lower):
+            return True
+    
+    return False
+
+
+def find_all_caption_candidates(
+    page: "fitz.Page",
+    page_num: int,
+    pattern: re.Pattern,
+    kind: str = 'figure'
+) -> List[CaptionCandidate]:
+    """
+    在单页中找到所有匹配 pattern 的候选 caption。
+    
+    参数:
+        page: PyMuPDF 页面对象
+        page_num: 页码（0-based）
+        pattern: 匹配 caption 的正则表达式（需要有一个捕获组提取编号）
+        kind: 'figure' 或 'table'
+    
+    返回:
+        CaptionCandidate 列表
+    """
+    candidates: List[CaptionCandidate] = []
+    
+    try:
+        dict_data = page.get_text("dict")
+        
+        for blk_idx, blk in enumerate(dict_data.get("blocks", [])):
+            if blk.get("type", 0) != 0:  # 只处理文本 block
+                continue
+            
+            for ln_idx, ln in enumerate(blk.get("lines", [])):
+                spans = ln.get("spans", [])
+                if not spans:
+                    continue
+                
+                # 拼接当前行的完整文本
+                text = "".join(sp.get("text", "") for sp in spans)
+                text_stripped = text.strip()
+                
+                # 尝试匹配 pattern
+                match = pattern.match(text_stripped)
+                if match:
+                    # 提取编号（假设第一个捕获组是编号）
+                    number = match.group(1)
+                    
+                    candidate = CaptionCandidate(
+                        rect=fitz.Rect(*ln.get("bbox", [0, 0, 0, 0])),
+                        text=text_stripped,
+                        number=number,
+                        kind=kind,
+                        page=page_num,
+                        block_idx=blk_idx,
+                        line_idx=ln_idx,
+                        spans=spans,
+                        block=blk,
+                        score=0.0  # 初始分数为 0
+                    )
+                    candidates.append(candidate)
+    
+    except Exception as e:
+        # 如果页面解析失败，返回空列表
+        print(f"Warning: Failed to parse page {page_num + 1} for {kind} captions: {e}")
+    
+    return candidates
+
+
+def score_caption_candidate(
+    candidate: CaptionCandidate,
+    images: List[fitz.Rect],
+    drawings: List[fitz.Rect],
+    debug: bool = False
+) -> float:
+    """
+    为候选 caption 打分，判断其是真实图注的可能性。
+    
+    评分维度（总分 100）：
+    1. 位置特征（40分）：距离图像/绘图对象的距离
+    2. 格式特征（30分）：字体加粗、独立成段、后续标点
+    3. 结构特征（20分）：下一行有描述、段落长度
+    4. 上下文特征（10分）：语义分析（图注描述 vs 正文引用）
+    
+    参数:
+        candidate: 候选项
+        images: 页面中所有图像对象
+        drawings: 页面中所有绘图对象
+        debug: 是否输出调试信息
+    
+    返回:
+        得分（0-100+）
+    """
+    score = 0.0
+    details = {}  # 用于调试
+    
+    # === 1. 位置特征（40分）===
+    # 计算与图像/绘图对象的最小距离
+    all_objects = images + drawings
+    min_dist = min_distance_to_rects(candidate.rect, all_objects)
+    
+    if min_dist < 10:
+        position_score = 40.0
+    elif min_dist < 20:
+        position_score = 35.0
+    elif min_dist < 40:
+        position_score = 28.0
+    elif min_dist < 80:
+        position_score = 18.0
+    elif min_dist < 150:
+        position_score = 8.0
+    elif min_dist < float('inf'):
+        # 距离过远，但还有对象，给予少量分数
+        position_score = max(0, 5.0 - min_dist / 50.0)
+    else:
+        # 页面没有任何图像对象，无法判断（给予中等分数）
+        position_score = 15.0
+    
+    score += position_score
+    details['position'] = position_score
+    details['min_dist'] = min_dist
+    
+    # === 2. 格式特征（30分）===
+    format_score = 0.0
+    
+    # 2.1 检查是否加粗（15分）
+    if is_bold_text(candidate.spans):
+        format_score += 15.0
+        details['bold'] = True
+    else:
+        details['bold'] = False
+    
+    # 2.2 检查是否独立成段或行数较少（10分）
+    num_lines = len(candidate.block.get('lines', []))
+    if num_lines == 1:
+        format_score += 10.0
+        details['lines'] = 1
+    elif num_lines == 2:
+        format_score += 8.0
+        details['lines'] = 2
+    elif num_lines <= 4:
+        format_score += 5.0
+        details['lines'] = num_lines
+    else:
+        # 行数过多，可能是长段落中的引用
+        format_score += 0.0
+        details['lines'] = num_lines
+    
+    # 2.3 检查后续是否有标点符号（冒号、句点、破折号）（5分）
+    text_prefix = candidate.text[:40]  # 只检查前 40 个字符
+    if ':' in text_prefix or '：' in text_prefix:
+        format_score += 5.0
+        details['punctuation'] = 'colon'
+    elif '.' in text_prefix and not text_prefix.endswith('et al.'):
+        format_score += 3.0
+        details['punctuation'] = 'period'
+    elif '—' in text_prefix or '-' in text_prefix:
+        format_score += 2.0
+        details['punctuation'] = 'dash'
+    else:
+        details['punctuation'] = 'none'
+    
+    score += format_score
+    details['format'] = format_score
+    
+    # === 3. 结构特征（20分）===
+    structure_score = 0.0
+    
+    # 3.1 检查下一行是否有描述性文字（12分）
+    next_line_text = get_next_line_text(candidate.block, candidate.line_idx)
+    if next_line_text:
+        next_len = len(next_line_text)
+        if next_len > 40:
+            structure_score += 12.0
+            details['next_line_len'] = next_len
+        elif next_len > 15:
+            structure_score += 8.0
+            details['next_line_len'] = next_len
+        else:
+            structure_score += 3.0
+            details['next_line_len'] = next_len
+    else:
+        details['next_line_len'] = 0
+    
+    # 3.2 检查段落总长度（长段落可能是正文引用，扣分）（8分）
+    para_length = get_paragraph_length(candidate.block)
+    if para_length < 150:
+        # 短段落，很可能是图注
+        structure_score += 8.0
+        details['para_length'] = para_length
+    elif para_length < 300:
+        structure_score += 4.0
+        details['para_length'] = para_length
+    elif para_length < 600:
+        # 中等长度
+        structure_score += 0.0
+        details['para_length'] = para_length
+    else:
+        # 长段落，很可能是正文引用，扣分
+        structure_score -= 8.0
+        details['para_length'] = para_length
+    
+    score += structure_score
+    details['structure'] = structure_score
+    
+    # === 4. 上下文特征（10分）===
+    context_score = 0.0
+    
+    # 4.1 检查是否像图注描述（加分）
+    if is_likely_caption_context(candidate.text):
+        context_score += 10.0
+        details['context'] = 'caption'
+    # 4.2 检查是否像正文引用（扣分）
+    elif is_likely_reference_context(candidate.text):
+        context_score -= 15.0  # 正文引用给予较重的负分
+        details['context'] = 'reference'
+    else:
+        context_score += 0.0
+        details['context'] = 'neutral'
+    
+    score += context_score
+    details['context_score'] = context_score
+    
+    # === 总分 ===
+    details['total'] = score
+    
+    if debug:
+        print(f"\n=== Caption Scoring Debug ===")
+        print(f"Candidate: {candidate.kind} {candidate.number} at page {candidate.page + 1}")
+        print(f"Text: {candidate.text[:60]}...")
+        print(f"Position score: {position_score:.1f} (min_dist={min_dist:.1f})")
+        print(f"Format score: {format_score:.1f} (bold={details['bold']}, lines={details['lines']}, punct={details['punctuation']})")
+        print(f"Structure score: {structure_score:.1f} (next_line={details['next_line_len']}, para={details['para_length']})")
+        print(f"Context score: {context_score:.1f} ({details['context']})")
+        print(f"Total score: {score:.1f}")
+    
+    return score
+
+
+def select_best_caption(
+    candidates: List[CaptionCandidate],
+    page: "fitz.Page",
+    min_score_threshold: float = 25.0,
+    debug: bool = False
+) -> Optional[CaptionCandidate]:
+    """
+    从候选列表中选择得分最高的真实图注。
+    
+    参数:
+        candidates: 候选列表
+        page: 页面对象（用于获取图像/绘图对象）
+        min_score_threshold: 最低得分阈值（低于此值的候选项将被忽略）
+        debug: 是否输出调试信息
+    
+    返回:
+        得分最高的候选项，如果没有合格候选则返回 None
+    """
+    if not candidates:
+        return None
+    
+    # 获取页面中的图像和绘图对象
+    images = get_page_images(page)
+    drawings = get_page_drawings(page)
+    
+    # 为每个候选项评分
+    scored_candidates: List[Tuple[float, CaptionCandidate]] = []
+    for cand in candidates:
+        score = score_caption_candidate(cand, images, drawings, debug=debug)
+        cand.score = score  # 更新候选项的得分
+        scored_candidates.append((score, cand))
+    
+    # 按得分降序排序
+    scored_candidates.sort(key=lambda x: x[0], reverse=True)
+    
+    if debug:
+        print(f"\n=== All Candidates for {candidates[0].kind} {candidates[0].number} ===")
+        for score, cand in scored_candidates:
+            print(f"  Score {score:5.1f}: page {cand.page + 1}, y={cand.rect.y0:.1f}, text='{cand.text[:50]}...'")
+    
+    # 选择得分最高的候选
+    best_score, best_candidate = scored_candidates[0]
+    
+    # 检查是否达到最低分数阈值
+    if best_score < min_score_threshold:
+        if debug:
+            print(f"  >>> Best score {best_score:.1f} is below threshold {min_score_threshold}, rejecting all candidates")
+        return None
+    
+    if debug:
+        print(f"  >>> Selected: page {best_candidate.page + 1}, score {best_score:.1f}")
+    
+    return best_candidate
+
+
+def build_caption_index(
+    doc: "fitz.Document",
+    figure_pattern: Optional[re.Pattern] = None,
+    table_pattern: Optional[re.Pattern] = None,
+    debug: bool = False
+) -> CaptionIndex:
+    """
+    预扫描全文，建立 caption 索引（记录所有 Figure/Table 编号的所有出现位置）。
+    
+    参数:
+        doc: PyMuPDF 文档对象
+        figure_pattern: 匹配 Figure caption 的正则表达式
+        table_pattern: 匹配 Table caption 的正则表达式
+        debug: 是否输出调试信息
+    
+    返回:
+        CaptionIndex 对象
+    """
+    # 默认 pattern
+    if figure_pattern is None:
+        figure_pattern = re.compile(
+            r"^\s*(?:(?:Extended\s+Data\s+Figure|Supplementary\s+Figure|Figure|Fig\.?|图表|附图|图)\s*(?:S\s*)?(\d+))",
+            re.IGNORECASE
+        )
+    
+    if table_pattern is None:
+        table_pattern = re.compile(
+            r"^\s*(?:(?:Extended\s+Data\s+Table|Supplementary\s+Table|Table|表)\s*(?:S\s*)?(\d+|[IVX]+))",
+            re.IGNORECASE
+        )
+    
+    index_dict: Dict[str, List[CaptionCandidate]] = {}
+    
+    if debug:
+        print(f"\n=== Building Caption Index (total {len(doc)} pages) ===")
+    
+    # 扫描每一页
+    for pno in range(len(doc)):
+        page = doc[pno]
+        
+        # 查找 Figure 候选
+        fig_candidates = find_all_caption_candidates(page, pno, figure_pattern, kind='figure')
+        for cand in fig_candidates:
+            key = f"figure_{cand.number}"
+            if key not in index_dict:
+                index_dict[key] = []
+            index_dict[key].append(cand)
+        
+        # 查找 Table 候选
+        table_candidates = find_all_caption_candidates(page, pno, table_pattern, kind='table')
+        for cand in table_candidates:
+            key = f"table_{cand.number}"
+            if key not in index_dict:
+                index_dict[key] = []
+            index_dict[key].append(cand)
+    
+    if debug:
+        print(f"  Found {len(index_dict)} unique figure/table numbers")
+        for key, cands in sorted(index_dict.items()):
+            print(f"    {key}: {len(cands)} occurrence(s) across pages {', '.join(str(c.page+1) for c in cands)}")
+    
+    return CaptionIndex(candidates=index_dict)
+
+
 # 主流程：从 PDF 提取各图（通过图注定位）并导出 PNG
 # 参数说明：
 # - pdf_path：PDF 路径
@@ -732,6 +1429,10 @@ def extract_figures(
     text_trim_font_max: float = 16.0,
     text_trim_gap: float = 6.0,
     adjacent_th: float = 24.0,
+    # A+: far-text trim options (dual-threshold)
+    far_text_th: float = 300.0,
+    far_text_para_min_ratio: float = 0.30,
+    far_text_trim_mode: str = "aggressive",
     # B: object connectivity options
     object_pad: float = 8.0,
     object_min_area_ratio: float = 0.010,
@@ -753,6 +1454,9 @@ def extract_figures(
     near_edge_pad_px: int = 18,
     # Continuation handling
     allow_continued: bool = False,
+    # Smart caption detection
+    smart_caption_detection: bool = True,
+    debug_captions: bool = False,
 ) -> List[AttachmentRecord]:
     # 打开 PDF 文档并准备输出目录
     doc = fitz.open(pdf_path)
@@ -766,6 +1470,15 @@ def extract_figures(
     seen: Dict[int, str] = {}
     seen_counts: Dict[int, int] = {}
     records: List[AttachmentRecord] = []
+    
+    # === Smart Caption Detection: 预扫描建立索引 ===
+    caption_index: Optional[CaptionIndex] = None
+    if smart_caption_detection:
+        if debug_captions:
+            print(f"\n{'='*60}")
+            print(f"SMART CAPTION DETECTION ENABLED")
+            print(f"{'='*60}")
+        caption_index = build_caption_index(doc, figure_pattern=figure_line_re, debug=debug_captions)
 
     def _parse_fig_list(s: str) -> List[int]:
         out: List[int] = []
@@ -864,6 +1577,9 @@ def extract_figures(
             global_side = 'above'
         else:
             global_side = None
+    # === 存储智能选择的结果（用于跨页查找）===
+    smart_caption_cache: Dict[int, Tuple[fitz.Rect, str, int]] = {}  # {fig_no: (rect, caption, page_num)}
+    
     for pno in range(len(doc)):
         # 遍历每一页，读取文本与对象布局
         page = doc[pno]
@@ -873,48 +1589,115 @@ def extract_figures(
         # 收集本页所有图注（line-level 聚合）：
         # 将连续的行在遇到下一处图注前合并为同一条 caption。
         captions_on_page: List[Tuple[int, fitz.Rect, str]] = []
-        for blk in dict_data.get("blocks", []):
-            if blk.get("type", 0) != 0:
-                continue
-            lines = blk.get("lines", [])
-            i = 0
-            while i < len(lines):
-                ln = lines[i]
-                text = "".join(sp.get("text", "") for sp in ln.get("spans", []))
-                t = text.strip()
-                m = figure_line_re.match(t)
-                if not m:
-                    i += 1
+        
+        # === 智能 Caption 选择（如果启用）===
+        if smart_caption_detection and caption_index:
+            # 使用智能选择逻辑
+            # 1. 找到本页所有潜在的 figure 编号
+            page_fig_numbers = set()
+            for blk in dict_data.get("blocks", []):
+                if blk.get("type", 0) != 0:
                     continue
-                try:
-                    fig_no = int(m.group(1))
-                except Exception:
-                    i += 1
+                for ln in blk.get("lines", []):
+                    text = "".join(sp.get("text", "") for sp in ln.get("spans", []))
+                    m = figure_line_re.match(text.strip())
+                    if m:
+                        try:
+                            fig_no = int(m.group(1))
+                            if min_figure <= fig_no <= max_figure:
+                                page_fig_numbers.add(fig_no)
+                        except Exception:
+                            pass
+            
+            # 2. 对每个 figure 编号，从索引中获取候选项并选择最佳的
+            for fig_no in sorted(page_fig_numbers):
+                # 先检查是否已经在其他页找到过（智能选择可能跨页）
+                if fig_no in smart_caption_cache:
+                    cached_rect, cached_caption, cached_page = smart_caption_cache[fig_no]
+                    # 如果缓存的是本页，则使用
+                    if cached_page == pno:
+                        captions_on_page.append((fig_no, cached_rect, cached_caption))
                     continue
-                # 初始图注边界框来自当前行的 bbox
-                cap_rect = fitz.Rect(*(ln.get("bbox", [0,0,0,0])))
-                parts = [t]
-                char_count = len(t)
-                j = i + 1
-                while j < len(lines):
-                    ln2 = lines[j]
-                    t2 = "".join(sp.get("text", "") for sp in ln2.get("spans", [])).strip()
-                    if not t2:
-                        break
-                    if figure_line_re.match(t2):
-                        break
-                    # 合并后续非空行到当前 caption，扩展边界框
-                    parts.append(t2)
-                    char_count += len(t2)
-                    cap_rect = cap_rect | fitz.Rect(*(ln2.get("bbox", [0,0,0,0])))
-                    if t2.endswith('.') or char_count > 240:
+                
+                # 从索引中获取所有候选项
+                candidates = caption_index.get_candidates('figure', str(fig_no))
+                if not candidates:
+                    continue
+                
+                # 选择最佳候选（优先选择本页的，但如果本页得分太低，可能选择其他页）
+                best_candidate = select_best_caption(candidates, page, min_score_threshold=25.0, debug=debug_captions)
+                
+                if best_candidate:
+                    # 收集完整 caption 文本（合并后续行）
+                    full_caption = best_candidate.text
+                    cap_rect = best_candidate.rect
+                    
+                    # 尝试合并后续行
+                    block = best_candidate.block
+                    lines = block.get("lines", [])
+                    start_idx = best_candidate.line_idx + 1
+                    parts = [full_caption]
+                    for j in range(start_idx, len(lines)):
+                        ln = lines[j]
+                        t2 = "".join(sp.get("text", "") for sp in ln.get("spans", [])).strip()
+                        if not t2 or figure_line_re.match(t2):
+                            break
+                        parts.append(t2)
+                        cap_rect = cap_rect | fitz.Rect(*(ln.get("bbox", [0,0,0,0])))
+                        if t2.endswith('.') or sum(len(p) for p in parts) > 240:
+                            break
+                    full_caption = " ".join(parts)
+                    
+                    # 如果最佳候选是本页，则添加到本页列表
+                    if best_candidate.page == pno:
+                        captions_on_page.append((fig_no, cap_rect, full_caption))
+                    
+                    # 缓存结果
+                    smart_caption_cache[fig_no] = (cap_rect, full_caption, best_candidate.page)
+        else:
+            # === 原有逻辑：简单匹配 ===
+            for blk in dict_data.get("blocks", []):
+                if blk.get("type", 0) != 0:
+                    continue
+                lines = blk.get("lines", [])
+                i = 0
+                while i < len(lines):
+                    ln = lines[i]
+                    text = "".join(sp.get("text", "") for sp in ln.get("spans", []))
+                    t = text.strip()
+                    m = figure_line_re.match(t)
+                    if not m:
+                        i += 1
+                        continue
+                    try:
+                        fig_no = int(m.group(1))
+                    except Exception:
+                        i += 1
+                        continue
+                    # 初始图注边界框来自当前行的 bbox
+                    cap_rect = fitz.Rect(*(ln.get("bbox", [0,0,0,0])))
+                    parts = [t]
+                    char_count = len(t)
+                    j = i + 1
+                    while j < len(lines):
+                        ln2 = lines[j]
+                        t2 = "".join(sp.get("text", "") for sp in ln2.get("spans", [])).strip()
+                        if not t2:
+                            break
+                        if figure_line_re.match(t2):
+                            break
+                        # 合并后续非空行到当前 caption，扩展边界框
+                        parts.append(t2)
+                        char_count += len(t2)
+                        cap_rect = cap_rect | fitz.Rect(*(ln2.get("bbox", [0,0,0,0])))
+                        if t2.endswith('.') or char_count > 240:
+                            j += 1
+                            break
                         j += 1
-                        break
-                    j += 1
-                caption = " ".join(parts)
-                if min_figure <= fig_no <= max_figure:
-                    captions_on_page.append((fig_no, cap_rect, caption))
-                i = max(i+1, j)
+                    caption = " ".join(parts)
+                    if min_figure <= fig_no <= max_figure:
+                        captions_on_page.append((fig_no, cap_rect, caption))
+                    i = max(i+1, j)
 
         captions_on_page.sort(key=lambda t: t[1].y0)
 
@@ -1144,32 +1927,23 @@ def extract_figures(
 
             # A) 文本邻接裁切：增加“段落占比”门槛，防止误剪图边
             if text_trim:
-                head_strip = fitz.Rect(clip)
-                frac = 0.35
-                if side == 'above':
-                    head_strip.y0 = max(page_rect.y0, clip.y1 - max(40.0, frac * clip.height))
-                else:
-                    head_strip.y1 = min(page_rect.y1, clip.y0 + max(40.0, frac * clip.height))
-                para_ratio = _paragraph_ratio(
-                    head_strip,
+                # Always run Phase C (far-side trim) regardless of para_ratio
+                # This handles cases where large paragraphs are far from caption
+                clip = _trim_clip_head_by_text_v2(
+                    clip,
+                    page_rect,
+                    cap_rect,
+                    side,
                     text_lines_all,
                     width_ratio=text_trim_width_ratio,
                     font_min=text_trim_font_min,
                     font_max=text_trim_font_max,
+                    gap=text_trim_gap,
+                    adjacent_th=adjacent_th,
+                    far_text_th=far_text_th,
+                    far_text_para_min_ratio=far_text_para_min_ratio,
+                    far_text_trim_mode=far_text_trim_mode,
                 )
-                if para_ratio >= text_trim_min_para_ratio:
-                    clip = _trim_clip_head_by_text(
-                        clip,
-                        page_rect,
-                        cap_rect,
-                        side,
-                        text_lines_all,
-                        width_ratio=text_trim_width_ratio,
-                        font_min=text_trim_font_min,
-                        font_max=text_trim_font_max,
-                        gap=text_trim_gap,
-                        adjacent_th=adjacent_th,
-                    )
 
             # B) 对象连通域引导（可按图号禁用）
             if not (no_refine_figs and (fig_no in no_refine_figs)):
@@ -1327,13 +2101,16 @@ def extract_figures(
                     if not ok_comp: reasons.append(f"comp={r_comp}/{base_comp}")
                     print(f"[WARN] Fig {fig_no} p{pno+1}: refinement rejected ({', '.join(reasons)}), trying fallback")
                     # try A-only fallback
-                    clip_A = _trim_clip_head_by_text(
+                    clip_A = _trim_clip_head_by_text_v2(
                         base_clip, page_rect, cap_rect, side, text_lines_all,
                         width_ratio=text_trim_width_ratio,
                         font_min=text_trim_font_min,
                         font_max=text_trim_font_max,
                         gap=text_trim_gap,
                         adjacent_th=adjacent_th,
+                        far_text_th=far_text_th,
+                        far_text_para_min_ratio=far_text_para_min_ratio,
+                        far_text_trim_mode=far_text_trim_mode,
                     ) if text_trim else base_clip
                     rA_h, rA_a = max(1.0, clip_A.height), max(1.0, clip_A.width * clip_A.height)
                     if (rA_h >= 0.60 * base_height) and (rA_a >= 0.55 * base_area):
@@ -1506,6 +2283,10 @@ def extract_tables(
     text_trim_font_max: float = 16.0,
     text_trim_gap: float = 6.0,
     adjacent_th: float = 28.0,
+    # A+: far-text trim options (dual-threshold)
+    far_text_th: float = 300.0,
+    far_text_para_min_ratio: float = 0.30,
+    far_text_trim_mode: str = "aggressive",
     # B)
     object_pad: float = 8.0,
     object_min_area_ratio: float = 0.005,
@@ -1522,9 +2303,32 @@ def extract_tables(
     autocrop_min_height_px: int = 80,
     allow_continued: bool = True,
     protect_far_edge_px: int = 10,
+    # Smart caption detection
+    smart_caption_detection: bool = True,
+    debug_captions: bool = False,
 ) -> List[AttachmentRecord]:
     doc = fitz.open(pdf_path)
     os.makedirs(out_dir, exist_ok=True)
+    
+    # === Smart Caption Detection for Tables (ENABLED) ===
+    caption_index_table: Optional[CaptionIndex] = None
+    if smart_caption_detection:
+        if debug_captions:
+            print(f"\n{'='*60}")
+            print(f"SMART CAPTION DETECTION ENABLED FOR TABLES")
+            print(f"{'='*60}")
+        # Build caption index for tables (reuse figure logic)
+        caption_index_table = build_caption_index(
+            doc,
+            figure_pattern=None,  # Skip figures
+            table_pattern=re.compile(
+                r"^\s*(?:(?:Extended\s+Data\s+Table|Supplementary\s+Table|Table|Tab\.?|表)\s*"
+                r"(?:S\s*)?"
+                r"([A-Z]\d+|[IVX]{1,5}|\d+))",  # 单一捕获组，支持附录表/罗马数字/普通数字
+                re.IGNORECASE
+            ),
+            debug=debug_captions
+        )
 
     # 改进：支持罗马数字、附录表、补充材料表、续页标记
     table_line_re = re.compile(
@@ -1648,6 +2452,54 @@ def extract_tables(
             global_side_table = None
             print(f"[INFO] Global table anchor: AUTO (no clear preference)")
     
+    # === Cache for smart-selected table captions ===
+    smart_caption_cache_table: Dict[str, Tuple[fitz.Rect, str, int]] = {}
+    
+    if smart_caption_detection and caption_index_table:
+        # Pre-select best captions for all tables
+        for pno_pre in range(len(doc)):
+            page_pre = doc[pno_pre]
+            dict_data_pre = page_pre.get_text("dict")
+            # Find all table IDs on this page
+            page_table_ids = set()
+            for blk in dict_data_pre.get("blocks", []):
+                if blk.get("type", 0) != 0:
+                    continue
+                for ln in blk.get("lines", []):
+                    text = "".join(sp.get("text", "") for sp in ln.get("spans", []))
+                    m = table_line_re.match(text.strip())
+                    if m:
+                        ident = (m.group(1) or m.group(2) or m.group(3) or "").strip()
+                        if ident:
+                            page_table_ids.add(ident)
+            
+            # For each table ID, select best caption
+            for table_id in page_table_ids:
+                if table_id in smart_caption_cache_table:
+                    continue  # Already cached
+                candidates = caption_index_table.get_candidates('table', str(table_id))
+                if candidates:
+                    best = select_best_caption(candidates, page_pre, min_score_threshold=25.0, debug=debug_captions)
+                    if best:
+                        # Build full caption (merge subsequent lines)
+                        full_caption = best.text
+                        cap_rect = best.rect
+                        block = best.block
+                        lines_in_block = block.get("lines", [])
+                        start_idx = best.line_idx + 1
+                        parts = [full_caption]
+                        for j in range(start_idx, len(lines_in_block)):
+                            ln = lines_in_block[j]
+                            t2 = "".join(sp.get("text", "") for sp in ln.get("spans", [])).strip()
+                            if not t2 or table_line_re.match(t2):
+                                break
+                            parts.append(t2)
+                            cap_rect = cap_rect | fitz.Rect(*(ln.get("bbox", [0,0,0,0])))
+                            if t2.endswith('.') or sum(len(p) for p in parts) > 240:
+                                break
+                        full_caption = " ".join(parts)
+                        smart_caption_cache_table[table_id] = (cap_rect, full_caption, best.page)
+    
     for pno in range(len(doc)):
         page = doc[pno]
         page_rect = page.rect
@@ -1668,45 +2520,54 @@ def extract_tables(
         draw_items = collect_draw_items(page)
 
         captions_on_page: List[Tuple[str, fitz.Rect, str]] = []
-        for blk in dict_data.get("blocks", []):
-            if blk.get("type", 0) != 0:
-                continue
-            lines = blk.get("lines", [])
-            i = 0
-            while i < len(lines):
-                ln = lines[i]
-                text = "".join(sp.get("text", "") for sp in ln.get("spans", []))
-                t = text.strip()
-                m = table_line_re.match(t)
-                if not m:
-                    i += 1
+        
+        # === Use smart-selected captions if available ===
+        if smart_caption_detection and caption_index_table:
+            # Find all table IDs on this page from cache
+            for table_id, (cap_rect, caption, cached_page) in smart_caption_cache_table.items():
+                if cached_page == pno:
+                    captions_on_page.append((table_id, cap_rect, caption))
+        else:
+            # Fallback: Original logic
+            for blk in dict_data.get("blocks", []):
+                if blk.get("type", 0) != 0:
                     continue
-                # 提取表号：优先附录表、罗马数字、普通数字
-                ident = (m.group(1) or m.group(2) or m.group(3) or "").strip()
-                if not ident:
-                    i += 1
-                    continue
-                cap_rect = fitz.Rect(*(ln.get("bbox", [0,0,0,0])))
-                parts = [t]
-                char_count = len(t)
-                j = i + 1
-                while j < len(lines):
-                    ln2 = lines[j]
-                    t2 = "".join(sp.get("text", "") for sp in ln2.get("spans", [])).strip()
-                    if not t2:
-                        break
-                    if table_line_re.match(t2):
-                        break
-                    parts.append(t2)
-                    char_count += len(t2)
-                    cap_rect = cap_rect | fitz.Rect(*(ln2.get("bbox", [0,0,0,0])))
-                    if t2.endswith('.') or char_count > 240:
+                lines = blk.get("lines", [])
+                i = 0
+                while i < len(lines):
+                    ln = lines[i]
+                    text = "".join(sp.get("text", "") for sp in ln.get("spans", []))
+                    t = text.strip()
+                    m = table_line_re.match(t)
+                    if not m:
+                        i += 1
+                        continue
+                    # 提取表号：优先附录表、罗马数字、普通数字
+                    ident = (m.group(1) or m.group(2) or m.group(3) or "").strip()
+                    if not ident:
+                        i += 1
+                        continue
+                    cap_rect = fitz.Rect(*(ln.get("bbox", [0,0,0,0])))
+                    parts = [t]
+                    char_count = len(t)
+                    j = i + 1
+                    while j < len(lines):
+                        ln2 = lines[j]
+                        t2 = "".join(sp.get("text", "") for sp in ln2.get("spans", [])).strip()
+                        if not t2:
+                            break
+                        if table_line_re.match(t2):
+                            break
+                        parts.append(t2)
+                        char_count += len(t2)
+                        cap_rect = cap_rect | fitz.Rect(*(ln2.get("bbox", [0,0,0,0])))
+                        if t2.endswith('.') or char_count > 240:
+                            j += 1
+                            break
                         j += 1
-                        break
-                    j += 1
-                caption = " ".join(parts)
-                captions_on_page.append((ident, cap_rect, caption))
-                i = max(i+1, j)
+                    caption = " ".join(parts)
+                    captions_on_page.append((ident, cap_rect, caption))
+                    i = max(i+1, j)
 
         captions_on_page.sort(key=lambda t: t[1].y0)
 
@@ -1880,7 +2741,7 @@ def extract_tables(
             base_text = text_line_count(base_clip)
 
             if text_trim:
-                clip = _trim_clip_head_by_text(
+                clip = _trim_clip_head_by_text_v2(
                     clip,
                     page_rect,
                     cap_rect,
@@ -1891,6 +2752,9 @@ def extract_tables(
                     font_max=text_trim_font_max,
                     gap=text_trim_gap,
                     adjacent_th=adjacent_th,
+                    far_text_th=far_text_th,
+                    far_text_para_min_ratio=far_text_para_min_ratio,
+                    far_text_trim_mode=far_text_trim_mode,
                 )
 
             clip = _refine_clip_by_objects(
@@ -1988,13 +2852,16 @@ def extract_tables(
                     if not ok_t: reasons.append(f"text_lines={r_text}/{base_text}")
                     if not ok_comp: reasons.append(f"comp={r_comp}/{base_comp}")
                     print(f"[WARN] Table {ident} p{pno+1}: refinement rejected ({', '.join(reasons)}), using A-only fallback")
-                    clip_A = _trim_clip_head_by_text(
+                    clip_A = _trim_clip_head_by_text_v2(
                         base_clip, page_rect, cap_rect, side, text_lines_all,
                         width_ratio=text_trim_width_ratio,
                         font_min=text_trim_font_min,
                         font_max=text_trim_font_max,
                         gap=text_trim_gap,
                         adjacent_th=adjacent_th,
+                        far_text_th=far_text_th,
+                        far_text_para_min_ratio=far_text_para_min_ratio,
+                        far_text_trim_mode=far_text_trim_mode,
                     ) if text_trim else base_clip
                     clip = clip_A
                     try:
@@ -2051,6 +2918,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--scan-topk", type=int, default=3, help="Keep top-k candidates during anchor v2 (for debugging)")
     p.add_argument("--dump-candidates", action="store_true", help="Dump page-level candidate boxes for debugging (anchor v2)")
     p.add_argument("--caption-mid-guard", type=float, default=6.0, help="Guard (pt) around midline between adjacent captions to avoid cross-anchoring")
+    # Smart caption detection (NEW)
+    p.add_argument("--smart-caption-detection", action="store_true", default=True, help="Enable smart caption detection to distinguish real captions from in-text references (default: enabled)")
+    p.add_argument("--no-smart-caption-detection", action="store_false", dest="smart_caption_detection", help="Disable smart caption detection (use simple pattern matching)")
+    p.add_argument("--debug-captions", action="store_true", help="Print detailed caption candidate scoring information for debugging")
     # A) text trimming options
     p.add_argument("--text-trim", action="store_true", help="Trim paragraph-like text near caption side inside chosen clip")
     p.add_argument("--text-trim-width-ratio", type=float, default=0.5, help="Min horizontal overlap ratio to treat a line as paragraph text")
@@ -2058,6 +2929,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--text-trim-font-max", type=float, default=16.0, help="Max font size for paragraph detection")
     p.add_argument("--text-trim-gap", type=float, default=6.0, help="Gap between trimmed text and new clip boundary (pt)")
     p.add_argument("--adjacent-th", type=float, default=24.0, help="Adjacency threshold to caption to treat text as body (pt)")
+    # A+) far-text trim options (dual-threshold)
+    p.add_argument("--far-text-th", type=float, default=300.0, help="Maximum distance to detect far text (pt)")
+    p.add_argument("--far-text-para-min-ratio", type=float, default=0.30, help="Minimum paragraph coverage ratio to trigger far-text trim")
+    p.add_argument("--far-text-trim-mode", type=str, default="aggressive", choices=["aggressive", "conservative"], help="Far-text trim mode")
     # B) object connectivity options
     p.add_argument("--object-pad", type=float, default=8.0, help="Padding (pt) added around chosen object component")
     p.add_argument("--object-min-area-ratio", type=float, default=0.012, help="Min area ratio of object region within clip to be considered (lower=more sensitive to small panels)")
@@ -2205,6 +3080,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         text_trim_font_max=args.text_trim_font_max,
         text_trim_gap=args.text_trim_gap,
         adjacent_th=args.adjacent_th,
+        far_text_th=getattr(args, 'far_text_th', 300.0),
+        far_text_para_min_ratio=getattr(args, 'far_text_para_min_ratio', 0.30),
+        far_text_trim_mode=getattr(args, 'far_text_trim_mode', 'aggressive'),
         object_pad=args.object_pad,
         object_min_area_ratio=args.object_min_area_ratio,
         object_merge_gap=args.object_merge_gap,
@@ -2221,6 +3099,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         protect_far_edge_px=getattr(args, 'protect_far_edge_px', 14),
         near_edge_pad_px=getattr(args, 'near_edge_pad_px', 18),
         allow_continued=args.allow_continued,
+        smart_caption_detection=getattr(args, 'smart_caption_detection', True),
+        debug_captions=getattr(args, 'debug_captions', False),
     )
 
     # 汇总记录
@@ -2250,6 +3130,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             text_trim_font_max=getattr(args, 'text_trim_font_max', 16.0),
             text_trim_gap=getattr(args, 'text_trim_gap', 6.0),
             adjacent_th=getattr(args, 'table_adjacent_th', 28.0),
+            far_text_th=getattr(args, 'far_text_th', 300.0),
+            far_text_para_min_ratio=getattr(args, 'far_text_para_min_ratio', 0.30),
+            far_text_trim_mode=getattr(args, 'far_text_trim_mode', 'aggressive'),
             object_pad=getattr(args, 'object_pad', 8.0),
             object_min_area_ratio=getattr(args, 'table_object_min_area_ratio', 0.005),
             object_merge_gap=getattr(args, 'table_object_merge_gap', 4.0),
@@ -2263,6 +3146,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             autocrop_min_height_px=getattr(args, 'autocrop_min_height_px', 80),
             allow_continued=args.allow_continued,
             protect_far_edge_px=getattr(args, 'protect_far_edge_px', 12),
+            smart_caption_detection=getattr(args, 'smart_caption_detection', True),
+            debug_captions=getattr(args, 'debug_captions', False),
         )
         all_records.extend(tbl_records)
 

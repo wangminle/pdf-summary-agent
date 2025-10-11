@@ -59,6 +59,80 @@
 - 关闭表格提取：`--no-tables`（默认开启表格提取）。
 - 导出 CSV 清单：`--manifest <path>` 可生成包含 `(type,id,page,caption,file,continued)` 的 CSV；与 `images/index.json` 字段一致。
 
+### 智能 Caption 识别（默认开启）
+**问题背景**：论文中的图表标号（如 Figure 1、Table 2）可能出现在三种位置：
+1. **真实图注**：紧邻图表上方或下方，作为图注首次出现（期望的情况）
+2. **前文引用**：在图表之前的正文中提前引用和说明
+3. **混合情况**：图注、前文、后文都出现该标号
+
+**智能识别机制**（默认启用，**图与表均已支持**）：
+- **预扫描索引**：脚本会预先扫描全文，记录每个 Figure/Table 编号的所有出现位置。
+- **四维评分**：为每个候选位置打分（总分 100），综合考虑：
+  1. **位置特征**（40分）：与图像/绘图对象的距离（越近得分越高）
+  2. **格式特征**（30分）：字体加粗、独立成段、后续标点（冒号、句点等）
+  3. **结构特征**（20分）：下一行有描述文字、段落长度（长段落可能是正文引用）
+  4. **上下文特征**（10分）：语义分析（是否包含"显示"、"展示"等图注关键词，或"如图所示"等引用关键词）
+- **最佳选择**：自动选择得分最高的候选作为真实图注（阈值：25分）。
+- **✨ 2025-01-11 更新**：表格智能Caption检测已启用，与图片使用相同的四维评分机制，成功解决"表格引用"与"真实表注"混淆问题。
+
+**控制选项**：
+- `--smart-caption-detection`（默认开启）：启用智能识别。
+- `--no-smart-caption-detection`：关闭智能识别，使用简单模式（按顺序匹配第一个出现的标号）。
+- `--debug-captions`：输出详细的候选项评分信息，用于调试和分析。
+
+**使用示例**：
+```bash
+# 启用智能识别（默认）
+python3 scripts/extract_pdf_assets.py --pdf paper.pdf --preset robust
+
+# 查看候选项评分详情（调试模式）
+python3 scripts/extract_pdf_assets.py --pdf paper.pdf --preset robust --debug-captions
+
+# 关闭智能识别（使用简单模式）
+python3 scripts/extract_pdf_assets.py --pdf paper.pdf --preset robust --no-smart-caption-detection
+```
+
+**适用场景**：
+- ✅ 当图表标号在图片前文中提前出现时（如先讨论后列图）
+- ✅ 当同一标号在多处出现时（前文+图注+后文引用）
+- ✅ 复杂排版的论文（图注格式不规范、混合引用较多）
+- ✅ 表格与图片均支持智能识别（支持罗马数字、附录表等复杂情况）
+
+### 远距文字清除（Phase C，默认开启）
+**问题背景**：某些论文PDF中，图表截取区域会包含距离图注较远的正文段落（如Abstract、Introduction等），导致图表上下方有多余文字。
+
+**核心创新**（基于全局锚点方向）：
+- **方向性检测**：利用全局锚点判定（ABOVE/BELOW），自动识别多余文字可能出现的方向
+  - 图注在下方 → 多余文字通常在上方（far side = top）
+  - 图注在上方 → 多余文字通常在下方（far side = bottom）
+- **三阶段Trim策略**：
+  - **Phase A**：移除紧邻图注的文字（<24pt，原有逻辑）
+  - **Phase B**：移除near-side的远距文字（24-300pt，预留但通常不触发）
+  - **Phase C**：移除far-side的大段正文（>100pt，覆盖率≥20%）★核心功能
+- **安全保护**：最多trim 50%原始窗口高度，配合验收机制防止过度裁剪
+
+**新增参数**：
+- `--far-text-th 300.0`：远距文字检测范围（默认300pt）
+- `--far-text-para-min-ratio 0.30`：触发trim的段落覆盖率阈值（默认0.30）
+- `--far-text-trim-mode aggressive|conservative`：trim模式（默认aggressive）
+
+**效果示例**（FunAudio-ASR.pdf实测）：
+- Figure 1：上方Abstract移除，高度减少 138px (-13.4%)
+- Figure 3：上方正文移除，高度减少 311px (-39.0%)
+- Table 3：上方正文移除，高度减少 222px (-30.8%)
+
+**使用示例**：
+```bash
+# 默认启用（随--preset robust自动启用）
+python3 scripts/extract_pdf_assets.py --pdf paper.pdf --preset robust
+
+# 调整远距检测阈值（更激进）
+python3 scripts/extract_pdf_assets.py --pdf paper.pdf --preset robust --far-text-th 400 --far-text-para-min-ratio 0.15
+
+# 使用保守模式（仅当段落连续时才trim）
+python3 scripts/extract_pdf_assets.py --pdf paper.pdf --preset robust --far-text-trim-mode conservative
+```
+
 ### 推荐参数备忘（遇到边沿轻微过裁时）
 - 仅靠近图注一侧再放宽：`--near-edge-pad-px 34~36`
 - 同时保护远端上/下边：`--protect-far-edge-px 20~24`

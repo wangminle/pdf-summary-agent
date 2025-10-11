@@ -1,7 +1,7 @@
 # pdf-summary-agent
 
 ## Overview (EN)
-Extract text and figure/table PNGs from a research PDF and produce a JSON index. Designed for robust caption-anchored cropping (Anchor v2 with multi-scale scanning, global anchor consistency for both figures and tables), optional auto-cropping, and safety checks to avoid over/under-trimming.
+Extract text and figure/table PNGs from a research PDF and produce a JSON index. Designed for robust caption-anchored cropping (Anchor v2 with multi-scale scanning, global anchor consistency for both figures and tables), **smart caption detection** (distinguishes real captions from in-text references for both figures and tables), **far-side text trimming** (removes distant paragraphs like Abstract/Introduction), optional auto-cropping, and safety checks to avoid over/under-trimming.
 
 - Requirements: Python 3.12+, macOS/Linux recommended
 - Dependencies: PyMuPDF (pymupdf), pdfminer.six
@@ -9,6 +9,9 @@ Extract text and figure/table PNGs from a research PDF and produce a JSON index.
   - `text/<paper>.txt`
   - `images/*.png` (Figure_* and Table_*)
   - `images/index.json`
+- **NEW (2025-01-11)**: 
+  - Smart caption detection now supports **both figures and tables** (4-dimensional scoring to distinguish real captions from references)
+  - Far-side text trimming (Phase C) automatically removes distant paragraphs based on global anchor direction
 
 ### Install
 - Quick: `python3 -m pip install --user pymupdf pdfminer.six`
@@ -23,6 +26,7 @@ Common flags: `--allow-continued`, `--anchor-mode v1`, `--below/--above`, `--man
 ### Notes
 - Use relative paths like `images/...` when embedding figures/tables in Markdown next to the PDF.
 - With Anchor v2 (default), per-id `--above/--below` works only if you switch to `--anchor-mode v1`.
+- **Smart caption detection**: Enabled by default, automatically distinguishes real captions from in-text references; use `--no-smart-caption-detection` to disable, or `--debug-captions` to see scoring details. See `AGENTS.md` for more.
 
 ### CLI Workflow (EN): place `AGENTS.md` and `scripts/` next to the PDF; let the Agent run it
 
@@ -65,7 +69,7 @@ python3 scripts/extract_pdf_assets.py \
 ---
 
 ## 概述 (ZH)
-从论文 PDF 中提取正文文本与图表 PNG，并生成统一索引 JSON。内置稳健的基于图注定位（Anchor v2 多尺度滑窗，图与表独立全局锚点一致性）、可选像素级去白边，以及多重安全校验，避免过裁/漏裁。
+从论文 PDF 中提取正文文本与图表 PNG，并生成统一索引 JSON。内置稳健的基于图注定位（Anchor v2 多尺度滑窗，图与表独立全局锚点一致性）、**智能图注识别**（图与表均支持，区分真实图注与正文引用）、**远距文字清除**（自动移除Abstract/Introduction等大段正文）、可选像素级去白边，以及多重安全校验，避免过裁/漏裁。
 
 - 环境：Python 3.12+（建议 macOS/Linux）
 - 依赖：PyMuPDF（pymupdf）、pdfminer.six
@@ -73,6 +77,9 @@ python3 scripts/extract_pdf_assets.py \
   - `text/<paper>.txt`
   - `images/*.png`（含 Figure_* 与 Table_*）
   - `images/index.json`
+- **新功能 (2025-01-11)**：
+  - 智能图注识别现已支持**图与表**（四维评分机制，自动区分真实图注与引用）
+  - 远距文字清除（Phase C）基于全局锚点方向自动移除远距大段正文
 
 ### 安装
 - 直接安装：`python3 -m pip install --user pymupdf pdfminer.six`
@@ -87,6 +94,7 @@ python3 scripts/extract_pdf_assets.py --pdf <PDF_DIR>/<paper>.pdf --preset robus
 ### 提示
 - 在生成 Markdown 摘要时，始终使用相对路径嵌图（如 `images/...`）。
 - 默认 Anchor v2 下，若需按编号强制上/下方向，请切换 `--anchor-mode v1` 后再配合 `--above/--below`。
+- **智能图注识别**：默认启用，自动区分真实图注与正文引用；如需关闭，使用 `--no-smart-caption-detection`；如需查看评分详情，使用 `--debug-captions`。详见 `AGENTS.md`。
 
 ### CLI 工作流示例：将 `AGENTS.md` 与 `scripts/` 放到 PDF 同目录，由 Agent 自动调用脚本
 

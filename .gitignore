@@ -51,3 +51,6 @@ coverage.xml
 docs/_build/
 __pypackages__/
 cython_debug/
+
+# Test files and PDFs
+tests/
