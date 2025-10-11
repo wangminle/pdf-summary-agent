@@ -39,11 +39,13 @@
   - 表格同理：再次命中相同“表号”将输出 `Table_<id>_continued_p{page}.png`。
   - 环境变量：`EXTRACT_FORCE_TABLE_ABOVE="1,S1"` 可对表强制上方裁剪。
 
-### 锚点 V2（默认）与“全局锚点一致性”
-- 锚点 V2：围绕 caption 多尺度滑窗（默认高度：240,320,420,520,640,720,820），结合结构打分（墨迹/对象覆盖/段落占比；表格再加“列对齐峰+线段密度”），并做边缘“吸附”。
+### 锚点 V2（默认）与"全局锚点一致性"
+- 锚点 V2：围绕 caption 多尺度滑窗（默认高度：240,320,420,520,640,720,820），结合结构打分（墨迹/对象覆盖/段落占比/组件数量；表格再加"列对齐峰+线段密度"），并做边缘"吸附"。
 - 中线护栏：扫描窗口不会跨越相邻两条图注的中线（`--caption-mid-guard 6`，建议 6–10pt）。
-- 距离罚项：候选离 caption 越远得分越低（`--scan-dist-lambda 0.15`，建议 0.15–0.2）。
-- 全局锚点一致性（默认开启）：`--global-anchor auto` 预扫整篇后，若“下方总分”显著高于“上方总分”（或反之），本篇文档所有 Figure 统一采用该方向；阈值由 `--global-anchor-margin` 控制（默认 0.02）。可用 `--global-anchor off` 关闭。
+- 距离罚项：候选离 caption 越远得分越低（`--scan-dist-lambda 0.12`，建议 0.10–0.15）。
+- 全局锚点一致性（默认开启）：
+  - 图片：`--global-anchor auto` 预扫整篇后，若"下方总分"显著高于"上方总分"（或反之），本篇文档所有 Figure 统一采用该方向；阈值由 `--global-anchor-margin` 控制（默认 0.02）。可用 `--global-anchor off` 关闭。
+  - **表格**（新增）：`--global-anchor-table auto` 对表格独立预扫，使用表格专用评分（含列对齐+线密度）；阈值更宽松（默认 0.03）以适应表格排版灵活性。可用 `--global-anchor-table off` 关闭。
 - 模式切换与调试：可用 `--anchor-mode v1|v2` 显式指定锚点策略；扫描步长与高度可由 `--scan-step`、`--scan-heights` 调整；如需导出页面候选窗口用于调试，使用 `--dump-candidates`。
 
 ### 防“半幅/错截”的补救
@@ -82,7 +84,7 @@
 ```
 
 ## 常见问题（FAQ）
-- 图片不显示：始终使用“相对于 MD 的相对路径”。若 MD 与 `images/` 同级，写 `images/...`；若在 `tests/` 下生成 MD，也写 `images/...`（确保与 MD 同级的 `images/` 存在）。
+- 图片不显示：始终使用"相对于 MD 的相对路径"。若 MD 与 `images/` 同级，写 `images/...`；若在 `tests/` 下生成 MD，也写 `images/...`（确保与 MD 同级的 `images/` 存在）。
 - 顶部正文或标题混入：优先 `--above <N>` + `--clip-height`，并启用 A/D（或调高 `--adjacent-th`、`--mask-top-frac`）。
-- 多子图被截半：保持 row 级聚合；开启 B 的“近侧对齐 + 主/横轴并集”，必要时提高 `--autocrop-min-height-px` 或对该图 `--no-refine`。
+- 多子图被截半：保持 row 级聚合；开启 B 的"近侧对齐 + 主/横轴并集"，必要时提高 `--autocrop-min-height-px` 或对该图 `--no-refine`。
 - 需要从图注下方取图：`--below N` 覆盖方向判定（与 A/B/D、验收可叠加）。

@@ -1,7 +1,7 @@
 # pdf-summary-agent
 
 ## Overview (EN)
-Extract text and figure/table PNGs from a research PDF and produce a JSON index. Designed for robust caption-anchored cropping (Anchor v2 with multi-scale scanning), optional auto-cropping, and safety checks to avoid over/under-trimming.
+Extract text and figure/table PNGs from a research PDF and produce a JSON index. Designed for robust caption-anchored cropping (Anchor v2 with multi-scale scanning, global anchor consistency for both figures and tables), optional auto-cropping, and safety checks to avoid over/under-trimming.
 
 - Requirements: Python 3.12+, macOS/Linux recommended
 - Dependencies: PyMuPDF (pymupdf), pdfminer.six
@@ -65,7 +65,7 @@ python3 scripts/extract_pdf_assets.py \
 ---
 
 ## 概述 (ZH)
-从论文 PDF 中提取正文文本与图表 PNG，并生成统一索引 JSON。内置稳健的基于图注定位（Anchor v2 多尺度滑窗）、可选像素级去白边，以及多重安全校验，避免过裁/漏裁。
+从论文 PDF 中提取正文文本与图表 PNG，并生成统一索引 JSON。内置稳健的基于图注定位（Anchor v2 多尺度滑窗，图与表独立全局锚点一致性）、可选像素级去白边，以及多重安全校验，避免过裁/漏裁。
 
 - 环境：Python 3.12+（建议 macOS/Linux）
 - 依赖：PyMuPDF（pymupdf）、pdfminer.six

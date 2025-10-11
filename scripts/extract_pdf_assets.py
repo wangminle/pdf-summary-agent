@@ -757,9 +757,10 @@ def extract_figures(
     # 打开 PDF 文档并准备输出目录
     doc = fitz.open(pdf_path)
     os.makedirs(out_dir, exist_ok=True)
-    # 匹配 “Figure N” 或 “图 N” 的图注起始行（忽略大小写）
+    # 匹配 "Figure N" 或 "图 N" 的图注起始行（忽略大小写），支持续页标记
     figure_line_re = re.compile(
-        r"^\s*(?:(?:Extended\s+Data\s+Figure|Supplementary\s+Figure|Figure|Fig\.?|图表|附图|图)\s*(?:S\s*)?(\d+))\b",
+        r"^\s*(?:(?:Extended\s+Data\s+Figure|Supplementary\s+Figure|Figure|Fig\.?|图表|附图|图)\s*(?:S\s*)?(\d+))"
+        r"(?:\s*\(continued\)|\s*续|\s*接上页)?",  # 可选的续页标记
         re.IGNORECASE,
     )
     seen: Dict[int, str] = {}
@@ -1052,7 +1053,10 @@ def extract_figures(
                         ink = 0.0
                     obj = object_area_ratio(clip)
                     para = _paragraph_ratio(clip, text_lines_all, width_ratio=text_trim_width_ratio, font_min=text_trim_font_min, font_max=text_trim_font_max)
-                    base = 0.6 * ink + 0.3 * obj - 0.25 * para
+                    # 增加组件数量奖励（鼓励捕获更多子图）
+                    comp_cnt = comp_count(clip)
+                    comp_bonus = 0.08 * min(1.0, comp_cnt / 3.0)  # 3+组件额外加分
+                    base = 0.55 * ink + 0.25 * obj - 0.2 * para + comp_bonus
                     # 距离罚项：候选窗离 caption 越远，得分越低
                     if cap_rect:
                         if clip.y1 <= cap_rect.y0:  # above
@@ -1314,6 +1318,14 @@ def extract_figures(
                 # If stacked components shrink to 1, be cautious
                 ok_comp = (r_comp >= min(2, base_comp)) if base_comp >= 2 else True
                 if not (ok_h and ok_a and ok_c and ok_i and ok_comp):
+                    # 收集失败原因用于调试
+                    reasons = []
+                    if not ok_h: reasons.append(f"height={r_height/base_height:.1%}")
+                    if not ok_a: reasons.append(f"area={r_area/base_area:.1%}")
+                    if not ok_c: reasons.append(f"cov={r_cov/base_cov:.1%}" if base_cov > 0 else "cov=low")
+                    if not ok_i: reasons.append(f"ink={r_ink/base_ink:.1%}" if base_ink > 0 else "ink=low")
+                    if not ok_comp: reasons.append(f"comp={r_comp}/{base_comp}")
+                    print(f"[WARN] Fig {fig_no} p{pno+1}: refinement rejected ({', '.join(reasons)}), trying fallback")
                     # try A-only fallback
                     clip_A = _trim_clip_head_by_text(
                         base_clip, page_rect, cap_rect, side, text_lines_all,
@@ -1326,8 +1338,10 @@ def extract_figures(
                     rA_h, rA_a = max(1.0, clip_A.height), max(1.0, clip_A.width * clip_A.height)
                     if (rA_h >= 0.60 * base_height) and (rA_a >= 0.55 * base_area):
                         clip = clip_A
+                        print(f"[INFO] Fig {fig_no} p{pno+1}: using A-only fallback")
                     else:
                         clip = base_clip
+                        print(f"[INFO] Fig {fig_no} p{pno+1}: reverted to baseline")
 
             # 生成安全文件名；若同名已存在（例如多页同名），则附加页码后缀
             base = sanitize_filename_from_caption(caption, fig_no, max_chars=max_caption_chars)
@@ -1512,8 +1526,16 @@ def extract_tables(
     doc = fitz.open(pdf_path)
     os.makedirs(out_dir, exist_ok=True)
 
+    # 改进：支持罗马数字、附录表、补充材料表、续页标记
     table_line_re = re.compile(
-        r"^\s*(?:(?:Extended\s+Data\s+Table|Supplementary\s+Table|Table|Tab\.?|表)\s*(?:S\s*)?([A-Za-z0-9IVX]+))\b",
+        r"^\s*(?:(?:Extended\s+Data\s+Table|Supplementary\s+Table|Table|Tab\.?|表)\s*"
+        r"(?:S\s*)?"
+        r"(?:"
+        r"([A-Z]\d+)|"              # 附录表: A1, B2, C3
+        r"([IVX]{1,5})|"            # 罗马数字: I, II, III, IV, V
+        r"(\d+)"                    # 普通数字: 1, 2, 3
+        r"))"
+        r"(?:\s*\(continued\)|\s*续|\s*接上页)?",  # 可选的续页标记
         re.IGNORECASE,
     )
 
@@ -1526,6 +1548,106 @@ def extract_tables(
     seen_counts: Dict[str, int] = {}
 
     anchor_mode = os.getenv('EXTRACT_ANCHOR_MODE', '').lower()
+    
+    # Global side prescan for tables (similar to figures)
+    global_side_table: Optional[str] = None
+    if os.getenv('GLOBAL_ANCHOR_TABLE', 'auto').lower() == 'auto':
+        try:
+            ga_margin_tbl = float(os.getenv('GLOBAL_ANCHOR_TABLE_MARGIN', '0.03'))
+        except Exception:
+            ga_margin_tbl = 0.03
+        above_total_tbl = 0.0
+        below_total_tbl = 0.0
+        for pno_scan in range(len(doc)):
+            page_s = doc[pno_scan]
+            page_rect_s = page_s.rect
+            dict_data_s = page_s.get_text("dict")
+            text_lines_s = _collect_text_lines(dict_data_s)
+            imgs_s: List[fitz.Rect] = []
+            for blk in dict_data_s.get("blocks", []):
+                if blk.get("type", 0) == 1 and "bbox" in blk:
+                    imgs_s.append(fitz.Rect(*blk["bbox"]))
+            vecs_s: List[fitz.Rect] = []
+            try:
+                for dr in page_s.get_drawings():
+                    if isinstance(dr, dict) and "rect" in dr:
+                        vecs_s.append(fitz.Rect(*dr["rect"]))
+            except Exception:
+                pass
+            draw_items_s = collect_draw_items(page_s)
+            def obj_ratio_s(clip: fitz.Rect) -> float:
+                area = max(1.0, clip.width * clip.height)
+                acc = 0.0
+                for r in imgs_s + vecs_s:
+                    inter = r & clip
+                    if inter.height > 0 and inter.width > 0:
+                        acc += inter.width * inter.height
+                return min(1.0, acc / area)
+            # Find table captions
+            cap_re_tbl = re.compile(
+                r"^\s*(?:(?:Extended\s+Data\s+Table|Supplementary\s+Table|Table|Tab\.?|表)\s*(?:S\s*)?[A-Z0-9IVX]+)\b",
+                re.IGNORECASE
+            )
+            lines_s: List[Tuple[fitz.Rect, str]] = []
+            for blk in dict_data_s.get("blocks", []):
+                if blk.get("type", 0) != 0:
+                    continue
+                for ln in blk.get("lines", []):
+                    text = "".join(sp.get("text", "") for sp in ln.get("spans", []))
+                    lines_s.append((fitz.Rect(*(ln.get("bbox", [0,0,0,0]))), text))
+            caps_tbl: List[fitz.Rect] = [r for (r,t) in lines_s if cap_re_tbl.match(t.strip())]
+            caps_tbl.sort(key=lambda r: r.y0)
+            x_left_s = page_rect_s.x0 + table_margin_x
+            x_right_s = page_rect_s.x1 - table_margin_x
+            for i_c, cap in enumerate(caps_tbl):
+                prev_c = caps_tbl[i_c-1] if i_c-1 >= 0 else None
+                next_c = caps_tbl[i_c+1] if i_c+1 < len(caps_tbl) else None
+                # Above window
+                topb = (prev_c.y1 + 8) if prev_c else page_rect_s.y0
+                botb = cap.y0 - table_caption_gap
+                yt = max(page_rect_s.y0, botb - table_clip_height, topb)
+                yb = min(botb, yt + table_clip_height)
+                yb = max(yt + 40, yb)
+                clip_above = fitz.Rect(x_left_s, yt, x_right_s, min(yb, page_rect_s.y1))
+                # Below window
+                top2 = cap.y1 + table_caption_gap
+                bot2 = (next_c.y0 - 8) if next_c else page_rect_s.y1
+                y0b = min(max(page_rect_s.y0, top2), page_rect_s.y1 - 40)
+                y1b = min(bot2, y0b + table_clip_height)
+                y1b = max(y0b + 40, min(y1b, page_rect_s.y1))
+                clip_below = fitz.Rect(x_left_s, y0b, x_right_s, y1b)
+                # Score using table-specific metrics
+                try:
+                    pix_a = page_s.get_pixmap(matrix=fitz.Matrix(1,1), clip=clip_above, alpha=False)
+                    ink_a = estimate_ink_ratio(pix_a)
+                except Exception:
+                    ink_a = 0.0
+                try:
+                    pix_b = page_s.get_pixmap(matrix=fitz.Matrix(1,1), clip=clip_below, alpha=False)
+                    ink_b = estimate_ink_ratio(pix_b)
+                except Exception:
+                    ink_b = 0.0
+                obj_a = obj_ratio_s(clip_above)
+                obj_b = obj_ratio_s(clip_below)
+                cols_a = _estimate_column_peaks(clip_above, text_lines_s) / 3.0
+                cols_b = _estimate_column_peaks(clip_below, text_lines_s) / 3.0
+                line_a = _line_density(clip_above, draw_items_s)
+                line_b = _line_density(clip_below, draw_items_s)
+                # Table score: ink + cols + lines + obj
+                score_a = 0.4 * ink_a + 0.25 * min(1.0, cols_a) + 0.2 * line_a + 0.15 * obj_a
+                score_b = 0.4 * ink_b + 0.25 * min(1.0, cols_b) + 0.2 * line_b + 0.15 * obj_b
+                above_total_tbl += score_a
+                below_total_tbl += score_b
+        if below_total_tbl > above_total_tbl * (1.0 + ga_margin_tbl):
+            global_side_table = 'below'
+            print(f"[INFO] Global table anchor: BELOW (below={below_total_tbl:.2f} vs above={above_total_tbl:.2f})")
+        elif above_total_tbl > below_total_tbl * (1.0 + ga_margin_tbl):
+            global_side_table = 'above'
+            print(f"[INFO] Global table anchor: ABOVE (above={above_total_tbl:.2f} vs below={below_total_tbl:.2f})")
+        else:
+            global_side_table = None
+            print(f"[INFO] Global table anchor: AUTO (no clear preference)")
+    
     for pno in range(len(doc)):
         page = doc[pno]
         page_rect = page.rect
@@ -1559,7 +1681,11 @@ def extract_tables(
                 if not m:
                     i += 1
                     continue
-                ident = m.group(1).strip()
+                # 提取表号：优先附录表、罗马数字、普通数字
+                ident = (m.group(1) or m.group(2) or m.group(3) or "").strip()
+                if not ident:
+                    i += 1
+                    continue
                 cap_rect = fitz.Rect(*(ln.get("bbox", [0,0,0,0])))
                 parts = [t]
                 char_count = len(t)
@@ -1691,35 +1817,37 @@ def extract_tables(
                     step = 14.0
                 cands: List[Tuple[float, str, fitz.Rect]] = []
 
-                # above
-                top_bound = (prev_cap.y1 + 8) if prev_cap else page_rect.y0
-                bot_bound = cap_rect.y0 - table_caption_gap
-                for h in heights:
-                    y1 = bot_bound
-                    y0_min = max(page_rect.y0, top_bound)
-                    y0 = max(y0_min, y1 - h)
-                    while y0 + 40.0 <= y1:
-                        c = fitz.Rect(x_left, y0, x_right, y1)
-                        sc = score_table_clip(c)
-                        cands.append((sc, 'above', c))
-                        y0 -= step
-                        if y0 < y0_min:
-                            break
-                # below
-                top2 = cap_rect.y1 + table_caption_gap
-                bot2 = (next_cap.y0 - 8) if next_cap else page_rect.y1
-                for h in heights:
-                    y0 = min(max(page_rect.y0, top2), page_rect.y1 - 40)
-                    y1_max = min(bot2, page_rect.y1)
-                    y1 = min(y1_max, y0 + h)
-                    while y1 - 40.0 >= y0:
-                        c = fitz.Rect(x_left, y0, x_right, y1)
-                        sc = score_table_clip(c)
-                        cands.append((sc, 'below', c))
-                        y0 += step
+                # above (respect global anchor for tables)
+                if global_side_table in (None, 'above'):
+                    top_bound = (prev_cap.y1 + 8) if prev_cap else page_rect.y0
+                    bot_bound = cap_rect.y0 - table_caption_gap
+                    for h in heights:
+                        y1 = bot_bound
+                        y0_min = max(page_rect.y0, top_bound)
+                        y0 = max(y0_min, y1 - h)
+                        while y0 + 40.0 <= y1:
+                            c = fitz.Rect(x_left, y0, x_right, y1)
+                            sc = score_table_clip(c)
+                            cands.append((sc, 'above', c))
+                            y0 -= step
+                            if y0 < y0_min:
+                                break
+                # below (respect global anchor for tables)
+                if global_side_table in (None, 'below'):
+                    top2 = cap_rect.y1 + table_caption_gap
+                    bot2 = (next_cap.y0 - 8) if next_cap else page_rect.y1
+                    for h in heights:
+                        y0 = min(max(page_rect.y0, top2), page_rect.y1 - 40)
+                        y1_max = min(bot2, page_rect.y1)
                         y1 = min(y1_max, y0 + h)
-                        if y0 >= y1_max:
-                            break
+                        while y1 - 40.0 >= y0:
+                            c = fitz.Rect(x_left, y0, x_right, y1)
+                            sc = score_table_clip(c)
+                            cands.append((sc, 'below', c))
+                            y0 += step
+                            y1 = min(y1_max, y0 + h)
+                            if y0 >= y1_max:
+                                break
                 if not cands:
                     side = 'above'
                     clip = fitz.Rect(x_left, max(page_rect.y0, cap_rect.y0 - table_clip_height), x_right, min(page_rect.y1, cap_rect.y1 + table_clip_height))
@@ -1852,6 +1980,14 @@ def extract_tables(
                 ok_t = (r_text >= max(1, int(0.75 * base_text))) if base_text > 0 else True
                 ok_comp = (r_comp >= min(2, base_comp)) if base_comp >= 2 else True
                 if not (ok_h and ok_a and ok_i and ok_t and ok_comp):
+                    # 表格验收失败日志
+                    reasons = []
+                    if not ok_h: reasons.append(f"height={r_height/base_height:.1%}")
+                    if not ok_a: reasons.append(f"area={r_area/base_area:.1%}")
+                    if not ok_i: reasons.append(f"ink={r_ink/base_ink:.1%}" if base_ink > 0 else "ink=low")
+                    if not ok_t: reasons.append(f"text_lines={r_text}/{base_text}")
+                    if not ok_comp: reasons.append(f"comp={r_comp}/{base_comp}")
+                    print(f"[WARN] Table {ident} p{pno+1}: refinement rejected ({', '.join(reasons)}), using A-only fallback")
                     clip_A = _trim_clip_head_by_text(
                         base_clip, page_rect, cap_rect, side, text_lines_all,
                         width_ratio=text_trim_width_ratio,
@@ -1911,7 +2047,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--anchor-mode", default="v2", choices=["v1", "v2"], help="Caption-anchoring strategy: v2 uses multi-scale scanning around captions (default)")
     p.add_argument("--scan-step", type=float, default=14.0, help="Vertical scan step (pt) for anchor v2")
     p.add_argument("--scan-heights", default="240,320,420,520,640,720,820", help="Comma-separated window heights (pt) for anchor v2")
-    p.add_argument("--scan-dist-lambda", type=float, default=0.15, help="Penalty weight for distance of candidate window to caption (anchor v2)")
+    p.add_argument("--scan-dist-lambda", type=float, default=0.12, help="Penalty weight for distance of candidate window to caption (anchor v2, recommend 0.10-0.15)")
     p.add_argument("--scan-topk", type=int, default=3, help="Keep top-k candidates during anchor v2 (for debugging)")
     p.add_argument("--dump-candidates", action="store_true", help="Dump page-level candidate boxes for debugging (anchor v2)")
     p.add_argument("--caption-mid-guard", type=float, default=6.0, help="Guard (pt) around midline between adjacent captions to avoid cross-anchoring")
@@ -1924,7 +2060,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--adjacent-th", type=float, default=24.0, help="Adjacency threshold to caption to treat text as body (pt)")
     # B) object connectivity options
     p.add_argument("--object-pad", type=float, default=8.0, help="Padding (pt) added around chosen object component")
-    p.add_argument("--object-min-area-ratio", type=float, default=0.015, help="Min area ratio of object region within clip to be considered")
+    p.add_argument("--object-min-area-ratio", type=float, default=0.012, help="Min area ratio of object region within clip to be considered (lower=more sensitive to small panels)")
     p.add_argument("--object-merge-gap", type=float, default=6.0, help="Gap (pt) when merging nearby object rects")
     # D) text-mask assisted autocrop
     p.add_argument("--autocrop-mask-text", action="store_true", help="Mask paragraph-like text when estimating autocrop bbox")
@@ -1935,14 +2071,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--protect-far-edge-px", type=int, default=14, help="Extra pixels to keep on the far edge during autocrop to avoid over-trim")
     p.add_argument("--near-edge-pad-px", type=int, default=32, help="Extra pixels to expand towards caption side after autocrop (avoid missing axes/labels)")
     # Global anchor consistency
-    p.add_argument("--global-anchor", default="auto", choices=["off", "auto"], help="Choose a single anchor side (above/below) for the whole document per kind via a prescan")
-    p.add_argument("--global-anchor-margin", type=float, default=0.02, help="Margin ratio to decide global side: below > above*(1+margin) or vice versa")
+    p.add_argument("--global-anchor", default="auto", choices=["off", "auto"], help="Choose a single anchor side (above/below) for figures via a prescan")
+    p.add_argument("--global-anchor-margin", type=float, default=0.02, help="Margin ratio to decide global side for figures: below > above*(1+margin) or vice versa")
+    p.add_argument("--global-anchor-table", default="auto", choices=["off", "auto"], help="Choose a single anchor side (above/below) for tables via a prescan (default: auto)")
+    p.add_argument("--global-anchor-table-margin", type=float, default=0.03, help="Margin ratio to decide global side for tables (default: 0.03, more lenient than figures)")
     # Safety & integration
     p.add_argument("--no-refine", default="", help="Comma-separated figure numbers to disable B/D refinements (keep baseline or A)")
     p.add_argument("--refine-near-edge-only", action="store_true", default=True, help="Refinements only adjust near-caption edge (default ON)")
     p.add_argument("--no-refine-near-edge-only", action="store_true", help="Disable near-edge-only behavior (for debugging)")
     p.add_argument("--no-refine-safe", action="store_true", help="Disable safety gates and fallback to baseline")
-    p.add_argument("--autocrop-shrink-limit", type=float, default=0.35, help="Max area shrink ratio allowed during autocrop (0.35 = shrink up to 35%)")
+    p.add_argument("--autocrop-shrink-limit", type=float, default=0.30, help="Max area shrink ratio allowed during autocrop (0.30 = shrink up to 30%, lower=more conservative)")
     p.add_argument("--autocrop-min-height-px", type=int, default=80, help="Minimal height in pixels after autocrop (at render DPI)")
     # Tables
     p.add_argument("--include-tables", dest="include_tables", action="store_true", help="Also extract tables as images")
@@ -2000,7 +2138,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.refine_near_edge_only = True
         args.no_refine_near_edge_only = False
         args.no_refine_safe = False
-        args.autocrop_shrink_limit = 0.35
+        args.autocrop_shrink_limit = 0.30
         args.autocrop_min_height_px = 80
         # Heuristics tuning for over-trim prevention
         args.text_trim_min_para_ratio = 0.18
@@ -2026,6 +2164,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     os.environ.setdefault('CAPTION_MID_GUARD', str(getattr(args, 'caption_mid_guard', 6.0)))
     os.environ.setdefault('GLOBAL_ANCHOR', (args.global_anchor or 'auto'))
     os.environ.setdefault('GLOBAL_ANCHOR_MARGIN', str(getattr(args, 'global_anchor_margin', 0.02)))
+    os.environ.setdefault('GLOBAL_ANCHOR_TABLE', (getattr(args, 'global_anchor_table', 'auto') or 'auto'))
+    os.environ.setdefault('GLOBAL_ANCHOR_TABLE_MARGIN', str(getattr(args, 'global_anchor_table_margin', 0.03)))
 
     # 控制调试导出
     if getattr(args, 'dump_candidates', False):
