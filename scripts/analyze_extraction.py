@@ -16,7 +16,7 @@ def analyze_extraction_results(pdf_dir: Path):
     index_file = images_dir / "index.json"
     
     if not index_file.exists():
-        print(f"❌ 未找到索引文件: {index_file}")
+        print(f"[错误] 未找到索引文件: {index_file}")
         return
     
     # 读取索引
@@ -24,7 +24,7 @@ def analyze_extraction_results(pdf_dir: Path):
         items = json.load(f)
     
     print("=" * 70)
-    print(f"📊 提取结果分析：{pdf_dir.name}")
+    print(f"[提取结果分析] {pdf_dir.name}")
     print("=" * 70)
     print()
     
@@ -32,10 +32,10 @@ def analyze_extraction_results(pdf_dir: Path):
     figures = [x for x in items if x['type'] == 'figure']
     tables = [x for x in items if x['type'] == 'table']
     
-    print(f"📈 总体统计")
-    print(f"  • 总计：{len(items)} 个元素")
-    print(f"  • 图片：{len(figures)} 个")
-    print(f"  • 表格：{len(tables)} 个")
+    print(f"[总体统计]")
+    print(f"  - 总计：{len(items)} 个元素")
+    print(f"  - 图片：{len(figures)} 个")
+    print(f"  - 表格：{len(tables)} 个")
     print()
     
     # 页面分布
@@ -46,14 +46,14 @@ def analyze_extraction_results(pdf_dir: Path):
             page_dist[page] = []
         page_dist[page].append(f"{item['type'].capitalize()} {item['id']}")
     
-    print(f"📄 页面分布")
+    print(f"[页面分布]")
     for page in sorted(page_dist.keys()):
         elements = ", ".join(page_dist[page])
-        print(f"  • Page {page}: {elements}")
+        print(f"  - Page {page}: {elements}")
     print()
     
     # 详细信息
-    print(f"📋 详细信息")
+    print(f"[详细信息]")
     for i, item in enumerate(items, 1):
         print(f"\n  [{i}] {item['type'].upper()} {item['id']}")
         print(f"      页码：Page {item['page']}")
@@ -76,17 +76,22 @@ def analyze_extraction_results(pdf_dir: Path):
         caption = item['caption']
         if len(caption) > 80:
             caption = caption[:77] + "..."
-        print(f"      图注：{caption}")
+        # 安全处理可能的Unicode编码问题
+        try:
+            print(f"      图注：{caption}")
+        except UnicodeEncodeError:
+            safe_caption = caption.encode('ascii', 'replace').decode('ascii')
+            print(f"      图注：{safe_caption}")
         
         if item.get('continued'):
-            print(f"      续页：✓")
+            print(f"      续页：YES")
     
     print()
     print("=" * 70)
     
     # 质量评估
     print()
-    print(f"✅ 质量评估")
+    print(f"[质量评估]")
     
     # 检查是否有漏图
     text_files = list(text_dir.glob("*.txt"))
@@ -99,30 +104,30 @@ def analyze_extraction_results(pdf_dir: Path):
         fig_mentions = len(re.findall(r'\bFigure\s+\d+', text, re.IGNORECASE))
         tab_mentions = len(re.findall(r'\bTable\s+\d+', text, re.IGNORECASE))
         
-        print(f"  • 文本中提到：Figure {fig_mentions}次, Table {tab_mentions}次")
-        print(f"  • 实际提取：Figure {len(figures)}个, Table {len(tables)}个")
+        print(f"  - 文本中提到：Figure {fig_mentions}次, Table {tab_mentions}次")
+        print(f"  - 实际提取：Figure {len(figures)}个, Table {len(tables)}个")
         
         if len(figures) + len(tables) >= fig_mentions + tab_mentions - 2:
-            print(f"  • 完整性：✅ 优秀（提取数量 ≥ 提及次数）")
+            print(f"  - 完整性：[优秀] 提取数量 >= 提及次数")
         elif len(figures) + len(tables) >= (fig_mentions + tab_mentions) * 0.8:
-            print(f"  • 完整性：⚠️  良好（提取数量 ≥ 80%）")
+            print(f"  - 完整性：[良好] 提取数量 >= 80%")
         else:
-            print(f"  • 完整性：❌ 需改进（可能有漏图）")
+            print(f"  - 完整性：[需改进] 可能有漏图")
     
     # 检查文件大小
     total_size = sum((images_dir / item['file']).stat().st_size 
                     for item in items if (images_dir / item['file']).exists())
     avg_size = total_size / len(items) if items else 0
     
-    print(f"  • 总大小：{total_size / 1024:.1f} KB")
-    print(f"  • 平均大小：{avg_size / 1024:.1f} KB/图")
+    print(f"  - 总大小：{total_size / 1024:.1f} KB")
+    print(f"  - 平均大小：{avg_size / 1024:.1f} KB/图")
     
     if 100 < avg_size / 1024 < 300:
-        print(f"  • 文件大小：✅ 合理（100-300KB/图）")
+        print(f"  - 文件大小：[合理] 100-300KB/图")
     elif avg_size / 1024 < 100:
-        print(f"  • 文件大小：⚠️  偏小（可能需要提高DPI）")
+        print(f"  - 文件大小：[偏小] 可能需要提高DPI")
     else:
-        print(f"  • 文件大小：⚠️  偏大（可考虑压缩）")
+        print(f"  - 文件大小：[偏大] 可考虑压缩")
     
     print()
 
@@ -131,7 +136,7 @@ def compare_extractions(dirs: list[Path]):
     """对比多个提取结果"""
     
     print("=" * 70)
-    print(f"📊 多文档提取效果对比")
+    print(f"[多文档提取效果对比]")
     print("=" * 70)
     print()
     

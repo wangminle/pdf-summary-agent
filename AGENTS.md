@@ -3,7 +3,7 @@
 ## 目标与产出
 - 输入：一份论文 PDF。
 - 过程：用 `scripts/extract_pdf_assets.py` 提取正文与“附图与表格”（Figure x / Table x）。
-- 输出：一份 1500–2400 字的中文 Markdown 摘要，嵌入论文全部“图与表”的 PNG，并为每个图表按照标号给出精要解释。
+- 输出：一份 1500–3000 字的 Markdown 摘要，支持中文或英文两种语言，默认是中文，如果用户主动提醒使用英文输出摘要，即改成英文；摘要文档中嵌入论文全部“图与表”的 PNG，并为每个图表按照标号给出精要解释；摘要面向的对象是同专业的高年级本科生，所以对于相对较难或者比较复杂的概念，适当给出专业术语的简要注释。
 - 重要：生成摘要时，必须将 `text/<paper>.txt` 与 `images/*.png` 一并提供给大模型，再生成摘要；不要只给文本或只给图片。
 
 ## 目录与命名
@@ -15,8 +15,60 @@
 - 摘要文档：置于 PDF 同级，命名 `/<paper>_阅读摘要-yyyymmdd.md`；在 MD 中以 `images/...` 相对路径嵌图。
 
 ## 一次跑通（提取文本与图片）
-- 环境：Python 3.12+；依赖安装：`python3 -m pip install --user pymupdf pdfminer.six`
-- 基本执行：`python3 scripts/extract_pdf_assets.py --pdf <PDF_DIR>/<paper>.pdf`
+ - 环境：Python 3.12+；依赖安装：`python3 -m pip install --user pymupdf pdfminer.six`
+ - 基本执行：`python3 scripts/extract_pdf_assets.py --pdf <PDF_DIR>/<paper>.pdf`
+
+### 环境与命令差异（macOS/Linux vs Windows/PowerShell）
+在执行任何命令前，请先确认当前运行环境；不同平台的常用命令如下（避免因命令差异导致报错）：
+
+- macOS/Linux：`python3`、`mv`、`cp`、`pwd`、`date`
+- Windows/PowerShell：`python`、`Move-Item`、`Copy-Item`、`Get-Location`、`Get-Date`
+
+等价示例（已进入 PDF 所在目录 `<PDF_DIR>` 后执行）：
+
+1) 运行提取脚本
+
+```bash
+# macOS/Linux
+python3 scripts/extract_pdf_assets.py --pdf "./<paper>.pdf" --preset robust
+```
+
+```powershell
+# Windows/PowerShell
+python .\scripts\extract_pdf_assets.py --pdf ".\<paper>.pdf" --preset robust
+```
+
+2) 批量重命名图表文件
+
+```bash
+# macOS/Linux
+cd images
+mv "Figure_1_Overview.png" "Figure_1_Architecture_Overview.png"
+mv "Table_1_Raw.png" "Table_1_Model_Performance_Metrics.png"
+cd ..
+```
+
+```powershell
+# Windows/PowerShell
+Set-Location images
+Move-Item "Figure_1_Overview.png" "Figure_1_Architecture_Overview.png"
+Move-Item "Table_1_Raw.png" "Table_1_Model_Performance_Metrics.png"
+Set-Location ..
+```
+
+3) 获取当天日期与当前路径（用于命名和路径确认）
+
+```bash
+# macOS/Linux
+date +%Y%m%d
+pwd
+```
+
+```powershell
+# Windows/PowerShell
+(Get-Date).ToString("yyyyMMdd")
+Get-Location
+```
 
 ### 一键稳健预设（推荐）
 - 使用 `--preset robust` 自动启用稳健参数（A+B+D 精裁 + 验收 + 关键阈值），相当于：
@@ -73,7 +125,7 @@
   3. **结构特征**（20分）：下一行有描述文字、段落长度（长段落可能是正文引用）
   4. **上下文特征**（10分）：语义分析（是否包含"显示"、"展示"等图注关键词，或"如图所示"等引用关键词）
 - **最佳选择**：自动选择得分最高的候选作为真实图注（阈值：25分）。
-- **✨ 2025-01-11 更新**：表格智能Caption检测已启用，与图片使用相同的四维评分机制，成功解决"表格引用"与"真实表注"混淆问题。
+- **✨ 2025-10-11 更新**：表格智能Caption检测已启用，与图片使用相同的四维评分机制，成功解决"表格引用"与"真实表注"混淆问题。
 
 **控制选项**：
 - `--smart-caption-detection`（默认开启）：启用智能识别。
@@ -143,18 +195,184 @@ python3 scripts/extract_pdf_assets.py --pdf paper.pdf --preset robust --far-text
 - 对多子图页，检查 (a)/(b) 是否完整保留。
  - 终端会输出 QC 汇总与弱对齐统计（从 txt 统计 Figure/Table/图/表 出现次数，供参考）。
 
-### 关于“基线→精裁”的融合策略
-- 基线：按“图注为锚点”的上/下候选窗口与评分挑选（row 级聚合，避免子图丢失）。
+- 按修改时间检查最新导出的 PNG（确认时间戳为最近一次运行产生）：
+
+```bash
+# macOS/Linux（取最近 10 张）
+ls -lt images/*.png | head -10
+```
+
+```powershell
+# Windows/PowerShell（取最近 10 张）
+Get-ChildItem images -Filter *.png |
+  Sort-Object LastWriteTime -Descending |
+  Select-Object -First 10 |
+  Format-Table Name, LastWriteTime, Length
+```
+
+### 关于"基线→精裁"的融合策略
+- 基线：按"图注为锚点"的上/下候选窗口与评分挑选（row 级聚合，避免子图丢失）。
 - 精裁：顺序执行 A（单边裁头）→ B（连通域近侧对齐 + 主/横轴并集）→ D（文本掩膜 autocrop，带收缩保护）。
-- 验收：若触发保护门槛，自动回退到 A-only 或基线，避免“半幅/过裁”。
+- 验收：若触发保护门槛，自动回退到 A-only 或基线，避免"半幅/过裁"。
+
+### 可视化调试模式（Visual Debug Mode）
+**问题背景**：当提取结果不理想时（图片截不完整、包含多余内容），需要直观了解各阶段的裁剪过程发生了什么。
+
+**调试功能**：启用 `--debug-visual` 后，脚本会在 `images/debug/` 目录下生成可视化图片和图例文件：
+- `Figure_N_pX_debug_stages.png`：在完整页面上叠加多色边界框，标注各阶段裁剪范围
+- `Figure_N_pX_legend.txt`：文字说明各阶段的尺寸和描述
+
+**边界框颜色方案**：
+| 阶段 | 颜色 | 说明 |
+|------|------|------|
+| Baseline (Anchor Selection) | 🔵 蓝色 | 锚点选择阶段的原始窗口 |
+| Phase A (Text Trimming) | 🟢 绿色 | 文本裁切后的窗口（如果启用） |
+| Phase B (Object Alignment) | 🟠 橙色 | 对象对齐后的窗口（如果启用） |
+| Phase D (Autocrop) | 🔴 红色 | 自动裁剪后的最终窗口（如果成功） |
+| Fallback (Reverted) | 🟡 黄色 | 验收失败，回退到基线（如果发生） |
+| Caption | 🟣 紫色 | 图注位置 |
+
+**使用示例**：
+```bash
+# macOS/Linux
+python3 scripts/extract_pdf_assets.py --pdf paper.pdf --preset robust --debug-visual
+
+# Windows/PowerShell
+python .\scripts\extract_pdf_assets.py --pdf .\paper.pdf --preset robust --debug-visual
+```
+
+**输出示例**：
+```
+[DEBUG] Saved visualization: images/debug/Figure_3_p5_debug_stages.png
+[DEBUG] Saved legend: images/debug/Figure_3_p5_legend.txt
+```
+
+**图例文件内容示例**（`Figure_3_p5_legend.txt`）：
+```
+=== Figure 3 Debug Legend (Page 5) ===
+
+Caption: 72.0,450.2 -> 540.0,465.8 (468.0×15.6pt)
+
+Baseline (Anchor Selection):
+  Position: 46.0,150.0 -> 566.0,444.2
+  Size: 520.0×294.2pt (5.30 sq.in)
+  Color: RGB(0, 102, 255)
+  Description: Initial window from anchor above selection
+
+Phase A (Text Trimming):
+  Position: 46.0,180.5 -> 566.0,444.2
+  Size: 520.0×263.7pt (4.78 sq.in)
+  Color: RGB(0, 200, 0)
+  Description: After removing adjacent text (Phase A+B+C)
+
+Phase D (Final - Autocrop):
+  Position: 58.3,185.2 -> 553.7,438.9
+  Size: 495.4×253.7pt (4.39 sq.in)
+  Color: RGB(255, 0, 0)
+  Description: Final result after A+B+D refinement
+```
+
+**适用场景**：
+- ✅ 诊断图片截不完整的问题（查看哪个阶段过度收缩）
+- ✅ 诊断包含多余内容的问题（查看文本裁切是否生效）
+- ✅ 对比 Baseline 和最终结果，评估精炼效果
+- ✅ 验收失败时查看 Fallback 的回退范围
 
 ## 生成带图摘要（大模型提示词模板）
 请务必同时提供 `text/<paper>.txt` 与 `images/*.png` 的完整集合。建议将 txt 的要点（或全文）与图片清单（图号+文件名）一并喂给模型。
+
+### 📋 必做任务清单
+生成摘要时，大模型必须完成以下两个任务：
+
+#### 任务1：图表文件重命名（必做）
+**背景说明**：脚本默认生成的文件名（如 `Figure_1_Overview_of_the_proposed_deep_learning.png`）是基于原始图注的**临时命名**。大模型需要基于论文完整内容与图表实际含义，为每个图表PNG文件生成**最终命名**。
+
+**重命名规则**：
+- 📏 **单词数量**：5-15个单词（不含 `Figure_N_` 或 `Table_N_` 前缀）
+- 🎯 **命名原则**：
+  - 准确反映图表的核心内容或贡献
+  - 使用专业但简洁的描述性术语
+  - 避免冗长的句式，突出关键概念
+  - 保持与论文术语的一致性
+- 📁 **命名格式**：`Figure_N_<新描述>.png` 或 `Table_N_<新描述>.png`
+- ⚠️ **注意事项**：
+  - 重命名时必须保留原有的 `Figure_N_` 或 `Table_N_` 前缀
+  - 使用下划线 `_` 连接单词，不使用空格
+  - 避免使用特殊字符（仅允许字母、数字、下划线、连字符）
+
+**重命名工作流**：
+1. 阅读论文全文与图表内容
+2. 理解每个图表的核心贡献和含义
+3. 使用 `mv` 命令（macOS/Linux）或等效命令批量重命名所有图表文件
+4. 在摘要文档中使用**新的文件名**嵌入图表
+
+**示例**：
+```bash
+# 原始临时命名（脚本生成）
+Figure_1_Overview_of_the_proposed_deep_learning.png
+
+# 最终命名（大模型重命名）
+mv "images/Figure_1_Overview_of_the_proposed_deep_learning.png" \
+   "images/Figure_1_Architecture_Overview.png"
+
+# 或者更具体的命名
+mv "images/Figure_1_Overview_of_the_proposed_deep_learning.png" \
+   "images/Figure_1_Multimodal_Transformer_Architecture.png"
 ```
-请基于给定的 txt 与全部 PNG 附图与表格，生成一份1500–2000字的中文Markdown摘要：
+
+#### 任务2：生成带图摘要（必做）
+请基于给定的 txt 与全部 PNG 附图与表格，生成一份1500–3000字的中文Markdown摘要：
 - 结构包含：研究动机/方法/训练与后训练/评测与效率/局限与展望/结论。
-- 按编号将所有“图与表”嵌入文档（相对路径如 images/Figure_1_*.png / images/Table_1_*.png），每个元素配1–2句精要解释。
+- 按编号将所有"图与表"嵌入文档（使用**重命名后**的相对路径，如 `images/Figure_1_Architecture_Overview.png`），每个元素配1–2句精要解释。
 - 语言准确、精炼，量化关键点（复杂度、算量、关键超参）。
+
+### 完整工作流示例
+
+**步骤1**：脚本提取（自动执行）
+```bash
+python3 scripts/extract_pdf_assets.py --pdf paper.pdf --preset robust --allow-continued
+# 输出临时命名: Figure_1_Overview_of_the_proposed_deep_learning.png, Figure_2_Experimental_results_on_benchmark_datasets.png, ...
+```
+
+**步骤2**：阅读并理解论文内容
+- 读取 `text/paper.txt` 了解论文整体内容
+- 查看 `images/*.png` 理解每个图表的实际含义
+- 参考 `images/index.json` 获取图表清单
+
+**步骤3**：图表重命名（必做）
+```bash
+# 根据论文内容重命名所有图表
+cd images/
+mv "Figure_1_Overview_of_the_proposed_deep_learning.png" "Figure_1_Multimodal_Architecture_Overview.png"
+mv "Figure_2_Experimental_results_on_benchmark_datasets.png" "Figure_2_Benchmark_Performance_Comparison.png"
+mv "Figure_3_Ablation_study_results_showing_the_impact.png" "Figure_3_Ablation_Study_Results.png"
+mv "Table_1_Comparison_of_model_performance_across_different.png" "Table_1_Model_Performance_Metrics.png"
+mv "Table_2_Hyperparameter_settings_used_in_our_experiments.png" "Table_2_Training_Hyperparameters.png"
+# ... 重命名所有图表
+cd ..
+```
+
+**步骤4**：生成摘要文档（使用新文件名）
+```markdown
+# 论文标题_阅读摘要-20250114.md
+
+## 研究动机
+...
+
+## 方法
+本文提出了一种多模态架构...
+
+![Figure 1: 架构概览](images/Figure_1_Multimodal_Architecture_Overview.png)
+**图1** 展示了提出的多模态Transformer架构，包含...
+
+## 实验结果
+...
+
+![Figure 2: 基准测试性能对比](images/Figure_2_Benchmark_Performance_Comparison.png)
+**图2** 对比了本文方法与现有方法在多个基准数据集上的性能...
+
+![Table 1: 模型性能指标](images/Table_1_Model_Performance_Metrics.png)
+**表1** 列出了不同模型配置的详细性能指标...
 ```
 
 ## 常见问题（FAQ）

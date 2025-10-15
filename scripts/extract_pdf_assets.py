@@ -98,12 +98,43 @@ def try_extract_text(pdf_path: str, out_text: Optional[str]) -> Optional[str]:
         return None
 
 
+# 限制文件名中标号后的单词数量
+def _limit_words_after_prefix(filename: str, prefix_pattern: str, max_words: int = 12) -> str:
+    """
+    限制文件名中前缀（如 Figure_1, Table_S1）之后的单词数量。
+    
+    Args:
+        filename: 完整文件名（不含扩展名）
+        prefix_pattern: 前缀模式（如 'Figure_1', 'Table_2'）
+        max_words: 标号后允许的最大单词数
+    
+    Returns:
+        单词数量受限的文件名
+    """
+    # 找到前缀结束位置（标号之后的第一个下划线）
+    parts = filename.split('_')
+    if len(parts) <= 2:  # 如果只有 'Figure_1' 或更少，直接返回
+        return filename
+    
+    # 前两部分是类型和编号（如 'Figure' + '1'），后面是描述
+    prefix_parts = parts[:2]
+    desc_parts = parts[2:]
+    
+    # 限制描述部分的单词数量
+    if len(desc_parts) > max_words:
+        desc_parts = desc_parts[:max_words]
+    
+    # 重新组合
+    return '_'.join(prefix_parts + desc_parts)
+
+
 # 从图注文本生成安全的文件名：
 # - 规范化分隔符与 Unicode；
 # - 限制可用字符集合；
 # - 压缩多余下划线并限制最大长度；
-# - 确保以 Figure_<no> 开头，避免重复与歧义。
-def sanitize_filename_from_caption(caption: str, figure_no: int, max_chars: int = 160) -> str:
+# - 确保以 Figure_<no> 开头，避免重复与歧义；
+# - 限制标号后的单词数量在12个以内。
+def sanitize_filename_from_caption(caption: str, figure_no: int, max_chars: int = 160, max_words: int = 12) -> str:
     s = caption.strip()
     # normalize & replace common separators
     s = s.replace("|", " ").replace("—", "-").replace("–", "-")
@@ -117,6 +148,8 @@ def sanitize_filename_from_caption(caption: str, figure_no: int, max_chars: int 
         s = f"Figure_{figure_no}_" + s
     if len(s) > max_chars:
         s = s[:max_chars].rstrip("._-")
+    # 限制标号后的单词数量
+    s = _limit_words_after_prefix(s, f"Figure_{figure_no}", max_words=max_words)
     return s
 
 
@@ -473,6 +506,9 @@ def _trim_clip_head_by_text_v2(
     far_text_th: float = 300.0,
     far_text_para_min_ratio: float = 0.30,
     far_text_trim_mode: str = "aggressive",
+    # Phase C tuners (far-side paragraphs)
+    far_side_min_dist: float = 100.0,
+    far_side_para_min_ratio: float = 0.20,
 ) -> fitz.Rect:
     """
     Enhanced dual-threshold text trimming.
@@ -499,6 +535,8 @@ def _trim_clip_head_by_text_v2(
     )
     
     # === Phase B: Detect and trim far-distance text ===
+    # For figures cropped ABOVE the caption, the near side is bottom and the far side is TOP.
+    # For figures cropped BELOW the caption, the near side is top and the far side is BOTTOM.
     near_is_top = (direction == 'below')
     
     # Collect far-distance paragraph lines (use ORIGINAL clip, not Phase A result)
@@ -535,10 +573,25 @@ def _trim_clip_head_by_text_v2(
                     far_para_lines.append((lb, size_est, text))
     
     # (Near-side far-text detection completed)
+    # Compute near-side paragraph coverage ratio for gating
+    para_coverage_ratio = 0.0
+    if far_para_lines:
+        if near_is_top:
+            # near side region = top portion up to mid of ORIGINAL clip
+            region_start = original_clip.y0
+            region_end = original_clip.y0 + max(40.0, 0.5 * original_clip.height)
+            region_h = max(1.0, region_end - region_start)
+            para_h = sum(lb.height for (lb, _, _) in far_para_lines)
+            para_coverage_ratio = para_h / region_h
+        else:
+            # near side region = bottom portion from mid to end of ORIGINAL clip
+            region_start = original_clip.y1 - max(40.0, 0.5 * original_clip.height)
+            region_end = original_clip.y1
+            region_h = max(1.0, region_end - region_start)
+            para_h = sum(lb.height for (lb, _, _) in far_para_lines)
+            para_coverage_ratio = para_h / region_h
     
-    # Phase B trimming (near-side far text)
-    if far_para_lines and para_coverage_ratio >= far_text_para_min_ratio:
-        pass  # Will be handled below
+    # Phase B trimming (near-side far text) – applied later after far-side handling as well
     
     # === Phase C: Detect and trim far-side large paragraphs ===
     far_is_top = not near_is_top  # Opposite side from caption
@@ -563,8 +616,8 @@ def _trim_clip_head_by_text_v2(
         else:
             dist = lb.y0 - caption_rect.y1
         
-        # Must be far from caption (>100pt)
-        if dist > 100.0:
+        # Must be far from caption (> far_side_min_dist)
+        if dist > far_side_min_dist:
             # Check if line is in the far-side region
             if far_is_top:
                 # Far side is TOP, check if in top half of original clip
@@ -592,8 +645,12 @@ def _trim_clip_head_by_text_v2(
         far_side_total_para_height = sum(lb.height for (lb, _, _) in far_side_para_lines)
         far_side_para_coverage = far_side_total_para_height / far_side_region_height
         
-        # Decision: trim far-side if coverage >= 20% (covers edge cases at 0.25)
-        if far_side_para_coverage >= 0.20:
+        # Decision: trim far-side if coverage >= threshold (default 0.20)
+        if far_side_para_coverage >= far_side_para_min_ratio:
+            try:
+                print(f"[DBG] Far-side trim: direction={'above' if near_is_top else 'below'} far_is_top={far_is_top} coverage={far_side_para_coverage:.3f} th={far_side_para_min_ratio}")
+            except Exception:
+                pass
             if far_is_top:
                 # Move clip.y0 down to after last far-side paragraph
                 last_para_y1 = max(lb.y1 for (lb, _, _) in far_side_para_lines)
@@ -608,7 +665,73 @@ def _trim_clip_head_by_text_v2(
                 # Safety: don't trim more than 50% of original clip height
                 min_trim = original_clip.y1 - 0.5 * original_clip.height
                 clip.y1 = max(new_y1, min_trim)
-    
+        else:
+            # Fallback: if no strong paragraph coverage on far side, still trim
+            # obvious top/bottom stray lines that are far from the caption.
+            # 改进：更激进地检测，包括普通段落文字（不仅仅是bullet）
+            fallback_lines: List[fitz.Rect] = []
+            for (lb, size_est, text) in text_lines:
+                if not text.strip():
+                    continue
+                inter = lb & original_clip
+                if inter.width <= 0 or inter.height <= 0:
+                    continue
+                # 先检查是否是明显的正文标记（bullet 或超长文本）
+                txt = text.strip()
+                has_bullet = txt.startswith('•') or txt.startswith('·') or txt.startswith('- ') or txt.startswith('○') or txt.startswith('–')
+                is_very_long_line = len(txt) > 60  # 超长文本行（>60字符）几乎肯定是段落
+                is_long_line = len(txt) > 30  # 长文本行（>30字符）
+                
+                # 如果是 bullet 或超长文本，跳过宽度和字体检查
+                if has_bullet or is_very_long_line:
+                    pass  # 直接进入距离判断
+                else:
+                    # 普通文字需要满足宽度和字体条件
+                    width_ok_small = (inter.width / max(1.0, original_clip.width)) >= max(0.10, width_ratio * 0.3)
+                    size_ok = (font_min <= size_est <= font_max)
+                    if not (width_ok_small and size_ok):
+                        continue
+                
+                # Compute distance to caption and check far side
+                if far_is_top:
+                    dist = caption_rect.y0 - lb.y1
+                    # 扩大检测区域从25%到50%
+                    in_far_region = (lb.y0 < original_clip.y0 + 0.50 * original_clip.height)
+                else:
+                    dist = lb.y0 - caption_rect.y1
+                    in_far_region = (lb.y1 > original_clip.y0 + 0.50 * original_clip.height)
+                
+                # 分层判断：bullet/超长文本 > 长文本 > 普通文字
+                should_trim = False
+                if has_bullet:
+                    # Bullet: 距离 >15pt 且在远侧区域即可
+                    should_trim = (dist > 15.0 and in_far_region)
+                elif is_very_long_line:
+                    # 超长文本: 距离 >18pt 且在远侧区域
+                    should_trim = (dist > 18.0 and in_far_region)
+                elif is_long_line:
+                    # 长文本: 距离 >20pt 且在远侧区域
+                    should_trim = (dist > 20.0 and in_far_region)
+                else:
+                    # 普通段落: 距离 >25pt 且在远侧区域
+                    should_trim = (dist > max(25.0, far_side_min_dist * 0.7) and in_far_region)
+                
+                if should_trim:
+                    fallback_lines.append(lb)
+            if fallback_lines:
+                try:
+                    print(f"[DBG] Far-side fallback trim: lines={len(fallback_lines)}")
+                except Exception:
+                    pass
+                if far_is_top:
+                    new_y0 = max(lb.y1 for lb in fallback_lines) + gap
+                    max_trim = original_clip.y0 + 0.5 * original_clip.height
+                    clip.y0 = min(new_y0, max_trim)
+                else:
+                    new_y1 = min(lb.y0 for lb in fallback_lines) - gap
+                    min_trim = original_clip.y1 - 0.5 * original_clip.height
+                    clip.y1 = max(new_y1, min_trim)
+
     # Now handle Phase B (near-side far text) if applicable
     if far_para_lines and para_coverage_ratio >= far_text_para_min_ratio:
         if far_text_trim_mode == "aggressive":
@@ -1415,6 +1538,7 @@ def extract_figures(
     margin_x: float = 20.0,
     caption_gap: float = 3.0,
     max_caption_chars: int = 160,
+    max_caption_words: int = 12,
     min_figure: int = 1,
     max_figure: int = 999,
     autocrop: bool = False,
@@ -1433,6 +1557,8 @@ def extract_figures(
     far_text_th: float = 300.0,
     far_text_para_min_ratio: float = 0.30,
     far_text_trim_mode: str = "aggressive",
+    far_side_min_dist: float = 100.0,
+    far_side_para_min_ratio: float = 0.20,
     # B: object connectivity options
     object_pad: float = 8.0,
     object_min_area_ratio: float = 0.010,
@@ -1457,6 +1583,8 @@ def extract_figures(
     # Smart caption detection
     smart_caption_detection: bool = True,
     debug_captions: bool = False,
+    # Visual debug mode
+    debug_visual: bool = False,
 ) -> List[AttachmentRecord]:
     # 打开 PDF 文档并准备输出目录
     doc = fitz.open(pdf_path)
@@ -1914,6 +2042,10 @@ def extract_figures(
                         )
                     side = best[1]
                     clip = snap_clip_edges(best[2], draw_items)
+                    try:
+                        print(f"[DBG] Select side={side} for Figure {fig_no} on page {pno+1}")
+                    except Exception:
+                        pass
 
             # clip 已选定（V1/V2）
 
@@ -1925,7 +2057,18 @@ def extract_figures(
             base_ink = ink_ratio_small(base_clip)
             base_comp = comp_count(base_clip)
 
-            # A) 文本邻接裁切：增加“段落占比”门槛，防止误剪图边
+            # === Visual Debug: 初始化并收集 Baseline ===
+            debug_stages: List[DebugStageInfo] = []
+            if debug_visual:
+                debug_stages.append(DebugStageInfo(
+                    name="Baseline (Anchor Selection)",
+                    rect=fitz.Rect(base_clip),
+                    color=(0, 102, 255),  # 蓝色
+                    description=f"Initial window from anchor {side} selection"
+                ))
+
+            # A) 文本邻接裁切：增加"段落占比"门槛，防止误剪图边
+            clip_after_A = fitz.Rect(clip)
             if text_trim:
                 # Always run Phase C (far-side trim) regardless of para_ratio
                 # This handles cases where large paragraphs are far from caption
@@ -1943,9 +2086,23 @@ def extract_figures(
                     far_text_th=far_text_th,
                     far_text_para_min_ratio=far_text_para_min_ratio,
                     far_text_trim_mode=far_text_trim_mode,
+                    # IMPORTANT: also pass far-side controls so callers can tune them
+                    far_side_min_dist=far_side_min_dist,
+                    far_side_para_min_ratio=far_side_para_min_ratio,
                 )
+                clip_after_A = fitz.Rect(clip)
+                
+                # Debug: 收集 Phase A 后的边界框
+                if debug_visual and (clip_after_A != base_clip):
+                    debug_stages.append(DebugStageInfo(
+                        name="Phase A (Text Trimming)",
+                        rect=fitz.Rect(clip_after_A),
+                        color=(0, 200, 0),  # 绿色
+                        description="After removing adjacent text (Phase A+B+C)"
+                    ))
 
             # B) 对象连通域引导（可按图号禁用）
+            clip_after_B = fitz.Rect(clip)
             if not (no_refine_figs and (fig_no in no_refine_figs)):
                 clip = _refine_clip_by_objects(
                     clip,
@@ -1960,8 +2117,18 @@ def extract_figures(
                     use_axis_union=True,
                     use_horizontal_union=True,
                 )
+                clip_after_B = fitz.Rect(clip)
+                
+                # Debug: 收集 Phase B 后的边界框
+                if debug_visual and (clip_after_B != clip_after_A):
+                    debug_stages.append(DebugStageInfo(
+                        name="Phase B (Object Alignment)",
+                        rect=fitz.Rect(clip_after_B),
+                        color=(255, 140, 0),  # 橙色
+                        description="After object connectivity refinement"
+                    ))
 
-            # 额外：若远端边（非靠 caption 一侧）仍有大量对象紧贴，尝试向远端外扩，避免“半幅”
+            # 额外：若远端边（非靠 caption 一侧）仍有大量对象紧贴，尝试向远端外扩，避免"半幅"
             def _touch_far_edge(c: fitz.Rect) -> bool:
                 eps = 2.0
                 if side == 'above':  # far = top
@@ -2085,10 +2252,65 @@ def extract_figures(
                 r_cov = object_area_ratio(refined)
                 r_ink = ink_ratio_small(refined)
                 r_comp = comp_count(refined)
-                ok_h = (r_height >= 0.60 * base_height)
-                ok_a = (r_area >= 0.55 * base_area)
-                ok_c = (r_cov >= (0.85 * base_cov) if base_cov > 0 else True)
-                ok_i = (r_ink >= (0.90 * base_ink) if base_ink > 0 else True)
+                # Adaptive relaxation: if the FAR side of the base clip contains
+                # substantial paragraph text (likely headers/bullets), allow a
+                # stronger shrink since we are intentionally removing that region.
+                relax_h = 0.60
+                relax_a = 0.55
+                try:
+                    near_is_top = (side == 'below')
+                    far_is_top = not near_is_top
+                    # estimate far-side paragraph coverage on BASE clip
+                    far_lines: List[fitz.Rect] = []
+                    for (lb, fs, tx) in text_lines_all:
+                        if not tx.strip():
+                            continue
+                        inter = lb & base_clip
+                        if inter.width <= 0 or inter.height <= 0:
+                            continue
+                        width_ok = (inter.width / max(1.0, base_clip.width)) >= max(0.35, text_trim_width_ratio * 0.7)
+                        size_ok = (text_trim_font_min <= fs <= text_trim_font_max)
+                        if not (width_ok and size_ok):
+                            continue
+                        if far_is_top:
+                            in_far = (lb.y0 < base_clip.y0 + 0.5 * base_clip.height)
+                        else:
+                            in_far = (lb.y1 > base_clip.y0 + 0.5 * base_clip.height)
+                        if in_far:
+                            far_lines.append(lb)
+                    far_cov = 0.0
+                    if far_lines:
+                        if far_is_top:
+                            region_h = max(1.0, (base_clip.y0 + 0.5 * base_clip.height) - base_clip.y0)
+                        else:
+                            region_h = max(1.0, base_clip.y1 - (base_clip.y0 + 0.5 * base_clip.height))
+                        far_cov = sum(lb.height for lb in far_lines) / region_h
+                    # Relax thresholds if far-side paragraphs are present
+                    # 分层策略：远侧文字越多，允许缩小得越多
+                    # 同时调整 ink 和 coverage 的阈值
+                    relax_ink = 0.90
+                    relax_cov = 0.85
+                    if far_cov >= 0.60:  # 极高覆盖率（>60%）：很可能是大段正文
+                        relax_h = 0.35
+                        relax_a = 0.25
+                        relax_ink = 0.70  # 允许 ink 降到70%
+                        relax_cov = 0.70  # 允许 coverage 降到70%
+                    elif far_cov >= 0.30:  # 高覆盖率（30-60%）：可能是多行段落
+                        relax_h = 0.45
+                        relax_a = 0.35
+                        relax_ink = 0.75
+                        relax_cov = 0.75
+                    elif far_cov >= 0.18:  # 中等覆盖率（18-30%）：少量文字
+                        relax_h = 0.50
+                        relax_a = 0.40
+                        relax_ink = 0.80
+                        relax_cov = 0.80
+                except Exception:
+                    pass
+                ok_h = (r_height >= relax_h * base_height)
+                ok_a = (r_area >= relax_a * base_area)
+                ok_c = (r_cov >= (relax_cov * base_cov) if base_cov > 0 else True)
+                ok_i = (r_ink >= (relax_ink * base_ink) if base_ink > 0 else True)
                 # If stacked components shrink to 1, be cautious
                 ok_comp = (r_comp >= min(2, base_comp)) if base_comp >= 2 else True
                 if not (ok_h and ok_a and ok_c and ok_i and ok_comp):
@@ -2111,6 +2333,8 @@ def extract_figures(
                         far_text_th=far_text_th,
                         far_text_para_min_ratio=far_text_para_min_ratio,
                         far_text_trim_mode=far_text_trim_mode,
+                        far_side_min_dist=far_side_min_dist,
+                        far_side_para_min_ratio=far_side_para_min_ratio,
                     ) if text_trim else base_clip
                     rA_h, rA_a = max(1.0, clip_A.height), max(1.0, clip_A.width * clip_A.height)
                     if (rA_h >= 0.60 * base_height) and (rA_a >= 0.55 * base_area):
@@ -2119,9 +2343,53 @@ def extract_figures(
                     else:
                         clip = base_clip
                         print(f"[INFO] Fig {fig_no} p{pno+1}: reverted to baseline")
+                        # Debug: 标记 Fallback to Baseline
+                        if debug_visual:
+                            debug_stages.append(DebugStageInfo(
+                                name="Fallback (Reverted to Baseline)",
+                                rect=fitz.Rect(clip),
+                                color=(255, 255, 0),  # 黄色
+                                description="Refinement rejected, reverted to baseline"
+                            ))
+            
+            # Debug: 标记最终结果（成功的精炼或 A-only fallback）
+            if debug_visual:
+                # 检查是否使用了 autocrop（通过比较当前 clip 和之前的阶段）
+                if autocrop and (clip != base_clip) and (clip != clip_after_A):
+                    # 成功的 autocrop 结果
+                    debug_stages.append(DebugStageInfo(
+                        name="Phase D (Final - Autocrop)",
+                        rect=fitz.Rect(clip),
+                        color=(255, 0, 0),  # 红色
+                        description="Final result after A+B+D refinement"
+                    ))
+                elif clip == clip_after_A and text_trim:
+                    # A-only fallback（没有其他阶段改变了边界）
+                    if not any(stage.name.startswith("Fallback") for stage in debug_stages):
+                        debug_stages.append(DebugStageInfo(
+                            name="Final (A-only Fallback)",
+                            rect=fitz.Rect(clip),
+                            color=(255, 200, 0),  # 金黄色
+                            description="A-only fallback result (B/D rejected)"
+                        ))
+            
+            # === Visual Debug: 保存可视化 ===
+            if debug_visual:
+                try:
+                    save_debug_visualization(
+                        page=page,
+                        out_dir=out_dir,
+                        fig_no=fig_no,
+                        page_num=pno + 1,
+                        stages=debug_stages,
+                        caption_rect=cap_rect,
+                        kind='figure'
+                    )
+                except Exception as e:
+                    print(f"[WARN] Debug visualization failed for Figure {fig_no}: {e}")
 
             # 生成安全文件名；若同名已存在（例如多页同名），则附加页码后缀
-            base = sanitize_filename_from_caption(caption, fig_no, max_chars=max_caption_chars)
+            base = sanitize_filename_from_caption(caption, fig_no, max_chars=max_caption_chars, max_words=max_caption_words)
             # 同号多页：根据选项决定是否允许继续导出，并命名为 continued
             count_prev = seen_counts.get(fig_no, 0)
             if count_prev >= 1 and not allow_continued:
@@ -2160,7 +2428,7 @@ def write_manifest(records: List[AttachmentRecord], manifest_path: Optional[str]
 
 
 # ---- 通用：从 kind/ident + caption 生成输出基名（不含扩展名） ----
-def build_output_basename(kind: str, ident: str, caption: str, max_chars: int = 160) -> str:
+def build_output_basename(kind: str, ident: str, caption: str, max_chars: int = 160, max_words: int = 12) -> str:
     # 基于现有 sanitize 逻辑，但前缀由 kind + ident 组成
     s = caption.strip()
     s = s.replace("|", " ").replace("—", "-").replace("–", "-")
@@ -2173,6 +2441,8 @@ def build_output_basename(kind: str, ident: str, caption: str, max_chars: int = 
         s = f"{prefix}_" + s
     if len(s) > max_chars:
         s = s[:max_chars].rstrip("._-")
+    # 限制标号后的单词数量
+    s = _limit_words_after_prefix(s, prefix, max_words=max_words)
     return s
 
 
@@ -2198,9 +2468,10 @@ def write_index_json(records: List[AttachmentRecord], index_path: str) -> Option
     return index_path
 
 
-def _draw_rects_on_pix(pix: "fitz.Pixmap", rects: List[Tuple[fitz.Rect, Tuple[int, int, int]]], *, scale: float) -> None:
+def _draw_rects_on_pix(pix: "fitz.Pixmap", rects: List[Tuple[fitz.Rect, Tuple[int, int, int]]], *, scale: float, line_width: int = 1) -> None:
     """Draw rectangle edges on a pixmap in-place with RGB colors.
     rects: list of (rect, (r,g,b))
+    line_width: thickness of the border lines (default: 1)
     """
     # Ensure no alpha
     if pix.alpha:
@@ -2208,7 +2479,8 @@ def _draw_rects_on_pix(pix: "fitz.Pixmap", rects: List[Tuple[fitz.Rect, Tuple[in
         pix = tmp
     w, h = pix.width, pix.height
     n = pix.n
-    samples = pix.samples  # bytes-like
+    # Convert to mutable bytearray for pixel modification
+    samples = bytearray(pix.samples)
     stride = pix.stride
 
     def set_px(x: int, y: int, color: Tuple[int, int, int]):
@@ -2225,12 +2497,20 @@ def _draw_rects_on_pix(pix: "fitz.Pixmap", rects: List[Tuple[fitz.Rect, Tuple[in
         rx = int(min(w - 1, (r.x1) * scale))
         ty = int(max(0, (r.y0) * scale))
         by = int(min(h - 1, (r.y1) * scale))
-        for x in range(lx, rx + 1):
-            set_px(x, ty, col)
-            set_px(x, by, col)
-        for y in range(ty, by + 1):
-            set_px(lx, y, col)
-            set_px(rx, y, col)
+        
+        # Draw border with line_width
+        for offset in range(line_width):
+            # Top and bottom edges
+            for x in range(lx, rx + 1):
+                set_px(x, ty + offset, col)
+                set_px(x, by - offset, col)
+            # Left and right edges
+            for y in range(ty, by + 1):
+                set_px(lx + offset, y, col)
+                set_px(rx - offset, y, col)
+    
+    # Write modified samples back to pixmap
+    pix.set_samples(bytes(samples))
 
 
 # Debug: dump top-k candidates per page
@@ -2253,10 +2533,118 @@ def dump_page_candidates(
             rects.append((r, (255, 85, 85)))
         # Best in green (overwrite color at end)
         rects.append((best[2], (0, 200, 0)))
-        _draw_rects_on_pix(pix, rects, scale=scale)
+        _draw_rects_on_pix(pix, rects, scale=scale, line_width=1)
         pix.save(out_path)
         return out_path
     except Exception:
+        return None
+
+
+# ---- Visual Debug: 保存多阶段边界框可视化 ----
+@dataclass
+class DebugStageInfo:
+    """调试阶段信息"""
+    name: str              # 阶段名称
+    rect: fitz.Rect        # 边界框
+    color: Tuple[int, int, int]  # RGB 颜色
+    description: str       # 描述信息
+
+
+def save_debug_visualization(
+    page: "fitz.Page",
+    out_dir: str,
+    fig_no: int,
+    page_num: int,
+    *,
+    stages: List[DebugStageInfo],
+    caption_rect: fitz.Rect,
+    kind: str = 'figure',
+) -> Optional[str]:
+    """
+    保存带多色线框的调试可视化图片
+    
+    Args:
+        page: 页面对象
+        out_dir: 输出目录
+        fig_no: 图/表编号
+        page_num: 页码（1-based）
+        stages: 阶段信息列表
+        caption_rect: 图注边界框
+        kind: 'figure' 或 'table'
+    
+    Returns:
+        输出文件路径
+    """
+    try:
+        debug_dir = os.path.join(out_dir, "debug")
+        os.makedirs(debug_dir, exist_ok=True)
+        
+        # 创建一个临时 PDF 页面副本用于绘图
+        # 使用 PyMuPDF 的 Shape 对象在页面上绘制矩形
+        src_doc = page.parent
+        # 创建临时 PDF 文档
+        temp_doc = fitz.open()
+        temp_page = temp_doc.new_page(width=page.rect.width, height=page.rect.height)
+        
+        # 先渲染原始页面内容
+        scale_render = 2.0  # 2x 分辨率
+        pix = page.get_pixmap(matrix=fitz.Matrix(scale_render, scale_render), alpha=False)
+        
+        # 在 temp_page 上插入原始页面的图像
+        temp_page.insert_image(temp_page.rect, pixmap=pix)
+        
+        # 绘制边界框（按从大到小排序，确保小的框在上面）
+        sorted_stages = sorted(stages, key=lambda s: s.rect.width * s.rect.height, reverse=True)
+        
+        shape = temp_page.new_shape()
+        
+        # 绘制所有阶段的边界框
+        for stage in sorted_stages:
+            r = stage.rect
+            color_normalized = tuple(c / 255.0 for c in stage.color)  # PyMuPDF 使用 0-1 范围
+            shape.draw_rect(r)
+            shape.finish(color=color_normalized, width=3)
+        
+        # 绘制 caption（紫色）
+        caption_color = (148/255.0, 0, 211/255.0)
+        shape.draw_rect(caption_rect)
+        shape.finish(color=caption_color, width=3)
+        
+        shape.commit()
+        
+        # 渲染最终结果
+        final_pix = temp_page.get_pixmap(matrix=fitz.Matrix(scale_render, scale_render), alpha=False)
+        
+        # 保存可视化图片
+        prefix = kind.capitalize()
+        vis_path = os.path.join(debug_dir, f"{prefix}_{fig_no}_p{page_num}_debug_stages.png")
+        final_pix.save(vis_path)
+        
+        # 关闭临时文档
+        temp_doc.close()
+        
+        # 生成文字图例
+        legend_path = os.path.join(debug_dir, f"{prefix}_{fig_no}_p{page_num}_legend.txt")
+        with open(legend_path, 'w', encoding='utf-8') as f:
+            f.write(f"=== {prefix} {fig_no} Debug Legend (Page {page_num}) ===\n\n")
+            f.write(f"Caption: {caption_rect.x0:.1f},{caption_rect.y0:.1f} -> {caption_rect.x1:.1f},{caption_rect.y1:.1f} "
+                    f"({caption_rect.width:.1f}×{caption_rect.height:.1f}pt)\n\n")
+            
+            for stage in stages:
+                r = stage.rect
+                f.write(f"{stage.name}:\n")
+                f.write(f"  Position: {r.x0:.1f},{r.y0:.1f} -> {r.x1:.1f},{r.y1:.1f}\n")
+                f.write(f"  Size: {r.width:.1f}×{r.height:.1f}pt ({r.width * r.height / 72.0 / 72.0:.2f} sq.in)\n")
+                f.write(f"  Color: RGB{stage.color}\n")
+                f.write(f"  Description: {stage.description}\n\n")
+        
+        print(f"[DEBUG] Saved visualization: {vis_path}")
+        print(f"[DEBUG] Saved legend: {legend_path}")
+        return vis_path
+    except Exception as e:
+        print(f"[WARN] Debug visualization failed: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 # ---- 表格提取（Table/表） ----
@@ -2269,6 +2657,7 @@ def extract_tables(
     table_margin_x: float = 26.0,
     table_caption_gap: float = 6.0,
     max_caption_chars: int = 160,
+    max_caption_words: int = 12,
     min_table: Optional[str] = None,
     max_table: Optional[str] = None,
     autocrop: bool = True,
@@ -2287,6 +2676,8 @@ def extract_tables(
     far_text_th: float = 300.0,
     far_text_para_min_ratio: float = 0.30,
     far_text_trim_mode: str = "aggressive",
+    far_side_min_dist: float = 100.0,
+    far_side_para_min_ratio: float = 0.20,
     # B)
     object_pad: float = 8.0,
     object_min_area_ratio: float = 0.005,
@@ -2306,6 +2697,8 @@ def extract_tables(
     # Smart caption detection
     smart_caption_detection: bool = True,
     debug_captions: bool = False,
+    # Visual debug mode
+    debug_visual: bool = False,
 ) -> List[AttachmentRecord]:
     doc = fitz.open(pdf_path)
     os.makedirs(out_dir, exist_ok=True)
@@ -2755,6 +3148,8 @@ def extract_tables(
                     far_text_th=far_text_th,
                     far_text_para_min_ratio=far_text_para_min_ratio,
                     far_text_trim_mode=far_text_trim_mode,
+                    far_side_min_dist=far_side_min_dist,
+                    far_side_para_min_ratio=far_side_para_min_ratio,
                 )
 
             clip = _refine_clip_by_objects(
@@ -2838,10 +3233,61 @@ def extract_tables(
                     r_ink = estimate_ink_ratio(pix_small2)
                 except Exception:
                     pass
-                ok_h = (r_height >= 0.50 * base_height)
-                ok_a = (r_area >= 0.45 * base_area)
-                ok_i = (r_ink >= (0.85 * base_ink) if base_ink > 0 else True)
-                ok_t = (r_text >= max(1, int(0.75 * base_text))) if base_text > 0 else True
+                # 表格也检测远侧文字覆盖率，分层放宽阈值
+                relax_h = 0.50
+                relax_a = 0.45
+                try:
+                    near_is_top = (side == 'below')
+                    far_is_top = not near_is_top
+                    far_lines_tbl: List[fitz.Rect] = []
+                    for (lb, fs, tx) in text_lines_all:
+                        if not tx.strip():
+                            continue
+                        inter = lb & base_clip
+                        if inter.width <= 0 or inter.height <= 0:
+                            continue
+                        width_ok = (inter.width / max(1.0, base_clip.width)) >= max(0.35, text_trim_width_ratio * 0.7)
+                        size_ok = (text_trim_font_min <= fs <= text_trim_font_max)
+                        if not (width_ok and size_ok):
+                            continue
+                        if far_is_top:
+                            in_far = (lb.y0 < base_clip.y0 + 0.5 * base_clip.height)
+                        else:
+                            in_far = (lb.y1 > base_clip.y0 + 0.5 * base_clip.height)
+                        if in_far:
+                            far_lines_tbl.append(lb)
+                    far_cov_tbl = 0.0
+                    if far_lines_tbl:
+                        if far_is_top:
+                            region_h_tbl = max(1.0, (base_clip.y0 + 0.5 * base_clip.height) - base_clip.y0)
+                        else:
+                            region_h_tbl = max(1.0, base_clip.y1 - (base_clip.y0 + 0.5 * base_clip.height))
+                        far_cov_tbl = sum(lb.height for lb in far_lines_tbl) / region_h_tbl
+                    # 分层策略（与 figure 一致）
+                    # 同时调整 ink 和 text_lines 的阈值
+                    relax_ink = 0.85
+                    relax_text = 0.75
+                    if far_cov_tbl >= 0.60:
+                        relax_h = 0.35
+                        relax_a = 0.25
+                        relax_ink = 0.70  # 极高覆盖率：允许 ink 降到70%
+                        relax_text = 0.55  # 允许 text_lines 降到55%
+                    elif far_cov_tbl >= 0.30:
+                        relax_h = 0.45
+                        relax_a = 0.35
+                        relax_ink = 0.75
+                        relax_text = 0.60
+                    elif far_cov_tbl >= 0.18:
+                        relax_h = 0.50
+                        relax_a = 0.40
+                        relax_ink = 0.80
+                        relax_text = 0.65
+                except Exception:
+                    pass
+                ok_h = (r_height >= relax_h * base_height)
+                ok_a = (r_area >= relax_a * base_area)
+                ok_i = (r_ink >= (relax_ink * base_ink) if base_ink > 0 else True)
+                ok_t = (r_text >= max(1, int(relax_text * base_text))) if base_text > 0 else True
                 ok_comp = (r_comp >= min(2, base_comp)) if base_comp >= 2 else True
                 if not (ok_h and ok_a and ok_i and ok_t and ok_comp):
                     # 表格验收失败日志
@@ -2862,6 +3308,8 @@ def extract_tables(
                         far_text_th=far_text_th,
                         far_text_para_min_ratio=far_text_para_min_ratio,
                         far_text_trim_mode=far_text_trim_mode,
+                        far_side_min_dist=far_side_min_dist,
+                        far_side_para_min_ratio=far_side_para_min_ratio,
                     ) if text_trim else base_clip
                     clip = clip_A
                     try:
@@ -2869,7 +3317,7 @@ def extract_tables(
                     except Exception:
                         pass
 
-            base_name = build_output_basename('Table', ident, caption, max_chars=max_caption_chars)
+            base_name = build_output_basename('Table', ident, caption, max_chars=max_caption_chars, max_words=max_caption_words)
             count_prev = seen_counts.get(ident, 0)
             cont = False
             if count_prev >= 1 and not allow_continued:
@@ -2900,6 +3348,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--margin-x", type=float, default=20.0, help="Horizontal page margin (pt)")
     p.add_argument("--caption-gap", type=float, default=5.0, help="Gap between caption and crop bottom (pt)")
     p.add_argument("--max-caption-chars", type=int, default=160, help="Max characters for caption-based filename")
+    p.add_argument("--max-caption-words", type=int, default=12, help="Max words after figure/table number in filename (default: 12)")
     p.add_argument("--min-figure", type=int, default=1, help="Minimum figure number to extract")
     p.add_argument("--max-figure", type=int, default=999, help="Maximum figure number to extract")
     # Autocrop related (default OFF). --autocrop enables trimming white margins.
@@ -2922,6 +3371,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--smart-caption-detection", action="store_true", default=True, help="Enable smart caption detection to distinguish real captions from in-text references (default: enabled)")
     p.add_argument("--no-smart-caption-detection", action="store_false", dest="smart_caption_detection", help="Disable smart caption detection (use simple pattern matching)")
     p.add_argument("--debug-captions", action="store_true", help="Print detailed caption candidate scoring information for debugging")
+    # Visual debug mode (NEW)
+    p.add_argument("--debug-visual", action="store_true", help="Enable visual debugging mode: save multi-stage boundary boxes overlaid on full page (output to images/debug/)")
     # A) text trimming options
     p.add_argument("--text-trim", action="store_true", help="Trim paragraph-like text near caption side inside chosen clip")
     p.add_argument("--text-trim-width-ratio", type=float, default=0.5, help="Min horizontal overlap ratio to treat a line as paragraph text")
@@ -2933,6 +3384,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--far-text-th", type=float, default=300.0, help="Maximum distance to detect far text (pt)")
     p.add_argument("--far-text-para-min-ratio", type=float, default=0.30, help="Minimum paragraph coverage ratio to trigger far-text trim")
     p.add_argument("--far-text-trim-mode", type=str, default="aggressive", choices=["aggressive", "conservative"], help="Far-text trim mode")
+    p.add_argument("--far-side-min-dist", type=float, default=100.0, help="Minimum distance to detect far-side text (pt)")
+    p.add_argument("--far-side-para-min-ratio", type=float, default=0.20, help="Minimum paragraph coverage ratio to trigger far-side trim")
     # B) object connectivity options
     p.add_argument("--object-pad", type=float, default=8.0, help="Padding (pt) added around chosen object component")
     p.add_argument("--object-min-area-ratio", type=float, default=0.012, help="Min area ratio of object region within clip to be considered (lower=more sensitive to small panels)")
@@ -3067,6 +3520,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         margin_x=args.margin_x,
         caption_gap=args.caption_gap,
         max_caption_chars=args.max_caption_chars,
+        max_caption_words=getattr(args, 'max_caption_words', 12),
         min_figure=args.min_figure,
         max_figure=args.max_figure,
         autocrop=args.autocrop,
@@ -3083,6 +3537,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         far_text_th=getattr(args, 'far_text_th', 300.0),
         far_text_para_min_ratio=getattr(args, 'far_text_para_min_ratio', 0.30),
         far_text_trim_mode=getattr(args, 'far_text_trim_mode', 'aggressive'),
+        far_side_min_dist=getattr(args, 'far_side_min_dist', 100.0),
+        far_side_para_min_ratio=getattr(args, 'far_side_para_min_ratio', 0.20),
         object_pad=args.object_pad,
         object_min_area_ratio=args.object_min_area_ratio,
         object_merge_gap=args.object_merge_gap,
@@ -3101,6 +3557,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         allow_continued=args.allow_continued,
         smart_caption_detection=getattr(args, 'smart_caption_detection', True),
         debug_captions=getattr(args, 'debug_captions', False),
+        debug_visual=getattr(args, 'debug_visual', False),
     )
 
     # 汇总记录
@@ -3119,6 +3576,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             table_margin_x=args.table_margin_x,
             table_caption_gap=args.table_caption_gap,
             max_caption_chars=args.max_caption_chars,
+            max_caption_words=getattr(args, 'max_caption_words', 12),
             autocrop=getattr(args, 'table_autocrop', True),
             autocrop_pad_px=getattr(args, 'table_autocrop_pad', 20),
             autocrop_white_threshold=getattr(args, 'table_autocrop_white_th', 250),
@@ -3133,6 +3591,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             far_text_th=getattr(args, 'far_text_th', 300.0),
             far_text_para_min_ratio=getattr(args, 'far_text_para_min_ratio', 0.30),
             far_text_trim_mode=getattr(args, 'far_text_trim_mode', 'aggressive'),
+            far_side_min_dist=getattr(args, 'far_side_min_dist', 100.0),
+            far_side_para_min_ratio=getattr(args, 'far_side_para_min_ratio', 0.20),
             object_pad=getattr(args, 'object_pad', 8.0),
             object_min_area_ratio=getattr(args, 'table_object_min_area_ratio', 0.005),
             object_merge_gap=getattr(args, 'table_object_merge_gap', 4.0),
@@ -3148,6 +3608,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             protect_far_edge_px=getattr(args, 'protect_far_edge_px', 12),
             smart_caption_detection=getattr(args, 'smart_caption_detection', True),
             debug_captions=getattr(args, 'debug_captions', False),
+            debug_visual=getattr(args, 'debug_visual', False),
         )
         all_records.extend(tbl_records)
 

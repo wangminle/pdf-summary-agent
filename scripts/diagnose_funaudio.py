@@ -65,13 +65,14 @@ def analyze_figure_context(pdf_path: str, page_num: int, fig_no: int, caption_y:
         if dist <= 24:
             if w_ratio >= 0.5 and 7 <= font <= 16:
                 should_trim = True
-                reason = "✓ TRIM (邻接)"
+                reason = "[TRIM] 邻接"
             else:
-                reason = f"✗ 未trim(w={w_ratio:.2f})"
+                reason = f"[未trim] w={w_ratio:.2f}"
         else:
-            reason = f"✗ 距离太远({dist:.0f}pt)"
+            reason = f"[远] 距离{dist:.0f}pt"
         
-        print(f"{dist:>8.1f}pt  {w_ratio:>6.2f}  {font:>4.1f}pt  {reason:<15} {ln['text'][:50]}")
+        text_preview = ln['text'][:50].encode('ascii', 'replace').decode('ascii')
+        print(f"{dist:>8.1f}pt  {w_ratio:>6.2f}  {font:>4.1f}pt  {reason:<20} {text_preview}")
     
     # 收集绘图对象
     drawings = []
@@ -156,8 +157,10 @@ def analyze_table8(pdf_path: str):
     print(f"\n找到 {len(candidates)} 个候选:")
     for i, cand in enumerate(candidates, 1):
         print(f"\n候选 {i}: y={cand['y']:.1f}pt")
-        print(f"  文本: {cand['text'][:80]}...")
-        print(f"  格式分: {cand['format_score']} (冒号={'✓' if cand['has_colon'] else '✗'})")
+        text_safe = cand['text'][:80].encode('ascii', 'replace').decode('ascii')
+        print(f"  文本: {text_safe}...")
+        colon_mark = 'YES' if cand['has_colon'] else 'NO'
+        print(f"  格式分: {cand['format_score']} (冒号={colon_mark})")
         print(f"  上下文分: {cand['context_score']}")
         print(f"  结构分: {cand['structure_score']} (段落长度={cand['para_len']})")
         print(f"  预估总分: {cand['total']}")
