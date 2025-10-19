@@ -62,10 +62,12 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Iterable, Any
 
-# 运行时版本检查：要求 Python 3.12+
-if sys.version_info < (3, 12):  # pragma: no cover
-    print(f"[ERROR] Python 3.12+ is required; found {sys.version.split()[0]}", file=sys.stderr)
+# 运行时版本检查：优先建议 Python 3.12+；在 3.10/3.11 上降级运行（给出警告，但不退出）
+if sys.version_info < (3, 10):  # pragma: no cover
+    print(f"[ERROR] Python 3.10+ is required; found {sys.version.split()[0]}", file=sys.stderr)
     raise SystemExit(3)
+elif sys.version_info < (3, 12):  # pragma: no cover
+    print(f"[WARN] Python 3.12+ is recommended; running with {sys.version.split()[0]}", file=sys.stderr)
 
 # 依赖检查：PyMuPDF 是渲染与页面结构读取的核心依赖
 try:
@@ -400,6 +402,212 @@ def _collect_text_lines(dict_data: Dict) -> List[Tuple[fitz.Rect, float, str]]:
     return out
 
 
+def _detect_exact_n_lines_of_text(
+    clip_rect: fitz.Rect,
+    text_lines: List[Tuple[fitz.Rect, float, str]],
+    typical_line_h: float,
+    n: int = 2,
+    tolerance: float = 0.35
+) -> Tuple[bool, List[fitz.Rect]]:
+    """
+    检测clip_rect中是否恰好包含n行文字。
+    
+    Args:
+        clip_rect: 待检测的矩形区域
+        text_lines: 文本行列表 (bbox, font_size, text)
+        typical_line_h: 典型行高
+        n: 期望的行数
+        tolerance: 容差（相对于期望值的比例）
+    
+    Returns:
+        (is_exact_n_lines, matched_line_bboxes)
+    """
+    # 筛选在区域内的文本行
+    text_in_region = []
+    for bbox, size_est, text in text_lines:
+        if bbox.intersects(clip_rect) and bbox.height < typical_line_h * 1.5:
+            text_in_region.append((bbox, size_est, text))
+    
+    if not text_in_region:
+        return False, []
+    
+    # 按y坐标排序
+    text_in_region.sort(key=lambda x: x[0].y0)
+    
+    # 计算实际行数（根据y间距判断是否为同一行）
+    actual_lines = []
+    current_line_bboxes = [text_in_region[0][0]]
+    
+    for i in range(1, len(text_in_region)):
+        prev_bbox = text_in_region[i-1][0]
+        curr_bbox = text_in_region[i][0]
+        gap = curr_bbox.y0 - prev_bbox.y1
+        
+        if gap < typical_line_h * 0.8:  # 认为是同一行
+            current_line_bboxes.append(curr_bbox)
+        else:  # 新的一行
+            # 合并当前行的所有bbox
+            merged_bbox = current_line_bboxes[0]
+            for bbox in current_line_bboxes[1:]:
+                merged_bbox = merged_bbox | bbox
+            actual_lines.append(merged_bbox)
+            current_line_bboxes = [curr_bbox]
+    
+    # 添加最后一行
+    if current_line_bboxes:
+        merged_bbox = current_line_bboxes[0]
+        for bbox in current_line_bboxes[1:]:
+            merged_bbox = merged_bbox | bbox
+        actual_lines.append(merged_bbox)
+    
+    # 检查行数是否匹配
+    if abs(len(actual_lines) - n) > 1:
+        return False, []
+    
+    # 检查总高度是否约等于n倍行高
+    if len(actual_lines) > 0:
+        total_height = actual_lines[-1].y1 - actual_lines[0].y0
+        expected_height = n * typical_line_h
+        
+        if abs(total_height - expected_height) / expected_height > tolerance:
+            return False, []
+    
+    return True, actual_lines
+
+
+def _estimate_document_line_metrics(
+    doc: fitz.Document,
+    sample_pages: int = 5,
+    debug: bool = False
+) -> Dict[str, float]:
+    """
+    统计文档的典型行高、字号、行距等文本度量信息。
+    
+    通过采样前N页的文本行，统计正文的典型字号和行高，
+    用于后续自适应参数计算（如相邻阈值、远距文字检测等）。
+    
+    Args:
+        doc: PDF文档对象
+        sample_pages: 采样页数（默认5页）
+        debug: 是否输出调试信息
+    
+    Returns:
+        字典包含:
+        - typical_font_size: 正文典型字号（pt）
+        - typical_line_height: 正文典型行高（pt）
+        - typical_line_gap: 正文典型行距（pt）
+        - median_line_height: 行高中位数（pt）
+        - p75_line_height: 行高75分位数（pt）
+    """
+    all_lines = []
+    
+    # 采样前N页
+    num_pages = min(sample_pages, len(doc))
+    for pno in range(num_pages):
+        page = doc[pno]
+        dict_data = page.get_text("dict")
+        
+        for block in dict_data.get("blocks", []):
+            if block.get("type") != 0:  # 仅文本块
+                continue
+            
+            lines = block.get("lines", [])
+            for i, line in enumerate(lines):
+                bbox = fitz.Rect(line["bbox"])
+                
+                # 跳过异常小的行（可能是噪点）
+                if bbox.height < 3 or bbox.width < 10:
+                    continue
+                
+                # 统计字号（取行内最大字号）
+                sizes = [sp.get("size", 10) for sp in line.get("spans", []) if "size" in sp]
+                if not sizes:
+                    continue
+                
+                font_size = max(sizes)
+                line_height = bbox.height
+                
+                # 计算与下一行的间距（如果存在）
+                line_gap = None
+                if i + 1 < len(lines):
+                    next_bbox = fitz.Rect(lines[i + 1]["bbox"])
+                    line_gap = next_bbox.y0 - bbox.y1
+                    # 过滤异常大的间距（可能是段落间距或跨列）
+                    if line_gap > 50:
+                        line_gap = None
+                
+                all_lines.append({
+                    'font_size': font_size,
+                    'line_height': line_height,
+                    'line_gap': line_gap,
+                    'y0': bbox.y0,
+                    'y1': bbox.y1,
+                })
+    
+    if not all_lines:
+        # 回退默认值
+        if debug:
+            print("[WARN] No text lines found for line metrics estimation, using defaults")
+        return {
+            'typical_font_size': 10.5,
+            'typical_line_height': 12.0,
+            'typical_line_gap': 1.5,
+            'median_line_height': 12.0,
+            'p75_line_height': 13.0,
+        }
+    
+    # 统计正文字号（过滤标题、图注等异常值：保留8-14pt范围）
+    font_sizes = [ln['font_size'] for ln in all_lines if 8 <= ln['font_size'] <= 14]
+    if not font_sizes:
+        font_sizes = [ln['font_size'] for ln in all_lines]
+    
+    # 使用中位数作为典型字号（更稳健）
+    typical_font = sorted(font_sizes)[len(font_sizes) // 2] if font_sizes else 10.5
+    
+    # 统计行高（仅统计接近正文字号的行，容差±2pt）
+    main_lines = [ln for ln in all_lines if abs(ln['font_size'] - typical_font) < 2.5]
+    if not main_lines:
+        main_lines = all_lines
+    
+    line_heights = [ln['line_height'] for ln in main_lines]
+    line_heights_sorted = sorted(line_heights)
+    
+    # 计算中位数和75分位数
+    median_idx = len(line_heights_sorted) // 2
+    p75_idx = int(len(line_heights_sorted) * 0.75)
+    
+    typical_line_h = line_heights_sorted[median_idx]
+    p75_line_h = line_heights_sorted[p75_idx] if p75_idx < len(line_heights_sorted) else typical_line_h
+    
+    # 统计行距（仅统计有效的gap值）
+    valid_gaps = [ln['line_gap'] for ln in main_lines if ln['line_gap'] is not None and 0 <= ln['line_gap'] < 20]
+    typical_gap = sorted(valid_gaps)[len(valid_gaps) // 2] if valid_gaps else (typical_line_h - typical_font)
+    
+    # 确保gap为正值
+    typical_gap = max(0.5, typical_gap)
+    
+    result = {
+        'typical_font_size': round(typical_font, 1),
+        'typical_line_height': round(typical_line_h, 1),
+        'typical_line_gap': round(typical_gap, 1),
+        'median_line_height': round(typical_line_h, 1),
+        'p75_line_height': round(p75_line_h, 1),
+    }
+    
+    if debug:
+        print(f"\n{'='*60}")
+        print(f"DOCUMENT LINE METRICS (sampled {num_pages} pages, {len(all_lines)} lines)")
+        print(f"{'='*60}")
+        print(f"  Typical Font Size:    {result['typical_font_size']:.1f} pt")
+        print(f"  Typical Line Height:  {result['typical_line_height']:.1f} pt")
+        print(f"  Typical Line Gap:     {result['typical_line_gap']:.1f} pt")
+        print(f"  Median Line Height:   {result['median_line_height']:.1f} pt")
+        print(f"  P75 Line Height:      {result['p75_line_height']:.1f} pt")
+        print(f"{'='*60}\n")
+    
+    return result
+
+
 def _trim_clip_head_by_text(
     clip: fitz.Rect,
     page_rect: fitz.Rect,
@@ -509,6 +717,8 @@ def _trim_clip_head_by_text_v2(
     # Phase C tuners (far-side paragraphs)
     far_side_min_dist: float = 100.0,
     far_side_para_min_ratio: float = 0.20,
+    # Adaptive line height
+    typical_line_h: Optional[float] = None,
 ) -> fitz.Rect:
     """
     Enhanced dual-threshold text trimming.
@@ -533,6 +743,42 @@ def _trim_clip_head_by_text_v2(
         width_ratio=width_ratio, font_min=font_min, font_max=font_max,
         gap=gap, adjacent_th=adjacent_th
     )
+    
+    # === Phase A+: Enhanced "Exact Two Lines" Detection ===
+    # If we have typical_line_h, check if there are exactly 2 lines of text and use more aggressive trim
+    if typical_line_h is not None and typical_line_h > 0:
+        near_is_top_a = (direction == 'below')
+        # Define the near-side strip to check (靠近图注的区域)
+        if near_is_top_a:
+            check_strip = fitz.Rect(
+                original_clip.x0,
+                original_clip.y0,
+                original_clip.x1,
+                min(original_clip.y1, original_clip.y0 + 3.5 * typical_line_h)  # 检查顶部3.5倍行高范围
+            )
+        else:
+            check_strip = fitz.Rect(
+                original_clip.x0,
+                max(original_clip.y0, original_clip.y1 - 3.5 * typical_line_h),  # 检查底部3.5倍行高范围
+                original_clip.x1,
+                original_clip.y1
+            )
+        
+        # 检测是否恰好有2行文字
+        is_exact_two, matched_lines = _detect_exact_n_lines_of_text(
+            check_strip, text_lines, typical_line_h, n=2, tolerance=0.35
+        )
+        
+        if is_exact_two and len(matched_lines) == 2:
+            # 使用更激进的裁切：移除这两行文字，并留一个小gap
+            if near_is_top_a:
+                # 图在下方，裁切顶部的两行
+                new_y0 = matched_lines[-1].y1 + gap  # 最后一行底部 + gap
+                clip.y0 = max(clip.y0, new_y0)  # 确保不会扩大clip
+            else:
+                # 图在上方，裁切底部的两行
+                new_y1 = matched_lines[0].y0 - gap  # 第一行顶部 - gap
+                clip.y1 = min(clip.y1, new_y1)  # 确保不会扩大clip
     
     # === Phase B: Detect and trim far-distance text ===
     # For figures cropped ABOVE the caption, the near side is bottom and the far side is TOP.
@@ -1387,7 +1633,7 @@ def score_caption_candidate(
     if debug:
         print(f"\n=== Caption Scoring Debug ===")
         print(f"Candidate: {candidate.kind} {candidate.number} at page {candidate.page + 1}")
-        print(f"Text: {candidate.text[:60]}...")
+        print(f"Text: {candidate.text[:60].encode('utf-8', errors='replace').decode('utf-8')}...")
         print(f"Position score: {position_score:.1f} (min_dist={min_dist:.1f})")
         print(f"Format score: {format_score:.1f} (bold={details['bold']}, lines={details['lines']}, punct={details['punctuation']})")
         print(f"Structure score: {structure_score:.1f} (next_line={details['next_line_len']}, para={details['para_length']})")
@@ -1585,6 +1831,8 @@ def extract_figures(
     debug_captions: bool = False,
     # Visual debug mode
     debug_visual: bool = False,
+    # Adaptive line height
+    adaptive_line_height: bool = True,
 ) -> List[AttachmentRecord]:
     # 打开 PDF 文档并准备输出目录
     doc = fitz.open(pdf_path)
@@ -1607,6 +1855,30 @@ def extract_figures(
             print(f"SMART CAPTION DETECTION ENABLED")
             print(f"{'='*60}")
         caption_index = build_caption_index(doc, figure_pattern=figure_line_re, debug=debug_captions)
+    
+    # === Adaptive Line Height: 统计文档行高并自适应调整参数 ===
+    if adaptive_line_height:
+        line_metrics = _estimate_document_line_metrics(doc, sample_pages=5, debug=debug_captions)
+        typical_line_h = line_metrics['typical_line_height']
+        
+        # 自适应参数计算（基于行高的倍数）
+        # 仅当参数为默认值时才替换（避免用户自定义参数被覆盖）
+        if adjacent_th == 24.0:  # 默认值
+            adjacent_th = 2.0 * typical_line_h
+        if far_text_th == 300.0:  # 默认值
+            far_text_th = 10.0 * typical_line_h
+        if text_trim_gap == 6.0:  # 默认值
+            text_trim_gap = 0.5 * typical_line_h
+        if far_side_min_dist == 100.0:  # 默认值
+            far_side_min_dist = 8.0 * typical_line_h
+        
+        if debug_captions:
+            print(f"ADAPTIVE PARAMETERS (based on line_height={typical_line_h:.1f}pt):")
+            print(f"  adjacent_th:      {adjacent_th:.1f} pt (2.0× line_height)")
+            print(f"  far_text_th:      {far_text_th:.1f} pt (10.0× line_height)")
+            print(f"  text_trim_gap:    {text_trim_gap:.1f} pt (0.5× line_height)")
+            print(f"  far_side_min_dist:{far_side_min_dist:.1f} pt (8.0× line_height)")
+            print()
 
     def _parse_fig_list(s: str) -> List[int]:
         out: List[int] = []
@@ -2072,6 +2344,8 @@ def extract_figures(
             if text_trim:
                 # Always run Phase C (far-side trim) regardless of para_ratio
                 # This handles cases where large paragraphs are far from caption
+                # 获取典型行高用于两行检测
+                typical_lh = line_metrics.get('typical_line_height') if (adaptive_line_height and 'line_metrics' in locals()) else None
                 clip = _trim_clip_head_by_text_v2(
                     clip,
                     page_rect,
@@ -2089,6 +2363,7 @@ def extract_figures(
                     # IMPORTANT: also pass far-side controls so callers can tune them
                     far_side_min_dist=far_side_min_dist,
                     far_side_para_min_ratio=far_side_para_min_ratio,
+                    typical_line_h=typical_lh,
                 )
                 clip_after_A = fitz.Rect(clip)
                 
@@ -2323,6 +2598,7 @@ def extract_figures(
                     if not ok_comp: reasons.append(f"comp={r_comp}/{base_comp}")
                     print(f"[WARN] Fig {fig_no} p{pno+1}: refinement rejected ({', '.join(reasons)}), trying fallback")
                     # try A-only fallback
+                    typical_lh_fallback = line_metrics.get('typical_line_height') if (adaptive_line_height and 'line_metrics' in locals()) else None
                     clip_A = _trim_clip_head_by_text_v2(
                         base_clip, page_rect, cap_rect, side, text_lines_all,
                         width_ratio=text_trim_width_ratio,
@@ -2335,6 +2611,7 @@ def extract_figures(
                         far_text_trim_mode=far_text_trim_mode,
                         far_side_min_dist=far_side_min_dist,
                         far_side_para_min_ratio=far_side_para_min_ratio,
+                        typical_line_h=typical_lh_fallback,
                     ) if text_trim else base_clip
                     rA_h, rA_a = max(1.0, clip_A.height), max(1.0, clip_A.width * clip_A.height)
                     if (rA_h >= 0.60 * base_height) and (rA_a >= 0.55 * base_area):
@@ -2699,6 +2976,8 @@ def extract_tables(
     debug_captions: bool = False,
     # Visual debug mode
     debug_visual: bool = False,
+    # Adaptive line height
+    adaptive_line_height: bool = True,
 ) -> List[AttachmentRecord]:
     doc = fitz.open(pdf_path)
     os.makedirs(out_dir, exist_ok=True)
@@ -2722,6 +3001,30 @@ def extract_tables(
             ),
             debug=debug_captions
         )
+    
+    # === Adaptive Line Height: 统计文档行高并自适应调整参数 ===
+    if adaptive_line_height:
+        line_metrics = _estimate_document_line_metrics(doc, sample_pages=5, debug=debug_captions)
+        typical_line_h = line_metrics['typical_line_height']
+        
+        # 自适应参数计算（基于行高的倍数）
+        # 仅当参数为默认值时才替换（避免用户自定义参数被覆盖）
+        if adjacent_th == 28.0:  # 表格默认值
+            adjacent_th = 2.0 * typical_line_h
+        if far_text_th == 300.0:  # 默认值
+            far_text_th = 10.0 * typical_line_h
+        if text_trim_gap == 6.0:  # 默认值
+            text_trim_gap = 0.5 * typical_line_h
+        if far_side_min_dist == 100.0:  # 默认值
+            far_side_min_dist = 8.0 * typical_line_h
+        
+        if debug_captions:
+            print(f"ADAPTIVE TABLE PARAMETERS (based on line_height={typical_line_h:.1f}pt):")
+            print(f"  adjacent_th:      {adjacent_th:.1f} pt (2.0× line_height)")
+            print(f"  far_text_th:      {far_text_th:.1f} pt (10.0× line_height)")
+            print(f"  text_trim_gap:    {text_trim_gap:.1f} pt (0.5× line_height)")
+            print(f"  far_side_min_dist:{far_side_min_dist:.1f} pt (8.0× line_height)")
+            print()
 
     # 改进：支持罗马数字、附录表、补充材料表、续页标记
     table_line_re = re.compile(
@@ -3133,7 +3436,21 @@ def extract_tables(
             base_comp = comp_count(base_clip)
             base_text = text_line_count(base_clip)
 
+            # === Visual Debug (TABLE): 初始化并收集 Baseline ===
+            debug_stages_tbl: List[DebugStageInfo] = []
+            if debug_visual:
+                debug_stages_tbl.append(DebugStageInfo(
+                    name="Baseline (Anchor Selection)",
+                    rect=fitz.Rect(base_clip),
+                    color=(0, 102, 255),  # 蓝色
+                    description=f"Initial window from anchor {side} selection"
+                ))
+
+            # A) 文本邻接裁切（含远侧文字 Phase C）
+            clip_after_A = fitz.Rect(clip)
             if text_trim:
+                # 获取典型行高用于两行检测
+                typical_lh = line_metrics.get('typical_line_height') if (adaptive_line_height and 'line_metrics' in locals()) else None
                 clip = _trim_clip_head_by_text_v2(
                     clip,
                     page_rect,
@@ -3150,8 +3467,19 @@ def extract_tables(
                     far_text_trim_mode=far_text_trim_mode,
                     far_side_min_dist=far_side_min_dist,
                     far_side_para_min_ratio=far_side_para_min_ratio,
+                    typical_line_h=typical_lh,
                 )
+                clip_after_A = fitz.Rect(clip)
+                if debug_visual and (clip_after_A != base_clip):
+                    debug_stages_tbl.append(DebugStageInfo(
+                        name="Phase A (Text Trimming)",
+                        rect=fitz.Rect(clip_after_A),
+                        color=(0, 200, 0),  # 绿色
+                        description="After removing adjacent text (Phase A+B+C)"
+                    ))
 
+            # B) 对象连通域引导
+            clip_after_B = fitz.Rect(clip)
             clip = _refine_clip_by_objects(
                 clip,
                 cap_rect,
@@ -3165,6 +3493,14 @@ def extract_tables(
                 use_axis_union=True,
                 use_horizontal_union=True,
             )
+            clip_after_B = fitz.Rect(clip)
+            if debug_visual and (clip_after_B != clip_after_A):
+                debug_stages_tbl.append(DebugStageInfo(
+                    name="Phase B (Object Alignment)",
+                    rect=fitz.Rect(clip_after_B),
+                    color=(255, 140, 0),  # 橙色
+                    description="After object connectivity refinement"
+                ))
 
             scale = dpi / 72.0
             mat = fitz.Matrix(scale, scale)
@@ -3298,6 +3634,7 @@ def extract_tables(
                     if not ok_t: reasons.append(f"text_lines={r_text}/{base_text}")
                     if not ok_comp: reasons.append(f"comp={r_comp}/{base_comp}")
                     print(f"[WARN] Table {ident} p{pno+1}: refinement rejected ({', '.join(reasons)}), using A-only fallback")
+                    typical_lh_fallback_tbl = line_metrics.get('typical_line_height') if (adaptive_line_height and 'line_metrics' in locals()) else None
                     clip_A = _trim_clip_head_by_text_v2(
                         base_clip, page_rect, cap_rect, side, text_lines_all,
                         width_ratio=text_trim_width_ratio,
@@ -3310,12 +3647,56 @@ def extract_tables(
                         far_text_trim_mode=far_text_trim_mode,
                         far_side_min_dist=far_side_min_dist,
                         far_side_para_min_ratio=far_side_para_min_ratio,
+                        typical_line_h=typical_lh_fallback_tbl,
                     ) if text_trim else base_clip
-                    clip = clip_A
+                    # 二次门槛：如 A-only 过小则回退到基线
+                    rA_h, rA_a = max(1.0, clip_A.height), max(1.0, clip_A.width * clip_A.height)
+                    if (rA_h >= 0.60 * base_height) and (rA_a >= 0.55 * base_area):
+                        clip = clip_A
+                    else:
+                        clip = base_clip
+                        if debug_visual:
+                            debug_stages_tbl.append(DebugStageInfo(
+                                name="Fallback (Reverted to Baseline)",
+                                rect=fitz.Rect(clip),
+                                color=(255, 255, 0),  # 黄色
+                                description="Refinement rejected, reverted to baseline"
+                            ))
                     try:
                         pix = page.get_pixmap(matrix=mat, clip=clip, alpha=False)
                     except Exception:
                         pass
+
+            # Debug: 标记最终结果（成功的精炼或 A-only 回退），并保存可视化
+            if debug_visual:
+                # 若最终结果源自 D（autocrop）阶段，则标红
+                if autocrop and (clip != base_clip) and (clip != clip_after_A):
+                    debug_stages_tbl.append(DebugStageInfo(
+                        name="Phase D (Final - Autocrop)",
+                        rect=fitz.Rect(clip),
+                        color=(255, 0, 0),  # 红色
+                        description="Final result after A+B+D refinement"
+                    ))
+                elif clip == clip_after_A and text_trim:
+                    # A-only 回退（B/D 未改变边界）
+                    debug_stages_tbl.append(DebugStageInfo(
+                        name="Final (A-only Fallback)",
+                        rect=fitz.Rect(clip),
+                        color=(255, 200, 0),  # 金黄色
+                        description="A-only fallback result (B/D rejected)"
+                    ))
+                try:
+                    save_debug_visualization(
+                        page=page,
+                        out_dir=out_dir,
+                        fig_no=ident,
+                        page_num=pno + 1,
+                        stages=debug_stages_tbl,
+                        caption_rect=cap_rect,
+                        kind='table'
+                    )
+                except Exception as e:
+                    print(f"[WARN] Debug visualization failed for Table {ident}: {e}")
 
             base_name = build_output_basename('Table', ident, caption, max_chars=max_caption_chars, max_words=max_caption_words)
             count_prev = seen_counts.get(ident, 0)
@@ -3373,6 +3754,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--debug-captions", action="store_true", help="Print detailed caption candidate scoring information for debugging")
     # Visual debug mode (NEW)
     p.add_argument("--debug-visual", action="store_true", help="Enable visual debugging mode: save multi-stage boundary boxes overlaid on full page (output to images/debug/)")
+    
+    # Adaptive line height
+    p.add_argument("--adaptive-line-height", action="store_true", default=True, help="Enable adaptive line height: auto-adjust parameters based on document's typical line height (default: enabled)")
+    p.add_argument("--no-adaptive-line-height", action="store_false", dest="adaptive_line_height", help="Disable adaptive line height (use fixed default parameters)")
+    
     # A) text trimming options
     p.add_argument("--text-trim", action="store_true", help="Trim paragraph-like text near caption side inside chosen clip")
     p.add_argument("--text-trim-width-ratio", type=float, default=0.5, help="Min horizontal overlap ratio to treat a line as paragraph text")
@@ -3483,6 +3869,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.table_mask_text = False
         args.table_object_min_area_ratio = 0.005
         args.table_object_merge_gap = 4.0
+        # 自适应行高（默认启用）
+        args.adaptive_line_height = True
 
     # Anchor mode & scan params
     os.environ.setdefault('EXTRACT_ANCHOR_MODE', (args.anchor_mode or 'v2'))
@@ -3558,6 +3946,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         smart_caption_detection=getattr(args, 'smart_caption_detection', True),
         debug_captions=getattr(args, 'debug_captions', False),
         debug_visual=getattr(args, 'debug_visual', False),
+        adaptive_line_height=getattr(args, 'adaptive_line_height', True),
     )
 
     # 汇总记录
@@ -3609,6 +3998,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             smart_caption_detection=getattr(args, 'smart_caption_detection', True),
             debug_captions=getattr(args, 'debug_captions', False),
             debug_visual=getattr(args, 'debug_visual', False),
+            adaptive_line_height=getattr(args, 'adaptive_line_height', True),
         )
         all_records.extend(tbl_records)
 

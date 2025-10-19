@@ -31,7 +31,7 @@ Common flags: `--allow-continued`, `--anchor-mode v1`, `--below/--above`, `--man
 - Use relative paths like `images/...` when embedding figures/tables in Markdown next to the PDF.
 - With Anchor v2 (default), per-id `--above/--below` works only if you switch to `--anchor-mode v1`.
 - **Smart caption detection**: Enabled by default, automatically distinguishes real captions from in-text references; use `--no-smart-caption-detection` to disable, or `--debug-captions` to see scoring details. See `AGENTS.md` for more.
-- **Visual debug mode** (NEW): Use `--debug-visual` to save multi-stage boundary boxes overlaid on full pages; outputs to `images/debug/Figure_N_pX_debug_stages.png` + legend. See `AGENTS.md` for color scheme and usage.
+- **Visual debug mode** (NEW): Use `--debug-visual` to save multi-stage boundary boxes overlaid on full pages (**supports both figures and tables**); outputs to `images/debug/Figure_N_pX_debug_stages.png` / `Table_N_pX_debug_stages.png` + legend files. See `AGENTS.md` for color scheme and usage.
 
 ### CLI Workflow (EN): place `AGENTS.md` and `scripts/` next to the PDF; let the Agent run it
 
@@ -109,7 +109,7 @@ python3 scripts/extract_pdf_assets.py --pdf <PDF_DIR>/<paper>.pdf --preset robus
 - 在生成 Markdown 摘要时，始终使用相对路径嵌图（如 `images/...`）。
 - 默认 Anchor v2 下，若需按编号强制上/下方向，请切换 `--anchor-mode v1` 后再配合 `--above/--below`。
 - **智能图注识别**：默认启用，自动区分真实图注与正文引用；如需关闭，使用 `--no-smart-caption-detection`；如需查看评分详情，使用 `--debug-captions`。详见 `AGENTS.md`。
-- **可视化调试模式**（新增）：使用 `--debug-visual` 保存多阶段边界框叠加的完整页面；输出到 `images/debug/Figure_N_pX_debug_stages.png` 及图例文件。颜色方案和使用方法详见 `AGENTS.md`。
+- **可视化调试模式**（新增）：使用 `--debug-visual` 保存多阶段边界框叠加的完整页面（**图与表均支持**）；输出到 `images/debug/Figure_N_pX_debug_stages.png` / `Table_N_pX_debug_stages.png` 及图例文件。颜色方案和使用方法详见 `AGENTS.md`。
 
 ### CLI 工作流示例：将 `AGENTS.md` 与 `scripts/` 放到 PDF 同目录，由 Agent 自动调用脚本
 

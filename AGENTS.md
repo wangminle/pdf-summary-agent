@@ -103,6 +103,35 @@ Get-Location
 ### 防“半幅/错截”的补救
 - 远端外扩：若在精裁后远离图注的边仍被对象“贴边”，脚本会向该方向外扩（最多约 200pt）以补齐整幅；必要时可调大最高扫描高度（`--scan-heights`）或外扩上限（需要代码内改，默认 200pt）。
 
+### 自适应行高（默认开启，v2.0新增）
+**问题背景**：不同PDF文档的行高差异很大（单栏vs双栏，10pt vs 14pt正文），固定参数无法适配所有文档。
+
+**核心功能**：
+- 自动统计文档的典型行高、字号、行距（采样前5页）
+- 基于行高**动态调整**裁切参数：
+  - `adjacent_th` = 2.0 × 行高（约2行）
+  - `far_text_th` = 10.0 × 行高（约10行）
+  - `text_trim_gap` = 0.5 × 行高（约半行）
+  - `far_side_min_dist` = 8.0 × 行高（约8行）
+- **"两行检测"增强**：精确识别并移除"刚好两行文字"（如Abstract/Introduction顶部文字）
+
+**使用示例**：
+```bash
+# 默认启用（推荐）
+python3 scripts/extract_pdf_assets.py --pdf paper.pdf --preset robust
+
+# 查看行高统计和参数调整（调试）
+python3 scripts/extract_pdf_assets.py --pdf paper.pdf --preset robust --debug-captions
+
+# 禁用自适应（回退固定参数）
+python3 scripts/extract_pdf_assets.py --pdf paper.pdf --preset robust --no-adaptive-line-height
+```
+
+**效果示例**（KearnsNevmyvakaHFTRiskBooks.pdf）：
+- 检测到典型行高：10.9pt
+- 自适应参数：`adjacent_th=21.8pt` (原24pt), `far_text_th=109.0pt` (原300pt)
+- Table 1：成功移除顶部120pt文字（约11行，包含两行正文+空白）
+
 ### 可选开关
 - 对个别图禁用精裁：`--no-refine 2,3`（仅保留基线或 A）。
 - 仅改靠近图注的一侧边界（默认开）：`--refine-near-edge-only`；如需禁用用于调试：`--no-refine-near-edge-only`。
@@ -218,9 +247,9 @@ Get-ChildItem images -Filter *.png |
 ### 可视化调试模式（Visual Debug Mode）
 **问题背景**：当提取结果不理想时（图片截不完整、包含多余内容），需要直观了解各阶段的裁剪过程发生了什么。
 
-**调试功能**：启用 `--debug-visual` 后，脚本会在 `images/debug/` 目录下生成可视化图片和图例文件：
-- `Figure_N_pX_debug_stages.png`：在完整页面上叠加多色边界框，标注各阶段裁剪范围
-- `Figure_N_pX_legend.txt`：文字说明各阶段的尺寸和描述
+**调试功能**：启用 `--debug-visual` 后，脚本会在 `images/debug/` 目录下生成可视化图片和图例文件（**图与表均支持**）：
+- `Figure_N_pX_debug_stages.png` / `Table_N_pX_debug_stages.png`：在完整页面上叠加多色边界框，标注各阶段裁剪范围
+- `Figure_N_pX_legend.txt` / `Table_N_pX_legend.txt`：文字说明各阶段的尺寸和描述
 
 **边界框颜色方案**：
 | 阶段 | 颜色 | 说明 |
@@ -245,6 +274,8 @@ python .\scripts\extract_pdf_assets.py --pdf .\paper.pdf --preset robust --debug
 ```
 [DEBUG] Saved visualization: images/debug/Figure_3_p5_debug_stages.png
 [DEBUG] Saved legend: images/debug/Figure_3_p5_legend.txt
+[DEBUG] Saved visualization: images/debug/Table_1_p8_debug_stages.png
+[DEBUG] Saved legend: images/debug/Table_1_p8_legend.txt
 ```
 
 **图例文件内容示例**（`Figure_3_p5_legend.txt`）：
@@ -273,10 +304,11 @@ Phase D (Final - Autocrop):
 ```
 
 **适用场景**：
-- ✅ 诊断图片截不完整的问题（查看哪个阶段过度收缩）
+- ✅ 诊断图片/表格截不完整的问题（查看哪个阶段过度收缩）
 - ✅ 诊断包含多余内容的问题（查看文本裁切是否生效）
 - ✅ 对比 Baseline 和最终结果，评估精炼效果
 - ✅ 验收失败时查看 Fallback 的回退范围
+- ✅ **图与表均支持**：所有裁剪阶段的可视化调试（Baseline → Phase A → Phase B → Phase D → Fallback）
 
 ## 生成带图摘要（大模型提示词模板）
 请务必同时提供 `text/<paper>.txt` 与 `images/*.png` 的完整集合。建议将 txt 的要点（或全文）与图片清单（图号+文件名）一并喂给模型。
