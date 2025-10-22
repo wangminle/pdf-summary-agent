@@ -343,6 +343,111 @@ class CaptionIndex:
         return self.candidates.get(key, [])
 
 
+# --- Layout-driven extraction structures (V2 architecture) ---
+@dataclass
+class EnhancedTextUnit:
+    """增强的文本单元（行级），保留完整格式信息"""
+    bbox: fitz.Rect              # 边界框
+    text: str                    # 文本内容
+    page: int                    # 页码（0-based）
+    
+    # 格式信息
+    font_name: str               # 字体名称（如 'TimesNewRoman'）
+    font_size: float             # 字号（pt）
+    font_weight: str             # 'bold' | 'regular'
+    font_flags: int              # PyMuPDF flags (bit flags)
+    color: Tuple[int, int, int]  # RGB颜色
+    
+    # 类型标注（由分类器推断）
+    text_type: str               # 'title_h1' | 'title_h2' | 'title_h3' | 'paragraph' | 
+                                 # 'caption_figure' | 'caption_table' | 'list' | 'equation' | 'unknown'
+    confidence: float            # 类型分类的置信度（0~1）
+    
+    # 排版信息
+    column: int                  # 所在栏（0=左栏, 1=右栏, -1=单栏）
+    indent: float                # 左边界（用于检测缩进）
+    
+    # 层级关系
+    block_idx: int               # 所在 block 索引
+    line_idx: int                # 所在 line 索引
+
+
+@dataclass
+class TextBlock:
+    """文本密集区域的聚合单元"""
+    bbox: fitz.Rect                      # 聚合后的边界框
+    units: List[EnhancedTextUnit]        # 包含的文本单元
+    block_type: str                      # 'paragraph_group' | 'caption' | 'title' | 'list'
+    page: int                            # 页码
+    column: int                          # 所在栏
+
+
+@dataclass
+class DocumentLayoutModel:
+    """全文档的版式模型"""
+    # 全局属性
+    page_size: Tuple[float, float]  # (width, height) in pt
+    num_columns: int                # 1=单栏, 2=双栏
+    margin_left: float
+    margin_right: float
+    margin_top: float
+    margin_bottom: float
+    column_gap: float               # 双栏时的栏间距
+    
+    # 典型尺寸
+    typical_font_size: float        # 正文字号
+    typical_line_height: float      # 行高
+    typical_line_gap: float         # 行距
+    
+    # 文本单元和区块（按页组织）
+    text_units: Dict[int, List[EnhancedTextUnit]]  # key=page_num
+    text_blocks: Dict[int, List[TextBlock]]        # key=page_num
+    
+    # 留白区域（可能包含图表的区域）
+    vacant_regions: Dict[int, List[fitz.Rect]]     # key=page_num
+    
+    def to_dict(self) -> Dict:
+        """转换为可序列化的字典"""
+        return {
+            'page_size': self.page_size,
+            'num_columns': self.num_columns,
+            'margins': {
+                'left': self.margin_left,
+                'right': self.margin_right,
+                'top': self.margin_top,
+                'bottom': self.margin_bottom
+            },
+            'column_gap': self.column_gap,
+            'typical_metrics': {
+                'font_size': self.typical_font_size,
+                'line_height': self.typical_line_height,
+                'line_gap': self.typical_line_gap
+            },
+            'text_units_count': {str(k): len(v) for k, v in self.text_units.items()},
+            'text_blocks_count': {str(k): len(v) for k, v in self.text_blocks.items()},
+            'vacant_regions_count': {str(k): len(v) for k, v in self.vacant_regions.items()}
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'DocumentLayoutModel':
+        """从字典创建（暂时简化版本）"""
+        return cls(
+            page_size=tuple(data['page_size']),
+            num_columns=data['num_columns'],
+            margin_left=data['margins']['left'],
+            margin_right=data['margins']['right'],
+            margin_top=data['margins']['top'],
+            margin_bottom=data['margins']['bottom'],
+            column_gap=data['column_gap'],
+            typical_font_size=data['typical_metrics']['font_size'],
+            typical_line_height=data['typical_metrics']['line_height'],
+            typical_line_gap=data['typical_metrics']['line_gap'],
+            text_units={},
+            text_blocks={},
+            vacant_regions={}
+        )
+
+
 def collect_draw_items(page: "fitz.Page") -> List[DrawItem]:
     """Collect simplified drawing items (lines/rects/paths) as oriented boxes.
     Orientation by aspect ratio of bbox: H (wide), V (tall), O (other).
@@ -1833,6 +1938,8 @@ def extract_figures(
     debug_visual: bool = False,
     # Adaptive line height
     adaptive_line_height: bool = True,
+    # Layout model (V2 Architecture)
+    layout_model: Optional[DocumentLayoutModel] = None,
 ) -> List[AttachmentRecord]:
     # 打开 PDF 文档并准备输出目录
     doc = fitz.open(pdf_path)
@@ -2320,7 +2427,21 @@ def extract_figures(
                         pass
 
             # clip 已选定（V1/V2）
-
+            
+            # === Step 3: Layout-Guided Adjustment (如果启用) ===
+            if layout_model is not None:
+                clip_before_layout = fitz.Rect(clip)
+                clip = _adjust_clip_with_layout(
+                    clip_rect=clip,
+                    caption_rect=cap_rect,
+                    layout_model=layout_model,
+                    page_num=pno,  # 0-based
+                    direction=side,
+                    debug=debug_captions
+                )
+                if debug_captions and clip != clip_before_layout:
+                    print(f"[INFO] Figure {fig_no}: Layout-guided adjustment applied")
+            
             # Baseline metrics for acceptance gating
             base_clip = fitz.Rect(clip)
             base_height = max(1.0, base_clip.height)
@@ -2514,6 +2635,21 @@ def extract_figures(
                             # near = top; do not cross caption baseline (cap_rect.y1 + caption_gap*0.5)
                             limit = cap_rect.y1 + max(1.0, caption_gap * 0.5)
                             tight = fitz.Rect(tight.x0, max(limit, tight.y0 - pad_pt), tight.x1, tight.y1)
+                    
+                    # Step 3.5: 在 autocrop 后再次应用版式引导，确保不切断文本块
+                    if layout_model is not None:
+                        clip_before_post_layout = fitz.Rect(tight)
+                        tight = _adjust_clip_with_layout(
+                            clip_rect=tight,
+                            caption_rect=cap_rect,
+                            layout_model=layout_model,
+                            page_num=pno,  # 0-based
+                            direction=side,
+                            debug=debug_captions
+                        )
+                        if debug_captions and tight != clip_before_post_layout:
+                            print(f"[INFO] Figure {fig_no}: Post-autocrop layout adjustment applied")
+                    
                     pix = page.get_pixmap(matrix=mat, clip=tight, alpha=False)
                     clip = tight
                 except Exception as e:
@@ -2660,7 +2796,8 @@ def extract_figures(
                         page_num=pno + 1,
                         stages=debug_stages,
                         caption_rect=cap_rect,
-                        kind='figure'
+                        kind='figure',
+                        layout_model=layout_model  # V2 Architecture
                     )
                 except Exception as e:
                     print(f"[WARN] Debug visualization failed for Figure {fig_no}: {e}")
@@ -2836,6 +2973,7 @@ def save_debug_visualization(
     stages: List[DebugStageInfo],
     caption_rect: fitz.Rect,
     kind: str = 'figure',
+    layout_model: Optional[DocumentLayoutModel] = None,
 ) -> Optional[str]:
     """
     保存带多色线框的调试可视化图片
@@ -2848,6 +2986,7 @@ def save_debug_visualization(
         stages: 阶段信息列表
         caption_rect: 图注边界框
         kind: 'figure' 或 'table'
+        layout_model: 可选的版式模型（用于显示文本区块）
     
     Returns:
         输出文件路径
@@ -2882,6 +3021,26 @@ def save_debug_visualization(
             shape.draw_rect(r)
             shape.finish(color=color_normalized, width=3)
         
+        # 绘制文本区块（如果提供了layout_model）
+        # Step 3 增强：标题用实线，段落用虚线
+        text_blocks_drawn = []
+        if layout_model is not None:
+            pno_zero_based = page_num - 1  # page_num是1-based，转换为0-based
+            text_blocks = layout_model.text_blocks.get(pno_zero_based, [])
+            pink_color = (255/255.0, 105/255.0, 180/255.0)  # Hot Pink: RGB(255, 105, 180)
+            
+            for block in text_blocks:
+                if block.block_type in ['paragraph_group', 'list_group']:
+                    # 段落/列表：粉红色虚线
+                    shape.draw_rect(block.bbox)
+                    shape.finish(color=pink_color, width=2, dashes="[3 3]")
+                    text_blocks_drawn.append(block)
+                elif block.block_type.startswith('title_'):
+                    # 标题：粉红色实线（Step 3 新增）
+                    shape.draw_rect(block.bbox)
+                    shape.finish(color=pink_color, width=2)  # 实线
+                    text_blocks_drawn.append(block)
+        
         # 绘制 caption（紫色）
         caption_color = (148/255.0, 0, 211/255.0)
         shape.draw_rect(caption_rect)
@@ -2907,6 +3066,31 @@ def save_debug_visualization(
             f.write(f"Caption: {caption_rect.x0:.1f},{caption_rect.y0:.1f} -> {caption_rect.x1:.1f},{caption_rect.y1:.1f} "
                     f"({caption_rect.width:.1f}×{caption_rect.height:.1f}pt)\n\n")
             
+            # 写入文本区块信息（如果有）
+            if text_blocks_drawn:
+                f.write("=" * 70 + "\n")
+                f.write(f"TEXT BLOCKS (Layout Model - V2 Architecture Step 3)\n")
+                f.write("=" * 70 + "\n")
+                f.write(f"Total text blocks on this page: {len(text_blocks_drawn)}\n")
+                f.write("Color: RGB(255, 105, 180) - Hot Pink\n")
+                f.write("Style: Solid line (title) | Dashed line (paragraph/list)\n\n")
+                
+                for i, block in enumerate(text_blocks_drawn, 1):
+                    r = block.bbox
+                    f.write(f"Text Block {i} ({block.block_type}):\n")
+                    f.write(f"  Position: {r.x0:.1f},{r.y0:.1f} -> {r.x1:.1f},{r.y1:.1f}\n")
+                    f.write(f"  Size: {r.width:.1f}×{r.height:.1f}pt ({r.width * r.height / 72.0 / 72.0:.2f} sq.in)\n")
+                    f.write(f"  Column: {block.column} (-1=single, 0=left, 1=right)\n")
+                    f.write(f"  Text units: {len(block.units)}\n")
+                    # 显示前50个字符
+                    sample_text = " ".join(u.text for u in block.units[:2])
+                    if len(sample_text) > 80:
+                        sample_text = sample_text[:77] + "..."
+                    f.write(f"  Sample: {sample_text}\n\n")
+                
+                f.write("=" * 70 + "\n\n")
+            
+            # 写入阶段信息
             for stage in stages:
                 r = stage.rect
                 f.write(f"{stage.name}:\n")
@@ -2978,6 +3162,8 @@ def extract_tables(
     debug_visual: bool = False,
     # Adaptive line height
     adaptive_line_height: bool = True,
+    # Layout model (V2 Architecture)
+    layout_model: Optional[DocumentLayoutModel] = None,
 ) -> List[AttachmentRecord]:
     doc = fitz.open(pdf_path)
     os.makedirs(out_dir, exist_ok=True)
@@ -3423,6 +3609,20 @@ def extract_tables(
                         )
                     side = best[1]
                     clip = snap_clip_edges(best[2], draw_items)
+            
+            # === Step 3: Layout-Guided Adjustment (如果启用) ===
+            if layout_model is not None:
+                clip_before_layout = fitz.Rect(clip)
+                clip = _adjust_clip_with_layout(
+                    clip_rect=clip,
+                    caption_rect=cap_rect,
+                    layout_model=layout_model,
+                    page_num=pno,  # 0-based
+                    direction=side,
+                    debug=debug_captions
+                )
+                if debug_captions and clip != clip_before_layout:
+                    print(f"[INFO] Table {ident}: Layout-guided adjustment applied")
 
             base_clip = fitz.Rect(clip)
             base_height = max(1.0, base_clip.height)
@@ -3552,6 +3752,21 @@ def extract_tables(
                         else:
                             y0_new = min(tight.y0, max(clip.y0, clip.y1 - min_h_pt))
                             tight = fitz.Rect(tight.x0, y0_new, tight.x1, tight.y1)
+                    
+                    # Step 3.5: 在 autocrop 后再次应用版式引导，确保不切断文本块
+                    if layout_model is not None:
+                        clip_before_post_layout = fitz.Rect(tight)
+                        tight = _adjust_clip_with_layout(
+                            clip_rect=tight,
+                            caption_rect=cap_rect,
+                            layout_model=layout_model,
+                            page_num=pno,  # 0-based
+                            direction=side,
+                            debug=debug_captions
+                        )
+                        if debug_captions and tight != clip_before_post_layout:
+                            print(f"[INFO] Table {ident}: Post-autocrop layout adjustment applied")
+                    
                     pix = page.get_pixmap(matrix=mat, clip=tight, alpha=False)
                     clip = tight
                 except Exception as e:
@@ -3693,7 +3908,8 @@ def extract_tables(
                         page_num=pno + 1,
                         stages=debug_stages_tbl,
                         caption_rect=cap_rect,
-                        kind='table'
+                        kind='table',
+                        layout_model=layout_model  # V2 Architecture
                     )
                 except Exception as e:
                     print(f"[WARN] Debug visualization failed for Table {ident}: {e}")
@@ -3716,6 +3932,823 @@ def extract_tables(
 
     records.sort(key=lambda r: (r.page, r.num_key(), r.ident))
     return records
+
+
+# ============================================================================
+# 版式驱动提取（V2 Architecture - Layout-Driven Extraction）
+# ============================================================================
+
+def _classify_text_types(
+    all_units: Dict[int, List[EnhancedTextUnit]],
+    typical_font_size: float,
+    typical_font_name: str,
+    page_width: float,
+    debug: bool = False
+) -> Dict[int, List[EnhancedTextUnit]]:
+    """
+    基于规则的文本类型分类器（Step 3增强版）
+    
+    分类规则：
+    1. Caption（图注/表注）: 匹配正则 + 字号略小于正文
+    2. Title（标题）: 加粗 + 字号大
+    3. List（列表）: bullet点或编号
+    4. In-Figure Text（图表内文字）: 字体不同 or 字号小 or 短文本
+    5. Paragraph（段落）: 默认类型
+    """
+    import re
+    
+    if debug:
+        print("\n[DEBUG] Text Type Classification (Step 3 Enhanced)")
+        print("=" * 70)
+        print(f"Typical font size: {typical_font_size:.1f}pt")
+        print(f"Typical font name: {typical_font_name}")
+        print(f"Page width: {page_width:.1f}pt")
+    
+    caption_pattern = re.compile(r'^\s*(Figure|Table|Fig\.|图|表)\s+\S', re.I)
+    
+    for pno, units in all_units.items():
+        if debug and pno == 0:
+            print(f"\n[Page {pno+1}] Classifying {len(units)} text units...")
+        
+        for unit in units:
+            text_stripped = unit.text.strip()
+            
+            # 规则1: Caption检测
+            if caption_pattern.match(text_stripped):
+                if 'fig' in text_stripped.lower() or '图' in text_stripped:
+                    unit.text_type = 'caption_figure'
+                else:
+                    unit.text_type = 'caption_table'
+                unit.confidence = 0.95
+                if debug and pno == 0:
+                    print(f"  Caption: {text_stripped[:50]}...")
+                continue
+            
+            # 规则2: Title检测
+            if unit.font_weight == 'bold':
+                ratio = unit.font_size / typical_font_size
+                if ratio > 1.3:
+                    unit.text_type = 'title_h1'
+                    unit.confidence = 0.90
+                elif ratio > 1.15:
+                    unit.text_type = 'title_h2'
+                    unit.confidence = 0.85
+                elif ratio > 1.05:
+                    unit.text_type = 'title_h3'
+                    unit.confidence = 0.80
+                else:
+                    # 加粗但字号不大，需要进一步判断
+                    # 特殊规则：如果是短文本（如 "3.5 Positional Encoding"），可能是小标题
+                    text_len = len(text_stripped)
+                    # 检测是否是编号标题（如 "3.5 Something"、"4.2.1 Title"）
+                    import re
+                    is_numbered_title = bool(re.match(r'^\d+(\.\d+)*\s+[A-Z]', text_stripped))
+                    
+                    if is_numbered_title or (text_len < 60 and text_len > 5):
+                        # 短加粗文本，很可能是标题
+                        unit.text_type = 'title_h3'
+                        unit.confidence = 0.75
+                    else:
+                        # 长加粗文本，可能是段落强调或图表内文字
+                        unit.text_type = 'paragraph'
+                        unit.confidence = 0.70
+                if debug and pno == 0 and unit.text_type.startswith('title'):
+                    print(f"  {unit.text_type.upper()}: {text_stripped[:40]}...")
+                continue
+            
+            # 规则3: List检测
+            if re.match(r'^\s*[•\-\*]\s+', text_stripped) or re.match(r'^\s*\d+[\.\)]\s+', text_stripped):
+                unit.text_type = 'list'
+                unit.confidence = 0.85
+                continue
+            
+            # 规则4: Equation检测（简化）
+            special_chars = set('∫∑∏√±≈≠≤≥∞αβγδθλμσΔΩ')
+            if len(set(text_stripped) & special_chars) > 0 and unit.bbox.width < 0.6 * page_width:
+                unit.text_type = 'equation'
+                unit.confidence = 0.75
+                continue
+            
+            # 规则5（新增）: In-Figure Text（图表内文字）检测
+            # 特征：
+            # - 字体与正文不同（font family不同）
+            # - 字号明显小于正文（< 0.85×typical）
+            # - 短文本（< 30字符）且独立成行
+            # - 宽度小于页面的40%
+            is_different_font = (typical_font_name.lower() not in unit.font_name.lower() and 
+                                unit.font_name.lower() not in typical_font_name.lower())
+            is_small_font = unit.font_size < 0.85 * typical_font_size
+            is_short_text = len(text_stripped) < 30
+            is_narrow = unit.bbox.width < 0.4 * page_width
+            
+            # 组合判断：如果满足多个特征，可能是图表内文字
+            infig_score = 0
+            if is_different_font:
+                infig_score += 2  # 字体不同是强特征
+            if is_small_font:
+                infig_score += 1
+            if is_short_text and is_narrow:
+                infig_score += 1
+            
+            if infig_score >= 2:
+                unit.text_type = 'in_figure_text'
+                unit.confidence = 0.70
+                if debug and pno == 0:
+                    print(f"  In-Figure Text: {text_stripped[:30]}... (font={unit.font_name}, size={unit.font_size:.1f})")
+                continue
+            
+            # 默认: Paragraph
+            unit.text_type = 'paragraph'
+            unit.confidence = 0.60
+    
+    return all_units
+
+
+def _detect_columns(
+    all_units: Dict[int, List[EnhancedTextUnit]],
+    page_width: float,
+    debug: bool = False
+) -> Tuple[int, float, Dict[int, List[EnhancedTextUnit]]]:
+    """
+    检测文档是单栏还是双栏
+    
+    方法：统计段落文本的x0分布，检测双峰
+    
+    返回: (num_columns, column_gap, updated_units)
+    """
+    if debug:
+        print("\n[DEBUG] Column Detection")
+        print("=" * 70)
+    
+    # 采样前5页的段落文本
+    x0_values = []
+    for pno in list(all_units.keys())[:5]:
+        units = all_units.get(pno, [])
+        for unit in units:
+            if unit.text_type == 'paragraph':
+                x0_values.append(unit.bbox.x0)
+    
+    if not x0_values or len(x0_values) < 10:
+        if debug:
+            print("Insufficient paragraph samples, assuming single column")
+        num_columns = 1
+        column_gap = 0.0
+        for units in all_units.values():
+            for unit in units:
+                unit.column = -1
+        return num_columns, column_gap, all_units
+    
+    # 使用numpy进行直方图分析
+    try:
+        import numpy as np
+        x0_array = np.array(x0_values)
+        hist, bins = np.histogram(x0_array, bins=20)
+        
+        # 简单的峰值检测：找到直方图中的两个主要峰值
+        # 峰值定义：该bin的计数高于平均值的1.5倍
+        threshold = np.mean(hist) * 1.5
+        peaks_idx = np.where(hist > threshold)[0]
+        
+        if len(peaks_idx) >= 2:
+            # 选择最高的两个峰
+            top_peaks = sorted(peaks_idx, key=lambda i: hist[i], reverse=True)[:2]
+            top_peaks.sort()  # 按位置排序
+            
+            peak1_x = bins[top_peaks[0]]
+            peak2_x = bins[top_peaks[1]]
+            
+            # 双栏
+            num_columns = 2
+            column_gap = peak2_x - peak1_x - (page_width - peak2_x)
+            mid_x = (peak1_x + peak2_x) / 2
+            
+            if debug:
+                print(f"Detected TWO columns:")
+                print(f"  Left column x0 ≈ {peak1_x:.1f}pt")
+                print(f"  Right column x0 ≈ {peak2_x:.1f}pt")
+                print(f"  Column gap ≈ {column_gap:.1f}pt")
+            
+            # 标注每个单元所在栏
+            for units in all_units.values():
+                for unit in units:
+                    unit.column = 0 if unit.bbox.x0 < mid_x else 1
+        else:
+            # 单栏
+            num_columns = 1
+            column_gap = 0.0
+            
+            if debug:
+                print(f"Detected SINGLE column")
+            
+            for units in all_units.values():
+                for unit in units:
+                    unit.column = -1
+    except ImportError:
+        # numpy未安装，默认单栏
+        if debug:
+            print("NumPy not available, assuming single column")
+        num_columns = 1
+        column_gap = 0.0
+        for units in all_units.values():
+            for unit in units:
+                unit.column = -1
+    
+    return num_columns, column_gap, all_units
+
+
+def _build_text_blocks(
+    all_units: Dict[int, List[EnhancedTextUnit]],
+    typical_line_height: float,
+    debug: bool = False
+) -> Dict[int, List[TextBlock]]:
+    """
+    将相邻的文本单元聚合成文本区块（Step 3增强版）
+    
+    聚合规则：
+    1. 同类型（如都是paragraph）
+    2. 垂直距离 < 2×typical_line_height
+    3. 同一栏
+    
+    新增：
+    - 为标题创建单独的TextBlock（用于debug可视化）
+    - 排除in_figure_text（图表内文字）
+    """
+    if debug:
+        print("\n[DEBUG] Building Text Blocks (Step 3 Enhanced)")
+        print("=" * 70)
+        print(f"Typical line height: {typical_line_height:.1f}pt")
+    
+    all_blocks: Dict[int, List[TextBlock]] = {}
+    
+    for pno, units in all_units.items():
+        if not units:
+            all_blocks[pno] = []
+            continue
+        
+        # 按y坐标排序
+        sorted_units = sorted(units, key=lambda u: u.bbox.y0)
+        
+        blocks: List[TextBlock] = []
+        current_block_units = [sorted_units[0]]
+        current_type = sorted_units[0].text_type
+        current_column = sorted_units[0].column
+        
+        for i in range(1, len(sorted_units)):
+            unit = sorted_units[i]
+            prev_unit = sorted_units[i-1]
+            
+            # 检查是否应该聚合
+            same_type = unit.text_type == current_type
+            same_column = unit.column == current_column
+            vertical_distance = unit.bbox.y0 - prev_unit.bbox.y1
+            close_distance = vertical_distance < 2 * typical_line_height
+            
+            if same_type and same_column and close_distance:
+                current_block_units.append(unit)
+            else:
+                # 创建新区块
+                # 1. 段落/列表：聚合多行（>=2）
+                if current_type in ['paragraph', 'list'] and len(current_block_units) >= 2:
+                    merged_bbox = fitz.Rect()
+                    for u in current_block_units:
+                        merged_bbox |= u.bbox
+                    blocks.append(TextBlock(
+                        bbox=merged_bbox,
+                        units=current_block_units,
+                        block_type=current_type + '_group',
+                        page=pno,
+                        column=current_column
+                    ))
+                # 2. 标题：创建单独的block（用于debug可视化）
+                elif current_type.startswith('title_') and len(current_block_units) >= 1:
+                    merged_bbox = fitz.Rect()
+                    for u in current_block_units:
+                        merged_bbox |= u.bbox
+                    blocks.append(TextBlock(
+                        bbox=merged_bbox,
+                        units=current_block_units,
+                        block_type=current_type,  # 保留原始类型（title_h1/h2/h3）
+                        page=pno,
+                        column=current_column
+                    ))
+                # 3. in_figure_text：跳过，不创建block
+                # 4. caption/equation：跳过
+                
+                # 开始新区块
+                current_block_units = [unit]
+                current_type = unit.text_type
+                current_column = unit.column
+        
+        # 处理最后一个区块
+        if current_type in ['paragraph', 'list'] and len(current_block_units) >= 2:
+            merged_bbox = fitz.Rect()
+            for u in current_block_units:
+                merged_bbox |= u.bbox
+            blocks.append(TextBlock(
+                bbox=merged_bbox,
+                units=current_block_units,
+                block_type=current_type + '_group',
+                page=pno,
+                column=current_column
+            ))
+        elif current_type.startswith('title_') and len(current_block_units) >= 1:
+            merged_bbox = fitz.Rect()
+            for u in current_block_units:
+                merged_bbox |= u.bbox
+            blocks.append(TextBlock(
+                bbox=merged_bbox,
+                units=current_block_units,
+                block_type=current_type,
+                page=pno,
+                column=current_column
+            ))
+        
+        all_blocks[pno] = blocks
+        
+        if debug and pno == 0:
+            print(f"[Page {pno+1}] Created {len(blocks)} text blocks")
+            for i, block in enumerate(blocks[:5]):  # 显示前5个
+                print(f"  Block {i+1}: {block.block_type}, {len(block.units)} units, bbox={block.bbox}")
+    
+    return all_blocks
+
+
+def _detect_vacant_regions(
+    all_blocks: Dict[int, List[TextBlock]],
+    doc: "fitz.Document",
+    debug: bool = False
+) -> Dict[int, List[fitz.Rect]]:
+    """
+    识别页面中的留白区域（可能包含图表）
+    
+    方法：
+    1. 将页面划分为网格（50×50pt）
+    2. 标记被文本区块覆盖的格子
+    3. 连通未覆盖的格子，形成留白区域
+    4. 过滤小区域（< 0.05 × page_area）
+    """
+    if debug:
+        print("\n[DEBUG] Detecting Vacant Regions")
+        print("=" * 70)
+    
+    grid_size = 50  # pt
+    all_vacant: Dict[int, List[fitz.Rect]] = {}
+    
+    for pno in range(len(doc)):
+        page = doc[pno]
+        page_rect = page.rect
+        
+        # 创建网格
+        nx = int(page_rect.width / grid_size) + 1
+        ny = int(page_rect.height / grid_size) + 1
+        
+        try:
+            import numpy as np
+            grid = np.zeros((ny, nx), dtype=bool)  # True = 被文本覆盖
+            
+            # 标记文本区块
+            blocks = all_blocks.get(pno, [])
+            for block in blocks:
+                if block.block_type in ['paragraph_group', 'list_group']:
+                    # 计算区块覆盖的网格范围
+                    x0_idx = max(0, int(block.bbox.x0 / grid_size))
+                    y0_idx = max(0, int(block.bbox.y0 / grid_size))
+                    x1_idx = min(nx, int(block.bbox.x1 / grid_size) + 1)
+                    y1_idx = min(ny, int(block.bbox.y1 / grid_size) + 1)
+                    
+                    grid[y0_idx:y1_idx, x0_idx:x1_idx] = True
+            
+            # 连通分量分析
+            from scipy.ndimage import label as scipy_label
+            labeled_grid, num_features = scipy_label(~grid)
+            
+            vacant_rects = []
+            for region_id in range(1, num_features + 1):
+                # 提取该区域的格子坐标
+                coords = np.argwhere(labeled_grid == region_id)
+                if len(coords) == 0:
+                    continue
+                
+                # 转换为pdf坐标
+                y_indices, x_indices = coords[:, 0], coords[:, 1]
+                y0_idx = y_indices.min()
+                y1_idx = y_indices.max()
+                x0_idx = x_indices.min()
+                x1_idx = x_indices.max()
+                
+                rect = fitz.Rect(
+                    x0_idx * grid_size,
+                    y0_idx * grid_size,
+                    min((x1_idx + 1) * grid_size, page_rect.width),
+                    min((y1_idx + 1) * grid_size, page_rect.height)
+                )
+                
+                # 过滤小区域
+                area_ratio = (rect.width * rect.height) / (page_rect.width * page_rect.height)
+                if area_ratio > 0.05:  # 至少占5%页面面积
+                    vacant_rects.append(rect)
+            
+            all_vacant[pno] = vacant_rects
+            
+            if debug and pno == 0:
+                print(f"[Page {pno+1}] Found {len(vacant_rects)} vacant regions")
+                for i, rect in enumerate(vacant_rects[:3]):
+                    area_ratio = (rect.width * rect.height) / (page_rect.width * page_rect.height)
+                    print(f"  Region {i+1}: {rect}, area={area_ratio:.1%}")
+        
+        except ImportError:
+            # numpy或scipy未安装，跳过留白检测
+            if debug and pno == 0:
+                print(f"[Page {pno+1}] NumPy/SciPy not available, skipping vacant region detection")
+            all_vacant[pno] = []
+    
+    return all_vacant
+
+
+def _adjust_clip_with_layout(
+    clip_rect: fitz.Rect,
+    caption_rect: fitz.Rect,
+    layout_model: DocumentLayoutModel,
+    page_num: int,  # 0-based
+    direction: str,  # 'above' or 'below'
+    debug: bool = False
+) -> fitz.Rect:
+    """
+    使用版式信息优化图表裁剪边界（Step 3核心功能）
+    
+    策略：
+    1. 检测clip_rect与正文段落的重叠
+    2. 如果重叠过多，调整边界以贴合文本区块边界
+    3. 使用文本区块边界作为"软约束"
+    
+    参数:
+        clip_rect: 候选窗口
+        caption_rect: 图注边界框
+        layout_model: 版式模型
+        page_num: 页码（0-based）
+        direction: 图注方向（'above' = 图在上方，'below' = 图在下方）
+        debug: 调试模式
+    
+    返回:
+        调整后的边界框
+    """
+    text_blocks = layout_model.text_blocks.get(page_num, [])
+    if not text_blocks:
+        return clip_rect  # 无文本区块，直接返回
+    
+    # 筛选出正文段落区块和标题（标题也需要保护，避免被误包含）
+    protected_blocks = [b for b in text_blocks if b.block_type in ['paragraph_group', 'list_group'] or b.block_type.startswith('title_')]
+    if not protected_blocks:
+        return clip_rect
+    
+    # 区分"内容区块"（图表内部）和"外部区块"（需要排除）
+    # 内容区块：位于 caption 和 clip 之间且与 clip 有显著重叠的文本块
+    # 外部区块：远离 clip 边界或重叠度低的文本块
+    content_blocks = []
+    external_blocks = []
+    
+    for block in protected_blocks:
+        # 计算重叠度
+        inter = clip_rect & block.bbox
+        if inter.is_empty:
+            external_blocks.append(block)
+            continue
+        
+        overlap_with_clip = (inter.width * inter.height) / (block.bbox.width * block.bbox.height)
+        
+        if direction == 'below':
+            # 图在下方，caption在上方
+            # 内容区块：在 caption 下方且与 clip 重叠度>50%
+            if block.bbox.y0 >= caption_rect.y1 - 5 and overlap_with_clip > 0.5:
+                content_blocks.append(block)
+            else:
+                external_blocks.append(block)
+        else:  # direction == 'above'
+            # 图在上方，caption在下方
+            # 内容区块：在 caption 上方且与 clip 重叠度>50%
+            if block.bbox.y1 <= caption_rect.y0 + 5 and overlap_with_clip > 0.5:
+                content_blocks.append(block)
+            else:
+                external_blocks.append(block)
+    
+    # 只考虑外部区块的重叠（内容区块是应该保留的）
+    total_overlap_area = 0.0
+    clip_area = clip_rect.width * clip_rect.height
+    
+    overlapping_blocks = []
+    for block in external_blocks:
+        inter = clip_rect & block.bbox
+        if not inter.is_empty:
+            overlap_area = inter.width * inter.height
+            total_overlap_area += overlap_area
+            overlap_ratio = overlap_area / clip_area
+            # 标题类区块：即使重叠度小也要记录（降低阈值到1%）
+            # 段落类区块：需要重叠度>5%才记录
+            threshold = 0.01 if block.block_type.startswith('title_') else 0.05
+            if overlap_ratio > threshold:
+                overlapping_blocks.append((block, inter, overlap_ratio))
+    
+    overlap_ratio_total = total_overlap_area / clip_area if clip_area > 0 else 0
+    
+    if debug:
+        print(f"\n[DEBUG] Layout-Guided Clipping Adjustment")
+        print(f"  Direction: {direction}")
+        print(f"  Original clip: {clip_rect}")
+        print(f"  Content blocks (inside): {len(content_blocks)}")
+        print(f"  External blocks (outside): {len(external_blocks)}")
+        print(f"  Total overlap (external only): {overlap_ratio_total:.1%}")
+        print(f"  Overlapping blocks: {len(overlapping_blocks)}")
+    
+    # 初始化调整后的边界
+    adjusted_clip = fitz.Rect(clip_rect)
+    
+    # ===== 优先处理：内容区块边界保护（即使外部重叠度低也要执行） =====
+    # 特殊处理：如果有内容区块被部分切断，扩展clip以包含完整内容
+    # 这主要解决表格内文字被切断的问题（如 Table 4 的表头）
+    content_adjusted = False
+    for block in content_blocks:
+        if direction == 'below':
+            # 图在下方，检查上边界是否切断了内容区块
+            if block.bbox.y0 < adjusted_clip.y0 < block.bbox.y1:
+                adjusted_clip.y0 = block.bbox.y0 - 2  # 向上扩展，留2pt间隙
+                content_adjusted = True
+                if debug:
+                    print(f"  -> Expanding top boundary to include content block at {block.bbox.y0:.1f}pt")
+            # 检查下边界
+            if block.bbox.y0 < adjusted_clip.y1 < block.bbox.y1:
+                adjusted_clip.y1 = block.bbox.y1 + 2  # 向下扩展
+                content_adjusted = True
+                if debug:
+                    print(f"  -> Expanding bottom boundary to include content block at {block.bbox.y1:.1f}pt")
+        else:  # direction == 'above'
+            # 图在上方，检查边界是否切断了内容区块
+            if block.bbox.y0 < adjusted_clip.y1 < block.bbox.y1:
+                adjusted_clip.y1 = block.bbox.y1 + 2  # 向下扩展
+                content_adjusted = True
+                if debug:
+                    print(f"  -> Expanding bottom boundary to include content block at {block.bbox.y1:.1f}pt")
+            if block.bbox.y0 < adjusted_clip.y0 < block.bbox.y1:
+                adjusted_clip.y0 = block.bbox.y0 - 2  # 向上扩展
+                content_adjusted = True
+                if debug:
+                    print(f"  -> Expanding top boundary to include content block at {block.bbox.y0:.1f}pt")
+    
+    # 如果进行了内容区块调整，直接返回（不需要检查外部重叠）
+    if content_adjusted:
+        if debug:
+            print(f"  Adjusted clip (content protection): {adjusted_clip}")
+            print(f"  Height change: {clip_rect.height:.1f}pt -> {adjusted_clip.height:.1f}pt ({(adjusted_clip.height/clip_rect.height - 1)*100:+.1f}%)")
+        return adjusted_clip
+    
+    # ===== 外部区块处理：只有在没有内容区块调整时才执行 =====
+    # 特殊处理：即使重叠度低，如果有标题与clip边界接触，也要调整
+    has_title_overlap = False
+    for block, inter, ratio in overlapping_blocks:
+        if block.block_type.startswith('title_'):
+            has_title_overlap = True
+            break
+    
+    # 如果重叠不严重（<20%）且没有标题重叠，直接返回
+    if overlap_ratio_total < 0.20 and not has_title_overlap:
+        if debug:
+            print(f"  -> No adjustment needed (overlap < 20%, no title overlap)")
+        return clip_rect
+    
+    if direction == 'above':
+        # 图在上方，图注在下方
+        # 调整策略：向上收缩clip的下边界，避开下方的外部区块
+        blocks_below = [b for b in external_blocks if b.bbox.y0 > caption_rect.y1]
+        if blocks_below:
+            # 最近的下方区块（不应该被包含）
+            nearest_below = min(blocks_below, key=lambda b: b.bbox.y0 - caption_rect.y1)
+            # 如果clip包含了这个区块，裁剪到caption上方
+            if adjusted_clip.y1 > nearest_below.bbox.y0:
+                adjusted_clip.y1 = min(adjusted_clip.y1, nearest_below.bbox.y0 - 5)  # 留5pt间隙
+        
+        # 同时检查是否包含了caption上方的外部区块
+        blocks_above_caption = [b for b in external_blocks if b.bbox.y1 < caption_rect.y0]
+        if blocks_above_caption:
+            # 找到最近的上方区块
+            nearest_above = max(blocks_above_caption, key=lambda b: b.bbox.y1)
+            # 如果clip顶部超出了这个区块很多，可能误包含了更上方的文字
+            if adjusted_clip.y0 < nearest_above.bbox.y0 - 50:  # 超出50pt
+                # 调整顶部，贴合区块底部
+                adjusted_clip.y0 = max(adjusted_clip.y0, nearest_above.bbox.y1 + 5)
+    
+    elif direction == 'below':
+        # 图在下方，图注在上方
+        # 调整策略：向下收缩clip的上边界，避开上方的外部区块
+        blocks_above = [b for b in external_blocks if b.bbox.y1 < caption_rect.y0]
+        if blocks_above:
+            # 最近的上方区块（不应该被包含）
+            nearest_above = max(blocks_above, key=lambda b: caption_rect.y0 - b.bbox.y1)
+            # 如果clip包含了这个区块，裁剪到caption下方
+            if adjusted_clip.y0 < nearest_above.bbox.y1:
+                adjusted_clip.y0 = max(adjusted_clip.y0, nearest_above.bbox.y1 + 5)  # 留5pt间隙
+        
+        # 同时检查是否包含了caption下方的外部区块
+        blocks_below_caption = [b for b in external_blocks if b.bbox.y0 > caption_rect.y1]
+        if blocks_below_caption:
+            # 找到最近的下方区块
+            nearest_below = min(blocks_below_caption, key=lambda b: b.bbox.y0)
+            # 如果是标题，只要clip包含了它（哪怕一点点），就要调整
+            # 如果是段落，clip要超出很多才调整
+            is_title = nearest_below.block_type.startswith('title_')
+            threshold = 5 if is_title else 50
+            if adjusted_clip.y1 > nearest_below.bbox.y1 + threshold:
+                # 调整底部，贴合区块顶部
+                adjusted_clip.y1 = min(adjusted_clip.y1, nearest_below.bbox.y0 - 5)
+            elif is_title and adjusted_clip.y1 > nearest_below.bbox.y0:
+                # 标题被部分包含，收缩到标题上方
+                adjusted_clip.y1 = min(adjusted_clip.y1, nearest_below.bbox.y0 - 5)
+    
+    # 验证调整后的窗口仍然合理（高度至少保留50%）
+    if adjusted_clip.height < 0.5 * clip_rect.height or adjusted_clip.height < 80:
+        if debug:
+            print(f"  -> Adjustment too aggressive, keeping original")
+        return clip_rect
+    
+    if debug:
+        print(f"  Adjusted clip: {adjusted_clip}")
+        print(f"  Height change: {clip_rect.height:.1f}pt -> {adjusted_clip.height:.1f}pt ({(adjusted_clip.height/clip_rect.height - 1)*100:+.1f}%)")
+    
+    return adjusted_clip
+
+
+def extract_text_with_format(
+    pdf_path: str,
+    out_json: Optional[str] = None,
+    sample_pages: Optional[int] = None,
+    debug: bool = False
+) -> DocumentLayoutModel:
+    """
+    提取文本并保留完整格式信息，构建版式模型
+    
+    参数:
+        pdf_path: PDF文件路径
+        out_json: 输出JSON路径（可选）
+        sample_pages: 采样页数（None表示全部）
+        debug: 调试模式
+    
+    返回:
+        DocumentLayoutModel: 版式模型对象
+    """
+    import json
+    
+    if debug:
+        print("\n" + "=" * 70)
+        print("LAYOUT-DRIVEN EXTRACTION: Building Document Layout Model")
+        print("=" * 70)
+    
+    doc = fitz.open(pdf_path)
+    
+    # 1. 统计全局属性
+    page_rect = doc[0].rect
+    page_size = (page_rect.width, page_rect.height)
+    
+    # 使用现有的行高统计函数
+    typical_metrics = _estimate_document_line_metrics(doc, sample_pages=5, debug=debug)
+    typical_font_size = typical_metrics['typical_font_size']
+    typical_line_height = typical_metrics['typical_line_height']
+    typical_line_gap = typical_metrics['typical_line_gap']
+    
+    # 1b. 统计典型字体名（用于识别图表内文字）
+    font_name_counts = {}
+    num_sample_pages = min(5, len(doc))
+    for pno in range(num_sample_pages):
+        page = doc[pno]
+        dict_data = page.get_text("dict")
+        for blk in dict_data.get("blocks", []):
+            if blk.get("type") != 0:
+                continue
+            for ln in blk.get("lines", []):
+                for sp in ln.get("spans", []):
+                    font_name = sp.get("font", "unknown")
+                    font_size = sp.get("size", 0)
+                    # 仅统计正文字号范围内的字体（8-14pt）
+                    if 8 <= font_size <= 14:
+                        font_name_counts[font_name] = font_name_counts.get(font_name, 0) + 1
+    
+    # 取出现最频繁的字体名作为典型字体
+    if font_name_counts:
+        typical_font_name = max(font_name_counts, key=font_name_counts.get)
+    else:
+        typical_font_name = "Times"  # 默认值
+    
+    if debug:
+        print(f"[INFO] Typical font name: {typical_font_name}")
+    
+    # 2. 提取每页的增强文本单元
+    all_units: Dict[int, List[EnhancedTextUnit]] = {}
+    num_pages = len(doc) if sample_pages is None else min(sample_pages, len(doc))
+    
+    for pno in range(num_pages):
+        page = doc[pno]
+        dict_data = page.get_text("dict")
+        
+        units = []
+        for blk_idx, blk in enumerate(dict_data.get("blocks", [])):
+            if blk.get("type") != 0:  # 仅文本块
+                continue
+            for ln_idx, ln in enumerate(blk.get("lines", [])):
+                spans = ln.get("spans", [])
+                if not spans:
+                    continue
+                
+                # 合并span级信息
+                text = "".join(sp.get("text", "") for sp in spans)
+                bbox = fitz.Rect(ln["bbox"])
+                
+                # 字体信息（取主要span）
+                main_span = max(spans, key=lambda s: len(s.get("text", "")))
+                font_name = main_span.get("font", "unknown")
+                font_size = main_span.get("size", 10.0)
+                font_flags = main_span.get("flags", 0)
+                color = main_span.get("color", 0)
+                
+                # 判断加粗（flags的bit 4表示bold）
+                font_weight = 'bold' if (font_flags & (1 << 4)) else 'regular'
+                
+                # RGB颜色
+                if isinstance(color, int):
+                    color_rgb = ((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF)
+                else:
+                    color_rgb = (0, 0, 0)
+                
+                # 创建增强文本单元
+                unit = EnhancedTextUnit(
+                    bbox=bbox,
+                    text=text,
+                    page=pno,
+                    font_name=font_name,
+                    font_size=font_size,
+                    font_weight=font_weight,
+                    font_flags=font_flags,
+                    color=color_rgb,
+                    text_type='unknown',
+                    confidence=0.0,
+                    column=-1,
+                    indent=bbox.x0,
+                    block_idx=blk_idx,
+                    line_idx=ln_idx
+                )
+                units.append(unit)
+        
+        all_units[pno] = units
+    
+    # 3. 文本类型分类（Step 3增强：传递typical_font_name）
+    all_units = _classify_text_types(all_units, typical_font_size, typical_font_name, page_size[0], debug=debug)
+    
+    # 4. 双栏检测
+    num_columns, column_gap, all_units = _detect_columns(all_units, page_size[0], debug=debug)
+    
+    # 5. 构建文本区块
+    all_blocks = _build_text_blocks(all_units, typical_line_height, debug=debug)
+    
+    # 6. 识别留白区域
+    vacant_regions = _detect_vacant_regions(all_blocks, doc, debug=debug)
+    
+    # 7. 创建版式模型
+    layout_model = DocumentLayoutModel(
+        page_size=page_size,
+        num_columns=num_columns,
+        margin_left=page_rect.x0,
+        margin_right=page_rect.x1,
+        margin_top=page_rect.y0,
+        margin_bottom=page_rect.y1,
+        column_gap=column_gap,
+        typical_font_size=typical_font_size,
+        typical_line_height=typical_line_height,
+        typical_line_gap=typical_line_gap,
+        text_units=all_units,
+        text_blocks=all_blocks,
+        vacant_regions=vacant_regions
+    )
+    
+    # 8. 保存为JSON（可选）
+    if out_json:
+        # 确保目录存在（只在dirname非空时创建，修复P1 review的bug）
+        out_dir = os.path.dirname(out_json)
+        if out_dir:  # 只在有目录路径时才创建
+            os.makedirs(out_dir, exist_ok=True)
+        with open(out_json, 'w', encoding='utf-8') as f:
+            json.dump(layout_model.to_dict(), f, indent=2, ensure_ascii=False)
+        if debug:
+            print(f"\n[INFO] Saved layout model to: {out_json}")
+    
+    doc.close()
+    
+    if debug:
+        print("\n[SUMMARY] Layout Model Built Successfully")
+        print(f"  - Pages analyzed: {num_pages}")
+        print(f"  - Total text units: {sum(len(v) for v in all_units.values())}")
+        print(f"  - Total text blocks: {sum(len(v) for v in all_blocks.values())}")
+        print(f"  - Total vacant regions: {sum(len(v) for v in vacant_regions.values())}")
+        print("=" * 70)
+    
+    return layout_model
+
+
 # 命令行参数解析：保持最小 API，同时提供关键裁剪与渲染调优项
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Extract text and figures/tables from a PDF")
@@ -3754,6 +4787,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--debug-captions", action="store_true", help="Print detailed caption candidate scoring information for debugging")
     # Visual debug mode (NEW)
     p.add_argument("--debug-visual", action="store_true", help="Enable visual debugging mode: save multi-stage boundary boxes overlaid on full page (output to images/debug/)")
+    
+    # Layout-driven extraction (V2 Architecture - NEW)
+    p.add_argument("--layout-driven", action="store_true", help="Enable layout-driven extraction (V2): build document layout model first, then use it to guide figure/table extraction (experimental)")
+    p.add_argument("--layout-json", default=None, help="Path to save/load layout model JSON (default: <out_dir>/layout_model.json)")
     
     # Adaptive line height
     p.add_argument("--adaptive-line-height", action="store_true", default=True, help="Enable adaptive line height: auto-adjust parameters based on document's typical line height (default: enabled)")
@@ -3830,7 +4867,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     pdf_stem = os.path.splitext(os.path.basename(pdf_path))[0]
     out_dir = args.out_dir or os.path.join(pdf_dir, "images")
     out_text = args.out_text or os.path.join(pdf_dir, "text", pdf_stem + ".txt")
-    os.makedirs(os.path.dirname(out_text), exist_ok=True)
+    # 确保文本输出目录存在（只在dirname非空时创建）
+    text_dir = os.path.dirname(out_text)
+    if text_dir:
+        os.makedirs(text_dir, exist_ok=True)
 
     # Extract text by default（若安装 pdfminer.six 且指定 out-text，默认尝试提取文本）
     try_extract_text(pdf_path, out_text)
@@ -3886,6 +4926,30 @@ def main(argv: Optional[List[str]] = None) -> int:
     # 控制调试导出
     if getattr(args, 'dump_candidates', False):
         os.environ['DUMP_CANDIDATES'] = '1'
+
+    # Build layout model if --layout-driven is enabled (V2 Architecture)
+    layout_model: Optional[DocumentLayoutModel] = None
+    if args.layout_driven:
+        print("\n" + "=" * 70)
+        print("LAYOUT-DRIVEN EXTRACTION (V2 Architecture)")
+        print("=" * 70)
+        
+        # Determine layout JSON path
+        layout_json_path = args.layout_json or os.path.join(out_dir, "layout_model.json")
+        
+        # Build layout model
+        layout_model = extract_text_with_format(
+            pdf_path=pdf_path,
+            out_json=layout_json_path,
+            sample_pages=None,  # Analyze全部页面
+            debug=args.debug_captions  # 复用debug_captions开关
+        )
+        
+        print(f"[INFO] Layout model built successfully")
+        print(f"  - Columns: {layout_model.num_columns} ({'single' if layout_model.num_columns == 1 else 'double'})")
+        print(f"  - Text blocks: {sum(len(v) for v in layout_model.text_blocks.values())}")
+        print(f"  - Vacant regions: {sum(len(v) for v in layout_model.vacant_regions.values())}")
+        print("=" * 70 + "\n")
 
     # Extract figures
     def parse_fig_list(s: str) -> List[int]:
@@ -3947,6 +5011,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         debug_captions=getattr(args, 'debug_captions', False),
         debug_visual=getattr(args, 'debug_visual', False),
         adaptive_line_height=getattr(args, 'adaptive_line_height', True),
+        layout_model=layout_model,  # V2 Architecture
     )
 
     # 汇总记录
@@ -3999,6 +5064,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             debug_captions=getattr(args, 'debug_captions', False),
             debug_visual=getattr(args, 'debug_visual', False),
             adaptive_line_height=getattr(args, 'adaptive_line_height', True),
+            layout_model=layout_model,  # V2 Architecture
         )
         all_records.extend(tbl_records)
 

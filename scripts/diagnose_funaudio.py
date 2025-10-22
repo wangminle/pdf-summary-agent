@@ -5,6 +5,8 @@
 
 import fitz
 import sys
+import argparse
+import os
 
 def analyze_figure_context(pdf_path: str, page_num: int, fig_no: int, caption_y: float):
     """分析图注周围的上下文"""
@@ -169,7 +171,22 @@ def analyze_table8(pdf_path: str):
 
 
 def main():
-    pdf_path = 'tests/FunAudio-ASR.pdf'
+    # 设置命令行参数
+    parser = argparse.ArgumentParser(description='诊断 FunAudio-ASR.pdf 的提取问题')
+    parser.add_argument('--pdf', type=str, 
+                       default='tests/basic-benchmark/FunAudio-ASR/FunAudio-ASR.pdf',
+                       help='PDF文件路径（默认：tests/basic-benchmark/FunAudio-ASR/FunAudio-ASR.pdf）')
+    args = parser.parse_args()
+    
+    pdf_path = args.pdf
+    
+    # 检查文件是否存在
+    if not os.path.exists(pdf_path):
+        print(f"错误：找不到PDF文件：{pdf_path}", file=sys.stderr)
+        print(f"请确认文件路径正确，或使用 --pdf 参数指定路径", file=sys.stderr)
+        sys.exit(1)
+    
+    print(f"诊断文件：{pdf_path}\n")
     
     # 分析有问题的Figures
     print("【问题分析：上方文字过多的图表】")
