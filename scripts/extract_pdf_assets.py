@@ -2344,26 +2344,29 @@ def extract_figures(
                     
                     返回:
                         True 如果检测到边缘截断大对象
+                    
+                    修复说明（2025-10-27）:
+                        原逻辑反转：当对象边缘与clip重合时误判为截断，导致完整窗口被扣分
+                        正确逻辑：检测对象是否延伸到clip外面（被clip边界截断）
                     """
-                    edge_margin = 10.0  # 边缘检测范围（pt）
                     min_obj_height = 50.0  # 最小对象高度阈值（pt）
                     
                     for obj in objects:
-                        # 检查对象是否在窗口内
+                        # 检查对象是否与窗口水平重叠
                         if not (obj.x0 < clip.x1 and obj.x1 > clip.x0):
                             continue
                         
                         # 根据方向检测边缘截断
                         if side == 'above':
                             # 检查顶部边缘（远离Caption一侧）
-                            if clip.y0 - 5 < obj.y0 < clip.y0 + edge_margin:
-                                if obj.height > min_obj_height:
-                                    return True
+                            # 如果对象顶部在clip外面，且对象底部在clip内足够深度 → 被截断
+                            if obj.y0 < clip.y0 and obj.y1 > clip.y0 + min_obj_height:
+                                return True
                         else:  # below
                             # 检查底部边缘（远离Caption一侧）
-                            if clip.y1 - edge_margin < obj.y1 < clip.y1 + 5:
-                                if obj.height > min_obj_height:
-                                    return True
+                            # 如果对象底部在clip外面，且对象顶部在clip内足够深度 → 被截断
+                            if obj.y1 > clip.y1 and obj.y0 < clip.y1 - min_obj_height:
+                                return True
                     
                     return False
 
@@ -3081,7 +3084,7 @@ def save_debug_visualization(
                 if block.block_type in ['paragraph_group', 'list_group']:
                     # 段落/列表：粉红色虚线
                     shape.draw_rect(block.bbox)
-                    shape.finish(color=pink_color, width=2, dashes="[3 3]")
+                    shape.finish(color=pink_color, width=2, dashes=[3, 3])
                     text_blocks_drawn.append(block)
                 elif block.block_type.startswith('title_'):
                     # 标题：粉红色实线（Step 3 新增）
@@ -3617,19 +3620,25 @@ def extract_tables(
                 
                 # 定义边缘截断检测函数（表格版本）
                 def detect_top_edge_truncation_table(clip: fitz.Rect, objects: List[fitz.Rect], side: str) -> bool:
-                    edge_margin = 10.0
+                    """
+                    检测表格窗口边缘是否截断对象
+                    
+                    修复说明（2025-10-27）:
+                        原逻辑反转：当对象边缘与clip重合时误判为截断，导致完整窗口被扣分
+                        正确逻辑：检测对象是否延伸到clip外面（被clip边界截断）
+                    """
                     min_obj_height = 50.0
                     for obj in objects:
                         if not (obj.x0 < clip.x1 and obj.x1 > clip.x0):
                             continue
                         if side == 'above':
-                            if clip.y0 - 5 < obj.y0 < clip.y0 + edge_margin:
-                                if obj.height > min_obj_height:
-                                    return True
+                            # 如果对象顶部在clip外面，且对象底部在clip内足够深度 → 被截断
+                            if obj.y0 < clip.y0 and obj.y1 > clip.y0 + min_obj_height:
+                                return True
                         else:  # below
-                            if clip.y1 - edge_margin < obj.y1 < clip.y1 + 5:
-                                if obj.height > min_obj_height:
-                                    return True
+                            # 如果对象底部在clip外面，且对象顶部在clip内足够深度 → 被截断
+                            if obj.y1 > clip.y1 and obj.y0 < clip.y1 - min_obj_height:
+                                return True
                     return False
                 
                 cands: List[Tuple[float, str, fitz.Rect]] = []
@@ -4911,7 +4920,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--refine-near-edge-only", action="store_true", default=True, help="Refinements only adjust near-caption edge (default ON)")
     p.add_argument("--no-refine-near-edge-only", action="store_true", help="Disable near-edge-only behavior (for debugging)")
     p.add_argument("--no-refine-safe", action="store_true", help="Disable safety gates and fallback to baseline")
-    p.add_argument("--autocrop-shrink-limit", type=float, default=0.30, help="Max area shrink ratio allowed during autocrop (0.30 = shrink up to 30%, lower=more conservative)")
+    p.add_argument("--autocrop-shrink-limit", type=float, default=0.30, help="Max area shrink ratio allowed during autocrop (0.30 = shrink up to 30%%, lower=more conservative)")
     p.add_argument("--autocrop-min-height-px", type=int, default=80, help="Minimal height in pixels after autocrop (at render DPI)")
     # Tables
     p.add_argument("--include-tables", dest="include_tables", action="store_true", help="Also extract tables as images")

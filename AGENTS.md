@@ -73,12 +73,15 @@ Get-Location
 ### 一键稳健预设（推荐）
 - 使用 `--preset robust` 自动启用稳健参数（A+B+D 精裁 + 验收 + 关键阈值），相当于：
   - `--dpi 300 --clip-height 520 --margin-x 26 --caption-gap 6`
-  - A：`--text-trim --text-trim-width-ratio 0.5 --text-trim-font-min 7 --text-trim-font-max 16 --text-trim-gap 6 --adjacent-th 28`
-  - B：`--object-pad 8 --object-min-area-ratio 0.015 --object-merge-gap 6`
+  - A（图）：`--text-trim --text-trim-width-ratio 0.5 --text-trim-font-min 7 --text-trim-font-max 16 --text-trim-gap 6 --adjacent-th 24`
+  - A（表）：相同参数，但 `--adjacent-th 28`（表格特化）
+  - B（图）：`--object-pad 8 --object-min-area-ratio 0.012 --object-merge-gap 6`
+  - B（表）：相同参数，但 `--object-min-area-ratio 0.005`（对表更敏感）
   - D（图）：`--autocrop --autocrop-pad 30 --autocrop-white-th 250 --autocrop-mask-text --mask-font-max 14 --mask-width-ratio 0.5 --mask-top-frac 0.6`
   - 防过裁（图，已默认）：`--near-edge-pad-px 32`（靠近图注一侧回扩）+ `--protect-far-edge-px 18`（远端边保护，默认 14，robust=18）
-  - 表格特化（自动启用）：`--include-tables --table-clip-height 520 --table-margin-x 26 --table-caption-gap 6 --table-object-min-area-ratio 0.005 --table-object-merge-gap 4 --table-autocrop --table-autocrop-pad 20 --no-table-mask-text`
+  - 表格特化（自动启用）：表格提取默认开启（用 `--no-tables` 禁用），`--table-clip-height 520 --table-margin-x 26 --table-caption-gap 6 --table-object-min-area-ratio 0.005 --table-object-merge-gap 4 --table-autocrop --table-autocrop-pad 20`（默认关闭表格文本掩膜，用 `--table-mask-text` 启用）
   - 验收保护：高度≥0.6×、面积≥0.55×、对象覆盖率≥0.85×、墨迹密度≥0.9×，并保护多子图不被缩并。
+  - **重要说明**：若启用"自适应行高"（默认启用），上述 `adjacent_th`、`far_text_th`、`text_trim_gap`、`far_side_min_dist` 等阈值参数会根据文档的典型行高动态调整（如 `adjacent_th` = 2.0×行高）。上述列出的是基准出厂值，最终运行值会根据文档自适应。
 
 ### 方向与续页控制
 - 强制方向：
