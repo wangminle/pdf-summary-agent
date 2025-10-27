@@ -2333,6 +2333,40 @@ def extract_figures(
                 except Exception:
                     dist_lambda = 0.15
 
+                def detect_top_edge_truncation(clip: fitz.Rect, objects: List[fitz.Rect], side: str) -> bool:
+                    """
+                    检测窗口边缘是否截断对象（方案B）
+                    
+                    参数:
+                        clip: 候选窗口
+                        objects: 页面中的所有对象（图像+绘图）
+                        side: 窗口方向（'above' 或 'below'）
+                    
+                    返回:
+                        True 如果检测到边缘截断大对象
+                    """
+                    edge_margin = 10.0  # 边缘检测范围（pt）
+                    min_obj_height = 50.0  # 最小对象高度阈值（pt）
+                    
+                    for obj in objects:
+                        # 检查对象是否在窗口内
+                        if not (obj.x0 < clip.x1 and obj.x1 > clip.x0):
+                            continue
+                        
+                        # 根据方向检测边缘截断
+                        if side == 'above':
+                            # 检查顶部边缘（远离Caption一侧）
+                            if clip.y0 - 5 < obj.y0 < clip.y0 + edge_margin:
+                                if obj.height > min_obj_height:
+                                    return True
+                        else:  # below
+                            # 检查底部边缘（远离Caption一侧）
+                            if clip.y1 - edge_margin < obj.y1 < clip.y1 + 5:
+                                if obj.height > min_obj_height:
+                                    return True
+                    
+                    return False
+
                 def fig_score(clip: fitz.Rect) -> float:
                     # 小分辨率渲染估计墨迹
                     small_scale = 1.0
@@ -2346,7 +2380,12 @@ def extract_figures(
                     # 增加组件数量奖励（鼓励捕获更多子图）
                     comp_cnt = comp_count(clip)
                     comp_bonus = 0.08 * min(1.0, comp_cnt / 3.0)  # 3+组件额外加分
-                    base = 0.55 * ink + 0.25 * obj - 0.2 * para + comp_bonus
+                    
+                    # 方案A：调整评分权重（墨迹35% → 对象40%）
+                    # 增加高度奖励（鼓励完整捕获）
+                    height_bonus = 0.05 * min(1.0, clip.height / 400.0)
+                    base = 0.35 * ink + 0.40 * obj - 0.2 * para + comp_bonus + height_bonus
+                    
                     # 距离罚项：候选窗离 caption 越远，得分越低
                     if cap_rect:
                         if clip.y1 <= cap_rect.y0:  # above
@@ -2356,6 +2395,9 @@ def extract_figures(
                         base -= dist_lambda * (dist / max(1.0, page_rect.height))
                     return base
 
+                # 获取页面所有对象（用于边缘截断检测）
+                all_page_objects = image_rects + vector_rects
+                
                 candidates: List[Tuple[float, str, fitz.Rect]] = []
                 # above scanning
                 top_bound = (prev_cap.y1 + 8) if prev_cap else page_rect.y0
@@ -2378,6 +2420,9 @@ def extract_figures(
                         while y0 + 40.0 <= y1:
                             c = fitz.Rect(x_left, y0, x_right, y1)
                             sc = fig_score(c)
+                            # 方案B：边缘截断检测并扣分
+                            if detect_top_edge_truncation(c, all_page_objects, 'above'):
+                                sc -= 0.15
                             candidates.append((sc, 'above', c))
                             y0 -= step
                             if y0 < y0_min:
@@ -2398,6 +2443,9 @@ def extract_figures(
                         while y1 - 40.0 >= y0:
                             c = fitz.Rect(x_left, y0, x_right, y1)
                             sc = fig_score(c)
+                            # 方案B：边缘截断检测并扣分
+                            if detect_top_edge_truncation(c, all_page_objects, 'below'):
+                                sc -= 0.15
                             candidates.append((sc, 'below', c))
                             y0 += step
                             y1 = min(y1_max, y0 + h)
@@ -3508,8 +3556,13 @@ def extract_tables(
                 cols_norm = min(1.0, cols / 3.0)
                 line_d = _line_density(clip, draw_items)
                 para = _paragraph_ratio(clip, text_lines_all, width_ratio=text_trim_width_ratio, font_min=text_trim_font_min, font_max=text_trim_font_max)
-                # 组合分：墨迹/列对齐/线密度/对象占比 - 段落惩罚
-                base = 0.5 * ink + 0.2 * cols_norm + 0.15 * line_d + 0.15 * obj - 0.25 * para
+                
+                # 方案A：调整表格评分权重（与图片保持一致的优化思路）
+                # 降低墨迹权重，保留表格特有的列对齐和线密度特征
+                # 增加高度奖励
+                height_bonus = 0.03 * min(1.0, clip.height / 400.0)  # 表格高度奖励稍低
+                base = 0.35 * ink + 0.18 * cols_norm + 0.12 * line_d + 0.35 * obj - 0.25 * para + height_bonus
+                
                 # 距离罚项
                 if clip.y1 <= cap_rect.y0:
                     dist = abs(cap_rect.y0 - clip.y1)
@@ -3558,6 +3611,27 @@ def extract_tables(
                     step = float(os.getenv('SCAN_STEP', '14'))
                 except Exception:
                     step = 14.0
+                
+                # 方案B：获取页面所有对象（用于边缘截断检测）
+                all_table_objects = image_rects + vector_rects
+                
+                # 定义边缘截断检测函数（表格版本）
+                def detect_top_edge_truncation_table(clip: fitz.Rect, objects: List[fitz.Rect], side: str) -> bool:
+                    edge_margin = 10.0
+                    min_obj_height = 50.0
+                    for obj in objects:
+                        if not (obj.x0 < clip.x1 and obj.x1 > clip.x0):
+                            continue
+                        if side == 'above':
+                            if clip.y0 - 5 < obj.y0 < clip.y0 + edge_margin:
+                                if obj.height > min_obj_height:
+                                    return True
+                        else:  # below
+                            if clip.y1 - edge_margin < obj.y1 < clip.y1 + 5:
+                                if obj.height > min_obj_height:
+                                    return True
+                    return False
+                
                 cands: List[Tuple[float, str, fitz.Rect]] = []
 
                 # above (respect global anchor for tables)
@@ -3571,6 +3645,9 @@ def extract_tables(
                         while y0 + 40.0 <= y1:
                             c = fitz.Rect(x_left, y0, x_right, y1)
                             sc = score_table_clip(c)
+                            # 方案B：边缘截断检测并扣分
+                            if detect_top_edge_truncation_table(c, all_table_objects, 'above'):
+                                sc -= 0.15
                             cands.append((sc, 'above', c))
                             y0 -= step
                             if y0 < y0_min:
@@ -3586,6 +3663,9 @@ def extract_tables(
                         while y1 - 40.0 >= y0:
                             c = fitz.Rect(x_left, y0, x_right, y1)
                             sc = score_table_clip(c)
+                            # 方案B：边缘截断检测并扣分
+                            if detect_top_edge_truncation_table(c, all_table_objects, 'below'):
+                                sc -= 0.15
                             cands.append((sc, 'below', c))
                             y0 += step
                             y1 = min(y1_max, y0 + h)
@@ -4776,7 +4856,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     # Anchor mode & scanning (V2)
     p.add_argument("--anchor-mode", default="v2", choices=["v1", "v2"], help="Caption-anchoring strategy: v2 uses multi-scale scanning around captions (default)")
     p.add_argument("--scan-step", type=float, default=14.0, help="Vertical scan step (pt) for anchor v2")
-    p.add_argument("--scan-heights", default="240,320,420,520,640,720,820", help="Comma-separated window heights (pt) for anchor v2")
+    p.add_argument("--scan-heights", default="240,320,420,520,640,720,820,920", help="Comma-separated window heights (pt) for anchor v2")
     p.add_argument("--scan-dist-lambda", type=float, default=0.12, help="Penalty weight for distance of candidate window to caption (anchor v2, recommend 0.10-0.15)")
     p.add_argument("--scan-topk", type=int, default=3, help="Keep top-k candidates during anchor v2 (for debugging)")
     p.add_argument("--dump-candidates", action="store_true", help="Dump page-level candidate boxes for debugging (anchor v2)")
