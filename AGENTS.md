@@ -43,17 +43,19 @@ python .\scripts\extract_pdf_assets.py --pdf ".\<paper>.pdf" --preset robust
 ```bash
 # macOS/Linux
 cd images
-mv "Figure_1_Overview.png" "Figure_1_Architecture_Overview.png"
-mv "Table_1_Raw.png" "Table_1_Model_Performance_Metrics.png"
+mv "Figure_1_Overview.png" "Figure_1_Multimodal_Transformer_Architecture_Overview_Diagram.png"
+mv "Table_1_Raw.png" "Table_1_Model_Performance_Metrics_On_Benchmarks.png"
 cd ..
+python3 scripts/sync_index_after_rename.py .
 ```
 
 ```powershell
 # Windows/PowerShell
 Set-Location images
-Move-Item "Figure_1_Overview.png" "Figure_1_Architecture_Overview.png"
-Move-Item "Table_1_Raw.png" "Table_1_Model_Performance_Metrics.png"
+Move-Item "Figure_1_Overview.png" "Figure_1_Multimodal_Transformer_Architecture_Overview_Diagram.png"
+Move-Item "Table_1_Raw.png" "Table_1_Model_Performance_Metrics_On_Benchmarks.png"
 Set-Location ..
+python .\\scripts\\sync_index_after_rename.py .
 ```
 
 3) 获取当天日期与当前路径（用于命名和路径确认）
@@ -456,7 +458,7 @@ Figure_1_Overview_of_the_proposed_deep_learning.png
 
 # 最终命名（大模型重命名）
 mv "images/Figure_1_Overview_of_the_proposed_deep_learning.png" \
-   "images/Figure_1_Architecture_Overview.png"
+   "images/Figure_1_Multimodal_Transformer_Architecture_Overview_Diagram.png"
 
 # 或者更具体的命名
 mv "images/Figure_1_Overview_of_the_proposed_deep_learning.png" \
@@ -466,7 +468,7 @@ mv "images/Figure_1_Overview_of_the_proposed_deep_learning.png" \
 #### 任务2：生成带图摘要（必做）
 请基于给定的 txt 与全部 PNG 附图与表格，生成一份1500–3000字的中文Markdown摘要：
 - 结构包含：研究动机/方法/训练与后训练/评测与效率/局限与展望/结论。
-- 按编号将所有"图与表"嵌入文档（使用**重命名后**的相对路径，如 `images/Figure_1_Architecture_Overview.png`），每个元素配1–2句精要解释。
+- 按编号将所有"图与表"嵌入文档（使用**重命名后**的相对路径，如 `images/Figure_1_Multimodal_Transformer_Architecture_Overview_Diagram.png`），每个元素配1–2句精要解释。
 - 语言准确、精炼，量化关键点（复杂度、算量、关键超参）。
 
 ### 完整工作流示例
@@ -486,13 +488,14 @@ python3 scripts/extract_pdf_assets.py --pdf paper.pdf --preset robust --allow-co
 ```bash
 # 根据论文内容重命名所有图表
 cd images/
-mv "Figure_1_Overview_of_the_proposed_deep_learning.png" "Figure_1_Multimodal_Architecture_Overview.png"
-mv "Figure_2_Experimental_results_on_benchmark_datasets.png" "Figure_2_Benchmark_Performance_Comparison.png"
-mv "Figure_3_Ablation_study_results_showing_the_impact.png" "Figure_3_Ablation_Study_Results.png"
-mv "Table_1_Comparison_of_model_performance_across_different.png" "Table_1_Model_Performance_Metrics.png"
-mv "Table_2_Hyperparameter_settings_used_in_our_experiments.png" "Table_2_Training_Hyperparameters.png"
+mv "Table_1_Comparison_of_model_performance_across_different.png" "Table_1_Model_Performance_Metrics_On_Benchmarks.png"
+mv "Figure_1_Overview_of_the_proposed_deep_learning.png" "Figure_1_Multimodal_Transformer_Architecture_Overview_Diagram.png"
+mv "Figure_2_Experimental_results_on_benchmark_datasets.png" "Figure_2_Benchmark_Performance_Comparison_Across_Datasets.png"
+mv "Figure_3_Ablation_study_results_showing_the_impact.png" "Figure_3_Component_Ablation_Study_Results_Analysis.png"
+mv "Table_2_Hyperparameter_settings_used_in_our_experiments.png" "Table_2_Training_Hyperparameters_Used_In_Experiments.png"
 # ... 重命名所有图表
 cd ..
+python3 scripts/sync_index_after_rename.py .
 ```
 
 **步骤4**：生成摘要文档（使用新文件名）
@@ -505,16 +508,16 @@ cd ..
 ## 方法
 本文提出了一种多模态架构...
 
-![Figure 1: 架构概览](images/Figure_1_Multimodal_Architecture_Overview.png)
+![Figure 1: 架构概览](images/Figure_1_Multimodal_Transformer_Architecture_Overview_Diagram.png)
 **图1** 展示了提出的多模态Transformer架构，包含...
 
 ## 实验结果
 ...
 
-![Figure 2: 基准测试性能对比](images/Figure_2_Benchmark_Performance_Comparison.png)
+![Figure 2: 基准测试性能对比](images/Figure_2_Benchmark_Performance_Comparison_Across_Datasets.png)
 **图2** 对比了本文方法与现有方法在多个基准数据集上的性能...
 
-![Table 1: 模型性能指标](images/Table_1_Model_Performance_Metrics.png)
+![Table 1: 模型性能指标](images/Table_1_Model_Performance_Metrics_On_Benchmarks.png)
 **表1** 列出了不同模型配置的详细性能指标...
 ```
 

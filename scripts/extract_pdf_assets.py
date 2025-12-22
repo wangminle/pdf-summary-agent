@@ -76,6 +76,21 @@ except Exception as e:  # pragma: no cover
     print("[ERROR] PyMuPDF (pymupdf) is required: pip install pymupdf", file=sys.stderr)
     raise
 
+# --- P0-01 修复：脚本托管的环境变量列表 ---
+# 这些变量由 CLI 参数控制，在脚本开始时清理以避免 shell 中的残留值污染 CLI 参数
+MANAGED_ENV_VARS = [
+    'EXTRACT_ANCHOR_MODE',
+    'SCAN_STEP',
+    'SCAN_HEIGHTS',
+    'SCAN_DIST_LAMBDA',
+    'CAPTION_MID_GUARD',
+    'GLOBAL_ANCHOR',
+    'GLOBAL_ANCHOR_MARGIN',
+    'GLOBAL_ANCHOR_TABLE',
+    'GLOBAL_ANCHOR_TABLE_MARGIN',
+    'DUMP_CANDIDATES',
+]
+
 
 # 文本提取：若提供 out_text 路径且安装了 pdfminer.six，则将 PDF 全文提取为 UTF-8 文本文件
 # 返回写入路径或 None（未提取/失败）。
@@ -128,6 +143,55 @@ def _limit_words_after_prefix(filename: str, prefix_pattern: str, max_words: int
     
     # 重新组合
     return '_'.join(prefix_parts + desc_parts)
+
+
+# --- P0-03 修复：从正则匹配结果中提取完整的图表标识符 ---
+def _extract_figure_ident(match: re.Match) -> str:
+    """
+    从 figure_line_re 的匹配结果中提取完整的图表标识符。
+    
+    匹配组结构（P0-03 更新后）：
+      group(1): S 前缀（可选），如 "S" 或 None
+      group(2): 数字编号，如 "1", "2"
+    
+    Returns:
+        完整标识符，如 "S1", "1", "S2" 等
+    """
+    s_prefix = match.group(1) or ""
+    number = match.group(2) or ""
+    return (s_prefix + number).strip()
+
+
+def _parse_figure_ident(ident: str) -> Tuple[bool, int]:
+    """
+    解析图表标识符，返回 (is_supplementary, numeric_part)。
+    
+    Examples:
+        "S1" -> (True, 1)
+        "1" -> (False, 1)
+        "S12" -> (True, 12)
+    """
+    if ident.upper().startswith('S'):
+        try:
+            return True, int(ident[1:])
+        except ValueError:
+            return True, 0
+    else:
+        try:
+            return False, int(ident)
+        except ValueError:
+            return False, 0
+
+
+def _ident_in_range(ident: str, min_val: int, max_val: int) -> bool:
+    """
+    检查标识符的数字部分是否在指定范围内。
+    对于 S1 等附录编号，总是返回 True（不过滤附录图）。
+    """
+    is_supp, num = _parse_figure_ident(ident)
+    if is_supp:
+        return True  # 附录图不受 min_figure/max_figure 过滤
+    return min_val <= num <= max_val
 
 
 # 从图注文本生成安全的文件名：
@@ -507,6 +571,40 @@ def _collect_text_lines(dict_data: Dict) -> List[Tuple[fitz.Rect, float, str]]:
     return out
 
 
+# --- P0-02 修复：检查文本行是否属于图注本身 ---
+def _is_caption_text(
+    lines: List[fitz.Rect],
+    caption_rect: fitz.Rect,
+    tolerance: float = 10.0
+) -> bool:
+    """
+    检查给定的文本行是否与图注 caption_rect 重叠或非常接近。
+    用于防止"两行检测"误裁图注本身（尤其是长标题换行的情况）。
+    
+    Args:
+        lines: 待检查的文本行边界框列表
+        caption_rect: 图注的边界框
+        tolerance: 容差（pt），行与图注距离小于此值视为图注的一部分
+    
+    Returns:
+        True 如果任何一行被判定为属于图注
+    """
+    for line_rect in lines:
+        # 检查是否与图注重叠
+        if line_rect.intersects(caption_rect):
+            return True
+        # 检查垂直距离是否在容差范围内
+        # 图注可能在行的上方或下方
+        v_dist_above = abs(line_rect.y0 - caption_rect.y1)  # 行在图注下方
+        v_dist_below = abs(caption_rect.y0 - line_rect.y1)  # 行在图注上方
+        if min(v_dist_above, v_dist_below) < tolerance:
+            # 还需检查水平方向是否有重叠
+            h_overlap = min(line_rect.x1, caption_rect.x1) - max(line_rect.x0, caption_rect.x0)
+            if h_overlap > 0:
+                return True
+    return False
+
+
 def _detect_exact_n_lines_of_text(
     clip_rect: fitz.Rect,
     text_lines: List[Tuple[fitz.Rect, float, str]],
@@ -875,15 +973,21 @@ def _trim_clip_head_by_text_v2(
         )
         
         if is_exact_two and len(matched_lines) == 2:
-            # 使用更激进的裁切：移除这两行文字，并留一个小gap
-            if near_is_top_a:
-                # 图在下方，裁切顶部的两行
-                new_y0 = matched_lines[-1].y1 + gap  # 最后一行底部 + gap
-                clip.y0 = max(clip.y0, new_y0)  # 确保不会扩大clip
+            # --- P0-02 修复：检查匹配到的文字是否属于图注本身 ---
+            # 如果这两行文字与 caption_rect 重叠或非常接近，说明是长标题换行，不应裁切
+            if _is_caption_text(matched_lines, caption_rect, tolerance=10.0):
+                # 跳过裁切，保留图注
+                pass
             else:
-                # 图在上方，裁切底部的两行
-                new_y1 = matched_lines[0].y0 - gap  # 第一行顶部 - gap
-                clip.y1 = min(clip.y1, new_y1)  # 确保不会扩大clip
+                # 使用更激进的裁切：移除这两行文字，并留一个小gap
+                if near_is_top_a:
+                    # 图在下方，裁切顶部的两行
+                    new_y0 = matched_lines[-1].y1 + gap  # 最后一行底部 + gap
+                    clip.y0 = max(clip.y0, new_y0)  # 确保不会扩大clip
+                else:
+                    # 图在上方，裁切底部的两行
+                    new_y1 = matched_lines[0].y0 - gap  # 第一行顶部 - gap
+                    clip.y1 = min(clip.y1, new_y1)  # 确保不会扩大clip
     
     # === Phase B: Detect and trim far-distance text ===
     # For figures cropped ABOVE the caption, the near side is bottom and the far side is TOP.
@@ -1554,8 +1658,22 @@ def find_all_caption_candidates(
                 # 尝试匹配 pattern
                 match = pattern.match(text_stripped)
                 if match:
-                    # 提取编号（假设第一个捕获组是编号）
-                    number = match.group(1)
+                    # --- P0-03 修复：根据 kind 提取正确的编号 ---
+                    if kind == 'figure':
+                        # Figure 正则：group(1) = S前缀（可选），group(2) = 数字
+                        s_prefix = match.group(1) or ""
+                        num_part = match.group(2) or ""
+                        number = (s_prefix + num_part).strip()
+                    elif kind == 'table':
+                        # Table 正则：group(1) = 附录表(A1), group(2) = 罗马数字, group(3) = 普通数字
+                        # 取第一个非空的捕获组
+                        number = (match.group(1) or match.group(2) or match.group(3) or "").strip()
+                    else:
+                        # 其他类型：尝试 group(1)
+                        number = (match.group(1) or "").strip()
+                    
+                    if not number:
+                        continue  # 跳过无效的编号
                     
                     candidate = CaptionCandidate(
                         rect=fitz.Rect(*ln.get("bbox", [0, 0, 0, 0])),
@@ -1751,6 +1869,8 @@ def score_caption_candidate(
 def select_best_caption(
     candidates: List[CaptionCandidate],
     page: "fitz.Page",
+    *,
+    doc: Optional["fitz.Document"] = None,
     min_score_threshold: float = 25.0,
     debug: bool = False
 ) -> Optional[CaptionCandidate]:
@@ -1769,13 +1889,17 @@ def select_best_caption(
     if not candidates:
         return None
     
-    # 获取页面中的图像和绘图对象
-    images = get_page_images(page)
-    drawings = get_page_drawings(page)
-    
     # 为每个候选项评分
     scored_candidates: List[Tuple[float, CaptionCandidate]] = []
     for cand in candidates:
+        score_page = page
+        if doc is not None:
+            try:
+                score_page = doc[cand.page]
+            except Exception:
+                score_page = page
+        images = get_page_images(score_page)
+        drawings = get_page_drawings(score_page)
         score = score_caption_candidate(cand, images, drawings, debug=debug)
         cand.score = score  # 更新候选项的得分
         scored_candidates.append((score, cand))
@@ -1821,16 +1945,27 @@ def build_caption_index(
     返回:
         CaptionIndex 对象
     """
-    # 默认 pattern
+    # --- P0-03 修复：默认 pattern 使用更新后的捕获组结构 ---
     if figure_pattern is None:
+        # Figure 正则：group(1) = S前缀（可选），group(2) = 数字
         figure_pattern = re.compile(
-            r"^\s*(?:(?:Extended\s+Data\s+Figure|Supplementary\s+Figure|Figure|Fig\.?|图表|附图|图)\s*(?:S\s*)?(\d+))",
+            r"^\s*(?:Extended\s+Data\s+Figure|Supplementary\s+Figure|Figure|Fig\.?|图表|附图|图)\s*"
+            r"(S)?\s*"                   # group(1): 可选的 S 前缀
+            r"(\d+)"                     # group(2): 数字编号
+            r"(?:\s*[A-Za-z]|\s*\([A-Za-z]\))?",  # 可选的子图标签
             re.IGNORECASE
         )
     
     if table_pattern is None:
+        # Table 正则：group(1) = 附录表(A1/S1), group(2) = 罗马数字, group(3) = 普通数字
         table_pattern = re.compile(
-            r"^\s*(?:(?:Extended\s+Data\s+Table|Supplementary\s+Table|Table|表)\s*(?:S\s*)?(\d+|[IVX]+))",
+            r"^\s*(?:Extended\s+Data\s+Table|Supplementary\s+Table|Table|Tab\.?|表)\s*"
+            r"(?:"
+            r"(S?\d+|[A-Z]\d+)|"        # group(1): S前缀编号或附录表 (S1, A1, B2)
+            r"([IVX]{1,5})|"            # group(2): 罗马数字 (I, II, III, IV, V)
+            r"(\d+)"                    # group(3): 普通数字 (1, 2, 3)
+            r")"
+            r"(?:\s*\(continued\)|\s*续|\s*接上页)?",  # 可选的续页标记
             re.IGNORECASE
         )
     
@@ -1895,8 +2030,9 @@ def extract_figures(
     autocrop: bool = False,
     autocrop_pad_px: int = 30,
     autocrop_white_threshold: int = 250,
-    below_figs: Optional[List[int]] = None,
-    above_figs: Optional[List[int]] = None,
+    # --- P0-03 修复：改为 List[str] 以支持 "S1" 等附录编号 ---
+    below_figs: Optional[List[str]] = None,
+    above_figs: Optional[List[str]] = None,
     # A: text-trim options
     text_trim: bool = False,
     text_trim_width_ratio: float = 0.5,
@@ -1921,7 +2057,8 @@ def extract_figures(
     mask_top_frac: float = 0.6,
     # Safety & integration
     refine_near_edge_only: bool = True,
-    no_refine_figs: Optional[List[int]] = None,
+    # --- P0-03 修复：改为 List[str] 以支持 "S1" 等附录编号 ---
+    no_refine_figs: Optional[List[str]] = None,
     refine_safe: bool = True,
     autocrop_shrink_limit: float = 0.35,
     autocrop_min_height_px: int = 80,
@@ -1944,13 +2081,19 @@ def extract_figures(
     # 打开 PDF 文档并准备输出目录
     doc = fitz.open(pdf_path)
     os.makedirs(out_dir, exist_ok=True)
-    # 匹配 "Figure N" 或 "图 N" 的图注起始行（忽略大小写），支持续页标记
+    # --- P0-03 修复：匹配 "Figure N" 或 "图 N" 的图注起始行，支持 S 前缀和子图标签 ---
+    # 捕获组说明：
+    #   group(1): S 前缀（可选），如 "S" 或 None
+    #   group(2): 数字编号，如 "1", "2"
+    # 完整标识符：若 group(1) 存在则 "S" + group(2)，否则 group(2)
     figure_line_re = re.compile(
-        r"^\s*(?:(?:Extended\s+Data\s+Figure|Supplementary\s+Figure|Figure|Fig\.?|图表|附图|图)\s*(?:S\s*)?(\d+))"
+        r"^\s*(?:Extended\s+Data\s+Figure|Supplementary\s+Figure|Figure|Fig\.?|图表|附图|图)\s*"
+        r"(S)?\s*"                   # group(1): 可选的 S 前缀
+        r"(\d+)"                     # group(2): 数字编号
+        r"(?:\s*[A-Za-z]|\s*\([A-Za-z]\))?"  # 可选的子图标签（如 1a, 1(a)）
         r"(?:\s*\(continued\)|\s*续|\s*接上页)?",  # 可选的续页标记
         re.IGNORECASE,
     )
-    seen: Dict[int, str] = {}
     seen_counts: Dict[int, int] = {}
     records: List[AttachmentRecord] = []
     
@@ -1987,16 +2130,16 @@ def extract_figures(
             print(f"  far_side_min_dist:{far_side_min_dist:.1f} pt (8.0× line_height)")
             print()
 
-    def _parse_fig_list(s: str) -> List[int]:
-        out: List[int] = []
+    # --- P0-03 修复：改为返回 List[str] 以支持 "S1" 等附录编号 ---
+    def _parse_fig_list(s: str) -> List[str]:
+        """解析图表编号列表，支持 "1,2,S1,S2" 等格式"""
+        out: List[str] = []
         for part in (s or "").split(','):
             part = part.strip()
             if not part:
                 continue
-            try:
-                out.append(int(part))
-            except ValueError:
-                pass
+            # 保留原始字符串标识符
+            out.append(part)
         return out
 
     anchor_mode = os.getenv('EXTRACT_ANCHOR_MODE', '').lower()
@@ -2095,13 +2238,15 @@ def extract_figures(
 
         # 收集本页所有图注（line-level 聚合）：
         # 将连续的行在遇到下一处图注前合并为同一条 caption。
-        captions_on_page: List[Tuple[int, fitz.Rect, str]] = []
+        # P0-03 类型修正：第一个元素是字符串标识符（如 "1", "S1"）
+        captions_on_page: List[Tuple[str, fitz.Rect, str]] = []
         
         # === 智能 Caption 选择（如果启用）===
         if smart_caption_detection and caption_index:
             # 使用智能选择逻辑
             # 1. 找到本页所有潜在的 figure 编号
-            page_fig_numbers = set()
+            # --- P0-03 修复：使用字符串标识符以支持 S1/S2 等附录编号 ---
+            page_fig_idents: set[str] = set()
             for blk in dict_data.get("blocks", []):
                 if blk.get("type", 0) != 0:
                     continue
@@ -2109,37 +2254,51 @@ def extract_figures(
                     text = "".join(sp.get("text", "") for sp in ln.get("spans", []))
                     m = figure_line_re.match(text.strip())
                     if m:
-                        try:
-                            fig_no = int(m.group(1))
-                            if min_figure <= fig_no <= max_figure:
-                                page_fig_numbers.add(fig_no)
-                        except Exception:
-                            pass
+                        ident = _extract_figure_ident(m)
+                        if ident and _ident_in_range(ident, min_figure, max_figure):
+                            page_fig_idents.add(ident)
             
             # 2. 对每个 figure 编号，从索引中获取候选项并选择最佳的
-            for fig_no in sorted(page_fig_numbers):
-                # 先检查是否已经在其他页找到过（智能选择可能跨页）
-                if fig_no in smart_caption_cache:
-                    cached_rect, cached_caption, cached_page = smart_caption_cache[fig_no]
-                    # 如果缓存的是本页，则使用
-                    if cached_page == pno:
-                        captions_on_page.append((fig_no, cached_rect, cached_caption))
-                    continue
-                
+            for fig_ident in sorted(page_fig_idents, key=lambda x: (not x.isdigit(), x)):
                 # 从索引中获取所有候选项
-                candidates = caption_index.get_candidates('figure', str(fig_no))
+                # --- P0-03 修复：使用字符串标识符 ---
+                candidates = caption_index.get_candidates('figure', fig_ident)
                 if not candidates:
                     continue
-                
-                # 选择最佳候选（优先选择本页的，但如果本页得分太低，可能选择其他页）
-                best_candidate = select_best_caption(candidates, page, min_score_threshold=25.0, debug=debug_captions)
-                
+
+                if allow_continued:
+                    # Continued 模式：按"页"独立判断（同号多页都可能是有效图注）
+                    candidates_on_page = [c for c in candidates if c.page == pno]
+                    if not candidates_on_page:
+                        continue
+                    best_candidate = select_best_caption(
+                        candidates_on_page,
+                        page,
+                        doc=doc,
+                        min_score_threshold=25.0,
+                        debug=debug_captions,
+                    )
+                else:
+                    # 非 continued：跨页选择"全局最优"图注，并缓存到其所属页（用于跳过正文引用页）
+                    if fig_ident in smart_caption_cache:
+                        cached_rect, cached_caption, cached_page = smart_caption_cache[fig_ident]
+                        if cached_page == pno:
+                            captions_on_page.append((fig_ident, cached_rect, cached_caption))
+                        continue
+                    best_candidate = select_best_caption(
+                        candidates,
+                        page,
+                        doc=doc,
+                        min_score_threshold=25.0,
+                        debug=debug_captions,
+                    )
+
                 if best_candidate:
                     # 收集完整 caption 文本（合并后续行）
                     full_caption = best_candidate.text
                     cap_rect = best_candidate.rect
-                    
-                    # 尝试合并后续行
+
+                    # 尝试合并后续行（同一 block 内）
                     block = best_candidate.block
                     lines = block.get("lines", [])
                     start_idx = best_candidate.line_idx + 1
@@ -2154,13 +2313,14 @@ def extract_figures(
                         if t2.endswith('.') or sum(len(p) for p in parts) > 240:
                             break
                     full_caption = " ".join(parts)
-                    
-                    # 如果最佳候选是本页，则添加到本页列表
-                    if best_candidate.page == pno:
-                        captions_on_page.append((fig_no, cap_rect, full_caption))
-                    
-                    # 缓存结果
-                    smart_caption_cache[fig_no] = (cap_rect, full_caption, best_candidate.page)
+
+                    # Continued 模式：当前页命中即加入；非 continued：只加入 best 所在页
+                    if allow_continued:
+                        captions_on_page.append((fig_ident, cap_rect, full_caption))
+                    else:
+                        if best_candidate.page == pno:
+                            captions_on_page.append((fig_ident, cap_rect, full_caption))
+                        smart_caption_cache[fig_ident] = (cap_rect, full_caption, best_candidate.page)
         else:
             # === 原有逻辑：简单匹配 ===
             for blk in dict_data.get("blocks", []):
@@ -2176,9 +2336,9 @@ def extract_figures(
                     if not m:
                         i += 1
                         continue
-                    try:
-                        fig_no = int(m.group(1))
-                    except Exception:
+                    # --- P0-03 修复：提取完整标识符（含 S 前缀）---
+                    fig_ident = _extract_figure_ident(m)
+                    if not fig_ident:
                         i += 1
                         continue
                     # 初始图注边界框来自当前行的 bbox
@@ -2202,8 +2362,9 @@ def extract_figures(
                             break
                         j += 1
                     caption = " ".join(parts)
-                    if min_figure <= fig_no <= max_figure:
-                        captions_on_page.append((fig_no, cap_rect, caption))
+                    # --- P0-03 修复：使用字符串标识符进行范围检查 ---
+                    if _ident_in_range(fig_ident, min_figure, max_figure):
+                        captions_on_page.append((fig_ident, cap_rect, caption))
                     i = max(i+1, j)
 
         captions_on_page.sort(key=lambda t: t[1].y0)
@@ -2274,7 +2435,8 @@ def extract_figures(
         text_lines_all = _collect_text_lines(dict_data)
 
         for idx, (fig_no, cap_rect, caption) in enumerate(captions_on_page):
-            if fig_no in seen:
+            count_prev = seen_counts.get(fig_no, 0)
+            if count_prev >= 1 and not allow_continued:
                 continue
 
             prev_cap = captions_on_page[idx-1][1] if idx-1 >= 0 else None
@@ -2301,8 +2463,10 @@ def extract_figures(
                 crop_above = (above_figs is not None and fig_no in above_figs) or (fig_no in force_above)
                 side = 'above'
                 chosen_clip = clip_above
-                if crop_below or crop_above:
+                if crop_below:
                     side, chosen_clip = 'below', clip_below
+                elif crop_above:
+                    side, chosen_clip = 'above', clip_above
                 else:
                     try:
                         ra = figure_score(clip_above)
@@ -2856,19 +3020,10 @@ def extract_figures(
             # 生成安全文件名；若同名已存在（例如多页同名），则附加页码后缀
             base = sanitize_filename_from_caption(caption, fig_no, max_chars=max_caption_chars, max_words=max_caption_words)
             # 同号多页：根据选项决定是否允许继续导出，并命名为 continued
-            count_prev = seen_counts.get(fig_no, 0)
-            if count_prev >= 1 and not allow_continued:
-                # 已导出过且不允许 continued：跳过
-                continue
             if count_prev >= 1 and allow_continued:
                 base = f"{base}_continued_p{pno+1}"
             out_path = os.path.join(out_dir, base + ".png")
-            if os.path.exists(out_path):
-                out_path = os.path.join(out_dir, f"{base}_p{pno+1}.png")
             pix.save(out_path)
-            # 记录当前图号的输出路径与次数
-            if count_prev == 0:
-                seen[fig_no] = out_path
             seen_counts[fig_no] = count_prev + 1
             records.append(AttachmentRecord('figure', str(fig_no), pno + 1, caption, out_path, continued=(count_prev>=1)))
             print(f"[INFO] Figure {fig_no} page {pno+1} -> {out_path}")
@@ -2882,14 +3037,51 @@ def extract_figures(
 def write_manifest(records: List[AttachmentRecord], manifest_path: Optional[str]) -> Optional[str]:
     if not manifest_path:
         return None
+    base_dir = os.path.dirname(os.path.abspath(manifest_path))
+    if base_dir:
+        os.makedirs(base_dir, exist_ok=True)
     with open(manifest_path, "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         # 统一为 (type,id,page,caption,file,continued)
         w.writerow(["type", "id", "page", "caption", "file", "continued"])
         for r in records:
-            w.writerow([r.kind, r.ident, r.page, r.caption, r.out_path, int(r.continued)])
+            rel = os.path.relpath(os.path.abspath(r.out_path), base_dir).replace('\\', '/')
+            w.writerow([r.kind, r.ident, r.page, r.caption, rel, int(r.continued)])
     print(f"[INFO] Wrote manifest: {manifest_path} (items={len(records)})")
     return manifest_path
+
+
+def prune_unindexed_images(*, out_dir: str, index_json_path: str) -> int:
+    """Remove Figure_*/Table_* PNGs in out_dir that are NOT referenced by index_json_path."""
+    try:
+        import json
+        base_dir = os.path.dirname(os.path.abspath(index_json_path))
+        with open(index_json_path, "r", encoding="utf-8") as f:
+            items = json.load(f)
+        referenced_abs: set[str] = set()
+        for it in items:
+            rel = (it.get("file") or "").replace("\\", "/")
+            if not rel:
+                continue
+            referenced_abs.add(os.path.abspath(os.path.join(base_dir, rel)))
+
+        removed = 0
+        for name in os.listdir(out_dir):
+            if not name.lower().endswith(".png"):
+                continue
+            if not (name.startswith("Figure_") or name.startswith("Table_")):
+                continue
+            abs_path = os.path.abspath(os.path.join(out_dir, name))
+            if abs_path in referenced_abs:
+                continue
+            try:
+                os.remove(abs_path)
+                removed += 1
+            except Exception:
+                pass
+        return removed
+    except Exception:
+        return 0
 
 
 # ---- 通用：从 kind/ident + caption 生成输出基名（不含扩展名） ----
@@ -3263,15 +3455,16 @@ def extract_tables(
             print(f"  far_side_min_dist:{far_side_min_dist:.1f} pt (8.0× line_height)")
             print()
 
-    # 改进：支持罗马数字、附录表、补充材料表、续页标记
+    # --- P0-03 修复：改进正则表达式，正确捕获 S 前缀 ---
+    # 支持罗马数字、附录表、补充材料表、续页标记
+    # 捕获组：group(1) = S前缀编号或附录表(S1, A1, B2), group(2) = 罗马数字, group(3) = 普通数字
     table_line_re = re.compile(
-        r"^\s*(?:(?:Extended\s+Data\s+Table|Supplementary\s+Table|Table|Tab\.?|表)\s*"
-        r"(?:S\s*)?"
+        r"^\s*(?:Extended\s+Data\s+Table|Supplementary\s+Table|Table|Tab\.?|表)\s*"
         r"(?:"
-        r"([A-Z]\d+)|"              # 附录表: A1, B2, C3
-        r"([IVX]{1,5})|"            # 罗马数字: I, II, III, IV, V
-        r"(\d+)"                    # 普通数字: 1, 2, 3
-        r"))"
+        r"(S?\d+|[A-Z]\d+)|"        # group(1): S前缀编号或附录表 (S1, A1, B2)
+        r"([IVX]{1,5})|"            # group(2): 罗马数字 (I, II, III, IV, V)
+        r"(\d+)"                    # group(3): 普通数字 (1, 2, 3)
+        r")"
         r"(?:\s*\(continued\)|\s*续|\s*接上页)?",  # 可选的续页标记
         re.IGNORECASE,
     )
@@ -3388,7 +3581,7 @@ def extract_tables(
     # === Cache for smart-selected table captions ===
     smart_caption_cache_table: Dict[str, Tuple[fitz.Rect, str, int]] = {}
     
-    if smart_caption_detection and caption_index_table:
+    if smart_caption_detection and caption_index_table and (not allow_continued):
         # Pre-select best captions for all tables
         for pno_pre in range(len(doc)):
             page_pre = doc[pno_pre]
@@ -3412,7 +3605,7 @@ def extract_tables(
                     continue  # Already cached
                 candidates = caption_index_table.get_candidates('table', str(table_id))
                 if candidates:
-                    best = select_best_caption(candidates, page_pre, min_score_threshold=25.0, debug=debug_captions)
+                    best = select_best_caption(candidates, page_pre, doc=doc, min_score_threshold=25.0, debug=debug_captions)
                     if best:
                         # Build full caption (merge subsequent lines)
                         full_caption = best.text
@@ -3456,10 +3649,50 @@ def extract_tables(
         
         # === Use smart-selected captions if available ===
         if smart_caption_detection and caption_index_table:
-            # Find all table IDs on this page from cache
-            for table_id, (cap_rect, caption, cached_page) in smart_caption_cache_table.items():
-                if cached_page == pno:
-                    captions_on_page.append((table_id, cap_rect, caption))
+            if allow_continued:
+                # Continued 模式：按页独立选择（同号多页均可输出）
+                page_table_ids = set()
+                for blk in dict_data.get("blocks", []):
+                    if blk.get("type", 0) != 0:
+                        continue
+                    for ln in blk.get("lines", []):
+                        text = "".join(sp.get("text", "") for sp in ln.get("spans", []))
+                        m = table_line_re.match(text.strip())
+                        if m:
+                            ident = (m.group(1) or m.group(2) or m.group(3) or "").strip()
+                            if ident:
+                                page_table_ids.add(ident)
+
+                for table_id in sorted(page_table_ids):
+                    candidates = caption_index_table.get_candidates('table', str(table_id))
+                    candidates_on_page = [c for c in candidates if c.page == pno]
+                    if not candidates_on_page:
+                        continue
+                    best = select_best_caption(candidates_on_page, page, doc=doc, min_score_threshold=25.0, debug=debug_captions)
+                    if not best:
+                        continue
+                    full_caption = best.text
+                    cap_rect = best.rect
+                    block = best.block
+                    lines_in_block = block.get("lines", [])
+                    start_idx = best.line_idx + 1
+                    parts = [full_caption]
+                    for j in range(start_idx, len(lines_in_block)):
+                        ln = lines_in_block[j]
+                        t2 = "".join(sp.get("text", "") for sp in ln.get("spans", [])).strip()
+                        if not t2 or table_line_re.match(t2):
+                            break
+                        parts.append(t2)
+                        cap_rect = cap_rect | fitz.Rect(*(ln.get("bbox", [0,0,0,0])))
+                        if t2.endswith('.') or sum(len(p) for p in parts) > 240:
+                            break
+                    full_caption = " ".join(parts)
+                    captions_on_page.append((table_id, cap_rect, full_caption))
+            else:
+                # 非 continued：每个表号只取“跨页最优”图注所在页
+                for table_id, (cap_rect, caption, cached_page) in smart_caption_cache_table.items():
+                    if cached_page == pno:
+                        captions_on_page.append((table_id, cap_rect, caption))
         else:
             # Fallback: Original logic
             for blk in dict_data.get("blocks", []):
@@ -4012,8 +4245,6 @@ def extract_tables(
                 base_name = f"{base_name}_continued_p{pno+1}"
                 cont = True
             out_path = os.path.join(out_dir, base_name + ".png")
-            if os.path.exists(out_path):
-                out_path = os.path.join(out_dir, f"{base_name}_p{pno+1}.png")
             pix.save(out_path)
             seen_counts[ident] = count_prev + 1
             records.append(AttachmentRecord('table', ident, pno + 1, caption, out_path, continued=cont))
@@ -4846,6 +5077,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--out-dir", default=None, help="Directory for output image PNGs. If omitted, writes to <pdf_dir>/images/")
     p.add_argument("--manifest", default=None, help="Path to CSV manifest of extracted items (figures/tables)")
     p.add_argument("--index-json", default=None, help="Path to JSON index (default: <pdf_dir>/images/index.json)")
+    p.add_argument("--prune-images", action="store_true", help="After extraction, remove Figure_*/Table_* PNGs in out-dir that are not referenced by the written index.json")
     p.add_argument("--dpi", type=int, default=300, help="Render DPI for figure images")
     p.add_argument("--clip-height", type=float, default=650.0, help="Clip window height above caption (pt)")
     p.add_argument("--margin-x", type=float, default=20.0, help="Horizontal page margin (pt)")
@@ -4988,7 +5220,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.protect_far_edge_px = 18
         args.near_edge_pad_px = 32
         # 表格预设（特化）
-        args.include_tables = True
         args.table_clip_height = 520.0
         args.table_margin_x = 26.0
         args.table_caption_gap = 6.0
@@ -4998,19 +5229,47 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.table_mask_text = False
         args.table_object_min_area_ratio = 0.005
         args.table_object_merge_gap = 4.0
-        # 自适应行高（默认启用）
-        args.adaptive_line_height = True
 
-    # Anchor mode & scan params
-    os.environ.setdefault('EXTRACT_ANCHOR_MODE', (args.anchor_mode or 'v2'))
-    os.environ.setdefault('SCAN_STEP', str(args.scan_step))
-    os.environ.setdefault('SCAN_HEIGHTS', args.scan_heights or '240,320,420,520,640')
-    os.environ.setdefault('SCAN_DIST_LAMBDA', str(getattr(args, 'scan_dist_lambda', 0.15)))
-    os.environ.setdefault('CAPTION_MID_GUARD', str(getattr(args, 'caption_mid_guard', 6.0)))
-    os.environ.setdefault('GLOBAL_ANCHOR', (args.global_anchor or 'auto'))
-    os.environ.setdefault('GLOBAL_ANCHOR_MARGIN', str(getattr(args, 'global_anchor_margin', 0.02)))
-    os.environ.setdefault('GLOBAL_ANCHOR_TABLE', (getattr(args, 'global_anchor_table', 'auto') or 'auto'))
-    os.environ.setdefault('GLOBAL_ANCHOR_TABLE_MARGIN', str(getattr(args, 'global_anchor_table_margin', 0.03)))
+    # --- P0-01 修复：环境变量优先级（CLI > ENV > 默认值）---
+    # 辅助函数：获取参数值，优先级为 CLI 参数 > 环境变量 > 默认值
+    def _get_param(cli_val, env_key: str, default_val, is_cli_default=False):
+        """
+        优先级：CLI 参数（非默认值）> 环境变量 > 默认值
+        is_cli_default: 若为 True，表示 cli_val 是 argparse 的默认值，应检查环境变量
+        """
+        # 如果 CLI 参数有明确的非 None 值且不是默认值，使用 CLI 参数
+        if cli_val is not None and not is_cli_default:
+            return cli_val
+        # 否则检查环境变量
+        env_val = os.environ.get(env_key)
+        if env_val is not None and env_val.strip():
+            return env_val
+        # 最后使用默认值
+        return default_val
+    
+    # 设置环境变量（保留现有环境变量值，除非 CLI 显式覆盖）
+    # anchor_mode: CLI 默认为 None，所以 args.anchor_mode 为 None 时应查环境变量
+    anchor_mode_val = _get_param(args.anchor_mode, 'EXTRACT_ANCHOR_MODE', 'v2', is_cli_default=(args.anchor_mode is None))
+    os.environ['EXTRACT_ANCHOR_MODE'] = str(anchor_mode_val)
+    
+    os.environ['SCAN_STEP'] = str(args.scan_step)
+    os.environ['SCAN_HEIGHTS'] = _get_param(args.scan_heights, 'SCAN_HEIGHTS', '240,320,420,520,640', is_cli_default=(args.scan_heights is None))
+    os.environ['SCAN_DIST_LAMBDA'] = str(getattr(args, 'scan_dist_lambda', 0.15))
+    os.environ['CAPTION_MID_GUARD'] = str(getattr(args, 'caption_mid_guard', 6.0))
+    
+    global_anchor_val = _get_param(args.global_anchor, 'GLOBAL_ANCHOR', 'auto', is_cli_default=(args.global_anchor is None))
+    os.environ['GLOBAL_ANCHOR'] = str(global_anchor_val)
+    os.environ['GLOBAL_ANCHOR_MARGIN'] = str(getattr(args, 'global_anchor_margin', 0.02))
+    
+    global_anchor_table_val = _get_param(getattr(args, 'global_anchor_table', None), 'GLOBAL_ANCHOR_TABLE', 'auto', is_cli_default=(getattr(args, 'global_anchor_table', None) is None))
+    os.environ['GLOBAL_ANCHOR_TABLE'] = str(global_anchor_table_val)
+    os.environ['GLOBAL_ANCHOR_TABLE_MARGIN'] = str(getattr(args, 'global_anchor_table_margin', 0.03))
+    
+    # 打印最终生效的关键参数值（便于调试与复现）
+    print(f"[INFO] Effective parameters:")
+    print(f"       anchor_mode={os.environ['EXTRACT_ANCHOR_MODE']}, "
+          f"global_anchor={os.environ['GLOBAL_ANCHOR']}, "
+          f"global_anchor_table={os.environ['GLOBAL_ANCHOR_TABLE']}")
 
     # 控制调试导出
     if getattr(args, 'dump_candidates', False):
@@ -5041,16 +5300,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("=" * 70 + "\n")
 
     # Extract figures
-    def parse_fig_list(s: str) -> List[int]:
-        out: List[int] = []
+    # --- P0-03 修复：改为返回 List[str] 以支持 "S1" 等附录编号 ---
+    def parse_fig_list(s: str) -> List[str]:
+        """解析图表编号列表，支持 "1,2,S1,S2" 等格式"""
+        out: List[str] = []
         for part in (s or "").split(","):
             part = part.strip()
             if not part:
                 continue
-            try:
-                out.append(int(part))
-            except ValueError:
-                pass
+            # 保留原始字符串标识符（如 "1", "S1", "A1"）
+            out.append(part)
         return out
 
     fig_records = extract_figures(
@@ -5125,7 +5384,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             autocrop_white_threshold=getattr(args, 'table_autocrop_white_th', 250),
             t_below=parse_str_list(getattr(args, 't_below', '')),
             t_above=parse_str_list(getattr(args, 't_above', '')),
-            text_trim=True if args.text_trim else True,
+            # --- P0-05 修复：正确传递 text_trim 参数 ---
+            text_trim=args.text_trim,
             text_trim_width_ratio=max(0.35, getattr(args, 'text_trim_width_ratio', 0.5)),
             text_trim_font_min=getattr(args, 'text_trim_font_min', 7.0),
             text_trim_font_max=getattr(args, 'text_trim_font_max', 16.0),
@@ -5157,12 +5417,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         all_records.extend(tbl_records)
 
+    # 统一排序：按页码 → Figure 优先 → 编号/标识
+    all_records.sort(key=lambda r: (r.page, 0 if r.kind == 'figure' else 1, r.num_key(), r.ident))
+
     # 写出 index.json（默认 images/index.json）
     index_json_path = args.index_json or os.path.join(out_dir, 'index.json')
     try:
         write_index_json(all_records, index_json_path)
     except Exception as e:
         print(f"[WARN] Write index.json failed: {e}")
+
+    # 可选：清理 out_dir 中未被本次 index.json 引用的旧图，避免混入旧结果
+    if getattr(args, "prune_images", False):
+        removed = prune_unindexed_images(out_dir=out_dir, index_json_path=index_json_path)
+        print(f"[INFO] Pruned unindexed images: {removed}")
 
     # Manifest：若用户指定 --manifest，则将记录写入 CSV
     write_manifest(all_records, args.manifest)

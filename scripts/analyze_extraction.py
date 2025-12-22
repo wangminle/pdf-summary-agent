@@ -8,6 +8,51 @@ import json
 import sys
 from pathlib import Path
 
+
+def _resolve_image_file(images_dir: Path, item: dict) -> Path | None:
+    """
+    Resolve an image file for an index.json item.
+
+    Handles the common workflow where PNGs are renamed after extraction but index.json isn't updated.
+    """
+    rel = (item.get("file") or "").replace("\\", "/")
+    if rel:
+        p = images_dir / rel
+        if p.exists():
+            return p
+
+    kind = (item.get("type") or "").lower()
+    ident = str(item.get("id") or "").strip()
+    page = int(item.get("page") or 0)
+    continued = bool(item.get("continued"))
+    if kind not in {"figure", "table"} or not ident:
+        return None
+
+    prefix = "Figure" if kind == "figure" else "Table"
+    candidates = list(images_dir.glob(f"{prefix}_{ident}_*.png"))
+    if not candidates:
+        return None
+
+    if continued:
+        continued_tag = f"continued_p{page}"
+        cand2 = [c for c in candidates if continued_tag in c.name]
+        if cand2:
+            candidates = cand2
+
+    if len(candidates) == 1:
+        return candidates[0]
+
+    # Prefer non-continued for non-continued items
+    if not continued:
+        cand2 = [c for c in candidates if "continued_p" not in c.name]
+        if cand2:
+            candidates = cand2
+
+    # Break ties by most recently modified
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0] if candidates else None
+
+
 def analyze_extraction_results(pdf_dir: Path):
     """分析提取结果"""
     
@@ -59,8 +104,8 @@ def analyze_extraction_results(pdf_dir: Path):
         print(f"      页码：Page {item['page']}")
         
         # 文件信息
-        img_file = images_dir / item['file']
-        if img_file.exists():
+        img_file = _resolve_image_file(images_dir, item)
+        if img_file and img_file.exists():
             size_kb = img_file.stat().st_size / 1024
             print(f"      文件：{size_kb:.1f} KB")
             
@@ -71,6 +116,10 @@ def analyze_extraction_results(pdf_dir: Path):
                 print(f"      尺寸：{img.width} × {img.height} px")
             except:
                 pass
+        else:
+            if item.get("file"):
+                print(f"      文件：[缺失] index.json 指向的文件不存在：{item['file']}")
+            print(f"      提示：若你已重命名 PNG，请运行 scripts/sync_index_after_rename.py 同步 index.json")
         
         # Caption预览
         caption = item['caption']
@@ -211,4 +260,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

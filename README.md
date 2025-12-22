@@ -37,12 +37,14 @@ python3 scripts/extract_pdf_assets.py --pdf <PDF_DIR>/<paper>.pdf --preset robus
 # Disable adaptive line height (use fixed parameters)
 python3 scripts/extract_pdf_assets.py --pdf <PDF_DIR>/<paper>.pdf --preset robust --no-adaptive-line-height
 ```
-Common flags: `--allow-continued`, `--anchor-mode v1`, `--below/--above`, `--manifest <path>`, `--max-caption-words 10`, `--layout-driven`, `--debug-visual`, `--no-adaptive-line-height`.
+Common flags: `--allow-continued`, `--anchor-mode v1`, `--below/--above`, `--manifest <path>`, `--max-caption-words 10`, `--layout-driven`, `--debug-visual`, `--no-adaptive-line-height`, `--prune-images`.
 
 > 跨平台说明：在 Windows/PowerShell 下通常使用 `python`、`Move-Item`、`Copy-Item`、`Get-Location`、`Get-Date`，而在 macOS/Linux 下使用 `python3`、`mv`、`cp`、`pwd`、`date`。详见 `AGENTS.md` 的“环境与命令差异”对照与示例。
 
 ### Notes
 - Use relative paths like `images/...` when embedding figures/tables in Markdown next to the PDF.
+- After renaming Figure_/Table_ PNGs, run `python scripts/sync_index_after_rename.py <PDF_DIR>` so `images/index.json` stays in sync.
+- If you re-run extraction and want to avoid mixing stale PNGs in `images/`, add `--prune-images` to remove files not referenced by the newly written `index.json`.
 - With Anchor v2 (default), per-id `--above/--below` works only if you switch to `--anchor-mode v1`.
 - **Smart caption detection**: Enabled by default, automatically distinguishes real captions from in-text references; use `--no-smart-caption-detection` to disable, or `--debug-captions` to see scoring details. See `AGENTS.md` for more.
 - **Visual debug mode**: Use `--debug-visual` to save multi-stage boundary boxes overlaid on full pages (**supports both figures and tables**); outputs to `images/debug/Figure_N_pX_debug_stages.png` / `Table_N_pX_debug_stages.png` + legend files. Paragraph boundaries are drawn as pink dashed lines when using `--layout-driven`. See `AGENTS.md` for color scheme and usage.
@@ -77,12 +79,12 @@ cd </path/to/PDF_DIR>
     ```
   - **Rename all figures/tables** based on paper content (5-15 words):
     ```bash
-    mv "images/Figure_1_Overview_of_the_proposed_deep_learning.png" "images/Figure_1_Architecture_Overview.png"
-    mv "images/Figure_2_Experimental_results_on_benchmark_datasets.png" "images/Figure_2_Performance_Comparison.png"
+    mv "images/Figure_1_Overview_of_the_proposed_deep_learning.png" "images/Figure_1_Multimodal_Transformer_Architecture_Overview_Diagram.png"
+    mv "images/Figure_2_Experimental_results_on_benchmark_datasets.png" "images/Figure_2_Benchmark_Performance_Comparison_Across_Datasets.png"
     # ... rename all figures/tables
     ```
   - Use `text/<paper>.txt`, renamed `images/*.png`, and `images/index.json`
-  - Generate `<paper>_阅读摘要-YYYYMMDD.md` with all images embedded via **new filenames** (e.g., `images/Figure_1_Architecture_Overview.png`)
+  - Generate `<paper>_阅读摘要-YYYYMMDD.md` with all images embedded via **new filenames** (e.g., `images/Figure_1_Multimodal_Transformer_Architecture_Overview_Diagram.png`)
 
 - Optional tuning (override direction or fix slight over-trim):
 ```bash
@@ -135,10 +137,12 @@ python3 scripts/extract_pdf_assets.py --pdf <PDF_DIR>/<paper>.pdf --preset robus
 # 禁用自适应行高（使用固定参数）
 python3 scripts/extract_pdf_assets.py --pdf <PDF_DIR>/<paper>.pdf --preset robust --no-adaptive-line-height
 ```
-常用参数：`--allow-continued`、`--anchor-mode v1`、`--below/--above`、`--manifest <path>`、`--max-caption-words 10`、`--layout-driven`、`--debug-visual`、`--no-adaptive-line-height`。
+常用参数：`--allow-continued`、`--anchor-mode v1`、`--below/--above`、`--manifest <path>`、`--max-caption-words 10`、`--layout-driven`、`--debug-visual`、`--no-adaptive-line-height`、`--prune-images`。
 
 ### 提示
 - 在生成 Markdown 摘要时，始终使用相对路径嵌图（如 `images/...`）。
+- 重命名 PNG 后，运行 `python scripts/sync_index_after_rename.py <PDF_DIR>` 同步 `images/index.json`，避免清单与文件名不一致。
+- 如重复运行导致 `images/` 中混入旧 PNG，可加 `--prune-images` 清理掉未被本次 `index.json` 引用的旧图。
 - 默认 Anchor v2 下，若需按编号强制上/下方向，请切换 `--anchor-mode v1` 后再配合 `--above/--below`。
 - **智能图注识别**：默认启用，自动区分真实图注与正文引用；如需关闭，使用 `--no-smart-caption-detection`；如需查看评分详情，使用 `--debug-captions`。详见 `AGENTS.md`。
 - **可视化调试模式**：使用 `--debug-visual` 保存多阶段边界框叠加的完整页面（**图与表均支持**）；输出到 `images/debug/Figure_N_pX_debug_stages.png` / `Table_N_pX_debug_stages.png` 及图例文件。配合 `--layout-driven` 使用时，段落边界以粉红色虚线显示。颜色方案和使用方法详见 `AGENTS.md`。
@@ -173,8 +177,8 @@ cd </path/to/PDF_DIR>
     ```
   - **重命名所有图表文件**（基于论文内容，5-15个单词）：
     ```bash
-    mv "images/Figure_1_Overview_of_the_proposed_deep_learning.png" "images/Figure_1_Architecture_Overview.png"
-    mv "images/Figure_2_Experimental_results_on_benchmark_datasets.png" "images/Figure_2_Performance_Comparison.png"
+    mv "images/Figure_1_Overview_of_the_proposed_deep_learning.png" "images/Figure_1_Multimodal_Transformer_Architecture_Overview_Diagram.png"
+    mv "images/Figure_2_Experimental_results_on_benchmark_datasets.png" "images/Figure_2_Benchmark_Performance_Comparison_Across_Datasets.png"
     # ... 重命名所有图表
     ```
   - 读取 `text/<paper>.txt` 与重命名后的 `images/*.png`、`images/index.json`
