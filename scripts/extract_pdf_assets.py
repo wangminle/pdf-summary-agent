@@ -76,22 +76,6 @@ except Exception as e:  # pragma: no cover
     print("[ERROR] PyMuPDF (pymupdf) is required: pip install pymupdf", file=sys.stderr)
     raise
 
-# --- P0-01 修复：脚本托管的环境变量列表 ---
-# 这些变量由 CLI 参数控制，在脚本开始时清理以避免 shell 中的残留值污染 CLI 参数
-MANAGED_ENV_VARS = [
-    'EXTRACT_ANCHOR_MODE',
-    'SCAN_STEP',
-    'SCAN_HEIGHTS',
-    'SCAN_DIST_LAMBDA',
-    'CAPTION_MID_GUARD',
-    'GLOBAL_ANCHOR',
-    'GLOBAL_ANCHOR_MARGIN',
-    'GLOBAL_ANCHOR_TABLE',
-    'GLOBAL_ANCHOR_TABLE_MARGIN',
-    'DUMP_CANDIDATES',
-]
-
-
 # 文本提取：若提供 out_text 路径且安装了 pdfminer.six，则将 PDF 全文提取为 UTF-8 文本文件
 # 返回写入路径或 None（未提取/失败）。
 def try_extract_text(pdf_path: str, out_text: Optional[str]) -> Optional[str]:
@@ -2484,7 +2468,8 @@ def extract_figures(
                 if scan_heights:
                     heights = [float(h) for h in scan_heights.split(',') if h.strip()]
                 else:
-                    heights = [240.0, 320.0, 420.0, 520.0, 640.0]
+                    # 与 argparse 默认值对齐（--scan-heights）
+                    heights = [240.0, 320.0, 420.0, 520.0, 640.0, 720.0, 820.0, 920.0]
                 step = 14.0
                 try:
                     step = float(os.getenv('SCAN_STEP', '14'))
@@ -2493,9 +2478,10 @@ def extract_figures(
 
                 dist_lambda = 0.0
                 try:
-                    dist_lambda = float(os.getenv('SCAN_DIST_LAMBDA', '0.15'))
+                    # 与 argparse 默认值对齐（--scan-dist-lambda）
+                    dist_lambda = float(os.getenv('SCAN_DIST_LAMBDA', '0.12'))
                 except Exception:
-                    dist_lambda = 0.15
+                    dist_lambda = 0.12
 
                 def detect_top_edge_truncation(clip: fitz.Rect, objects: List[fitz.Rect], side: str) -> bool:
                     """
@@ -3842,7 +3828,11 @@ def extract_tables(
             else:
                 # Anchor V2：多尺度滑窗 + 吸附
                 scan_heights = os.getenv('SCAN_HEIGHTS', '')
-                heights = [float(h) for h in scan_heights.split(',') if h.strip()] if scan_heights else [240.0, 320.0, 420.0, 520.0, 640.0]
+                heights = (
+                    [float(h) for h in scan_heights.split(',') if h.strip()]
+                    if scan_heights
+                    else [240.0, 320.0, 420.0, 520.0, 640.0, 720.0, 820.0, 920.0]
+                )
                 try:
                     step = float(os.getenv('SCAN_STEP', '14'))
                 except Exception:
@@ -5231,39 +5221,48 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.table_object_merge_gap = 4.0
 
     # --- P0-01 修复：环境变量优先级（CLI > ENV > 默认值）---
-    # 辅助函数：获取参数值，优先级为 CLI 参数 > 环境变量 > 默认值
-    def _get_param(cli_val, env_key: str, default_val, is_cli_default=False):
+    # NOTE: main(argv=...) 可能被程序化调用；显式参数检测需基于 argv 而非 sys.argv。
+    argv_for_cli_check = list(argv) if argv is not None else sys.argv[1:]
+
+    # 辅助函数：检查用户是否在命令行中显式传递了参数
+    def _cli_has_arg(arg_name: str) -> bool:
+        """检查 argv 中是否包含指定的参数名（支持 --kebab-case / --snake_case / --arg=val）"""
+        kebab = arg_name.replace('_', '-')
+        snake = arg_name.replace('-', '_')
+        variants = {f'--{kebab}', f'--{snake}'}
+        for a in argv_for_cli_check:
+            for v in variants:
+                if a == v or a.startswith(v + '='):
+                    return True
+        return False
+    
+    # 辅助函数：设置环境变量，实现 CLI > ENV > 默认值 优先级
+    def _set_env_with_priority(env_key: str, cli_arg_name: str, cli_val, default_val):
         """
-        优先级：CLI 参数（非默认值）> 环境变量 > 默认值
-        is_cli_default: 若为 True，表示 cli_val 是 argparse 的默认值，应检查环境变量
+        优先级：CLI 参数（显式传递）> 环境变量 > 默认值
+        
+        逻辑：
+        - 如果用户显式传递了 CLI 参数，使用 CLI 值
+        - 否则，检查环境变量是否已设置
+        - 最后使用默认值
         """
-        # 如果 CLI 参数有明确的非 None 值且不是默认值，使用 CLI 参数
-        if cli_val is not None and not is_cli_default:
-            return cli_val
-        # 否则检查环境变量
-        env_val = os.environ.get(env_key)
-        if env_val is not None and env_val.strip():
-            return env_val
-        # 最后使用默认值
-        return default_val
+        if _cli_has_arg(cli_arg_name):
+            # 用户显式传递了 CLI 参数，使用 CLI 值
+            os.environ[env_key] = str(cli_val)
+        else:
+            # 用户未传 CLI 参数，使用 setdefault 保留已存在的环境变量
+            os.environ.setdefault(env_key, str(default_val))
     
     # 设置环境变量（保留现有环境变量值，除非 CLI 显式覆盖）
-    # anchor_mode: CLI 默认为 None，所以 args.anchor_mode 为 None 时应查环境变量
-    anchor_mode_val = _get_param(args.anchor_mode, 'EXTRACT_ANCHOR_MODE', 'v2', is_cli_default=(args.anchor_mode is None))
-    os.environ['EXTRACT_ANCHOR_MODE'] = str(anchor_mode_val)
-    
-    os.environ['SCAN_STEP'] = str(args.scan_step)
-    os.environ['SCAN_HEIGHTS'] = _get_param(args.scan_heights, 'SCAN_HEIGHTS', '240,320,420,520,640', is_cli_default=(args.scan_heights is None))
-    os.environ['SCAN_DIST_LAMBDA'] = str(getattr(args, 'scan_dist_lambda', 0.15))
-    os.environ['CAPTION_MID_GUARD'] = str(getattr(args, 'caption_mid_guard', 6.0))
-    
-    global_anchor_val = _get_param(args.global_anchor, 'GLOBAL_ANCHOR', 'auto', is_cli_default=(args.global_anchor is None))
-    os.environ['GLOBAL_ANCHOR'] = str(global_anchor_val)
-    os.environ['GLOBAL_ANCHOR_MARGIN'] = str(getattr(args, 'global_anchor_margin', 0.02))
-    
-    global_anchor_table_val = _get_param(getattr(args, 'global_anchor_table', None), 'GLOBAL_ANCHOR_TABLE', 'auto', is_cli_default=(getattr(args, 'global_anchor_table', None) is None))
-    os.environ['GLOBAL_ANCHOR_TABLE'] = str(global_anchor_table_val)
-    os.environ['GLOBAL_ANCHOR_TABLE_MARGIN'] = str(getattr(args, 'global_anchor_table_margin', 0.03))
+    _set_env_with_priority('EXTRACT_ANCHOR_MODE', 'anchor-mode', args.anchor_mode, 'v2')
+    _set_env_with_priority('SCAN_STEP', 'scan-step', args.scan_step, 14.0)
+    _set_env_with_priority('SCAN_HEIGHTS', 'scan-heights', args.scan_heights, '240,320,420,520,640,720,820,920')
+    _set_env_with_priority('SCAN_DIST_LAMBDA', 'scan-dist-lambda', getattr(args, 'scan_dist_lambda', 0.12), 0.12)
+    _set_env_with_priority('CAPTION_MID_GUARD', 'caption-mid-guard', getattr(args, 'caption_mid_guard', 6.0), 6.0)
+    _set_env_with_priority('GLOBAL_ANCHOR', 'global-anchor', args.global_anchor, 'auto')
+    _set_env_with_priority('GLOBAL_ANCHOR_MARGIN', 'global-anchor-margin', getattr(args, 'global_anchor_margin', 0.02), 0.02)
+    _set_env_with_priority('GLOBAL_ANCHOR_TABLE', 'global-anchor-table', getattr(args, 'global_anchor_table', 'auto'), 'auto')
+    _set_env_with_priority('GLOBAL_ANCHOR_TABLE_MARGIN', 'global-anchor-table-margin', getattr(args, 'global_anchor_table_margin', 0.03), 0.03)
     
     # 打印最终生效的关键参数值（便于调试与复现）
     print(f"[INFO] Effective parameters:")
