@@ -11,6 +11,7 @@ Extract text and figure/table PNGs from a research PDF and produce a JSON index.
   - `images/index.json`
   - `images/layout_model.json` (if `--layout-driven` is used)
 - **NEW**: 
+  - **(2025-12-22)** **P0 fixes (P0-01~07)**: CLI args override env vars; Anchor v2 supports per-id `--above/--below` + `--t-above/--t-below`; fixes Supplementary IDs (S1) without collisions; protects 2-line captions from trimming; table `--no-text-trim` works; default pruning of stale PNGs; filename collision auto-disambiguation.
   - **(2025-10-27)** **Visual debug mode fixes**: Fixed dashes parameter for layout visualization (supports both figures and tables)
   - **(2025-10-21)** **Layout-driven extraction (V2)**: Use `--layout-driven` to build document layout model first, then use it to guide extraction (includes Step 3 layout-guided clipping)
   - **(2025-10-16)** **Adaptive line height**: Automatically adjusts trimming parameters based on document's typical line height (enabled by default)
@@ -37,15 +38,15 @@ python3 scripts/extract_pdf_assets.py --pdf <PDF_DIR>/<paper>.pdf --preset robus
 # Disable adaptive line height (use fixed parameters)
 python3 scripts/extract_pdf_assets.py --pdf <PDF_DIR>/<paper>.pdf --preset robust --no-adaptive-line-height
 ```
-Common flags: `--allow-continued`, `--anchor-mode v1`, `--below/--above`, `--manifest <path>`, `--max-caption-words 10`, `--layout-driven`, `--debug-visual`, `--no-adaptive-line-height`, `--prune-images`.
+Common flags: `--allow-continued`, `--anchor-mode v1`, `--below/--above`, `--t-above/--t-below`, `--manifest <path>`, `--max-caption-words 10`, `--layout-driven`, `--debug-visual`, `--no-adaptive-line-height`, `--prune-images/--no-prune-images`.
 
 > 跨平台说明：在 Windows/PowerShell 下通常使用 `python`、`Move-Item`、`Copy-Item`、`Get-Location`、`Get-Date`，而在 macOS/Linux 下使用 `python3`、`mv`、`cp`、`pwd`、`date`。详见 `AGENTS.md` 的“环境与命令差异”对照与示例。
 
 ### Notes
 - Use relative paths like `images/...` when embedding figures/tables in Markdown next to the PDF.
 - After renaming Figure_/Table_ PNGs, run `python scripts/sync_index_after_rename.py <PDF_DIR>` so `images/index.json` stays in sync.
-- If you re-run extraction and want to avoid mixing stale PNGs in `images/`, add `--prune-images` to remove files not referenced by the newly written `index.json`.
-- With Anchor v2 (default), per-id `--above/--below` works only if you switch to `--anchor-mode v1`.
+- **Image pruning**: Enabled by default; after writing `images/index.json`, the extractor removes unreferenced `Figure_*/Table_*` PNGs from `images/`. Use `--no-prune-images` to disable.
+- **Forced direction**: With Anchor v2 (default) or v1, per-id `--above/--below` (figures) and `--t-above/--t-below` (tables) work as expected; use `--anchor-mode v1` only if you prefer the legacy anchoring strategy.
 - **Smart caption detection**: Enabled by default, automatically distinguishes real captions from in-text references; use `--no-smart-caption-detection` to disable, or `--debug-captions` to see scoring details. See `AGENTS.md` for more.
 - **Visual debug mode**: Use `--debug-visual` to save multi-stage boundary boxes overlaid on full pages (**supports both figures and tables**); outputs to `images/debug/Figure_N_pX_debug_stages.png` / `Table_N_pX_debug_stages.png` + legend files. Paragraph boundaries are drawn as pink dashed lines when using `--layout-driven`. See `AGENTS.md` for color scheme and usage.
 - **Adaptive line height**: Enabled by default, automatically adjusts trimming parameters (`adjacent_th`, `far_text_th`, etc.) based on document's typical line height; use `--no-adaptive-line-height` to disable and use fixed default parameters.
@@ -91,7 +92,6 @@ cd </path/to/PDF_DIR>
 python3 scripts/extract_pdf_assets.py \
   --pdf "$(pwd)/<paper>.pdf" \
   --preset robust \
-  --anchor-mode v1 \
   --below 2,3 \
   --allow-continued
 ```
@@ -111,6 +111,7 @@ python3 scripts/extract_pdf_assets.py \
   - `images/index.json`
   - `images/layout_model.json`（使用 `--layout-driven` 时）
 - **新功能**：
+  - **(2025-12-22)** **P0-01~07 紧急修复**：参数优先级改为 **CLI 显式传参 > 环境变量 > 默认值**；默认 Anchor v2 下 `--above/--below` 与 `--t-above/--t-below` 按编号强制方向直接生效；支持 `S1` 等附录编号且不与 `1` 冲突；两行检测不再误裁图注；表格 `--no-text-trim` 生效；默认清理未引用旧图（`--prune-images`）；文件名碰撞自动消歧。
   - **(2025-10-27)** **可视化调试修复**：修复版式可视化中的虚线参数错误（图与表均支持）
   - **(2025-10-21)** **版式驱动提取（V2）**：使用 `--layout-driven` 先构建文档版式模型，再引导提取（包含 Step 3 版式引导裁剪）
   - **(2025-10-16)** **自适应行高**：根据文档典型行高自动调整裁切参数（默认启用）
@@ -137,13 +138,13 @@ python3 scripts/extract_pdf_assets.py --pdf <PDF_DIR>/<paper>.pdf --preset robus
 # 禁用自适应行高（使用固定参数）
 python3 scripts/extract_pdf_assets.py --pdf <PDF_DIR>/<paper>.pdf --preset robust --no-adaptive-line-height
 ```
-常用参数：`--allow-continued`、`--anchor-mode v1`、`--below/--above`、`--manifest <path>`、`--max-caption-words 10`、`--layout-driven`、`--debug-visual`、`--no-adaptive-line-height`、`--prune-images`。
+常用参数：`--allow-continued`、`--anchor-mode v1`、`--below/--above`、`--t-above/--t-below`、`--manifest <path>`、`--max-caption-words 10`、`--layout-driven`、`--debug-visual`、`--no-adaptive-line-height`、`--prune-images/--no-prune-images`。
 
 ### 提示
 - 在生成 Markdown 摘要时，始终使用相对路径嵌图（如 `images/...`）。
 - 重命名 PNG 后，运行 `python scripts/sync_index_after_rename.py <PDF_DIR>` 同步 `images/index.json`，避免清单与文件名不一致。
-- 如重复运行导致 `images/` 中混入旧 PNG，可加 `--prune-images` 清理掉未被本次 `index.json` 引用的旧图。
-- 默认 Anchor v2 下，若需按编号强制上/下方向，请切换 `--anchor-mode v1` 后再配合 `--above/--below`。
+- **输出隔离**：默认已启用 `--prune-images`（写入最新 `images/index.json` 后自动清理未引用旧图）；如需关闭，使用 `--no-prune-images`。
+- **强制方向**：默认 Anchor v2 下（或切换 v1 也同样可用），`--above/--below`（图）与 `--t-above/--t-below`（表）按编号强制方向直接生效。
 - **智能图注识别**：默认启用，自动区分真实图注与正文引用；如需关闭，使用 `--no-smart-caption-detection`；如需查看评分详情，使用 `--debug-captions`。详见 `AGENTS.md`。
 - **可视化调试模式**：使用 `--debug-visual` 保存多阶段边界框叠加的完整页面（**图与表均支持**）；输出到 `images/debug/Figure_N_pX_debug_stages.png` / `Table_N_pX_debug_stages.png` 及图例文件。配合 `--layout-driven` 使用时，段落边界以粉红色虚线显示。颜色方案和使用方法详见 `AGENTS.md`。
 - **自适应行高**：默认启用，根据文档典型行高自动调整裁切参数（`adjacent_th`、`far_text_th` 等）；如需禁用并使用固定默认参数，使用 `--no-adaptive-line-height`。
@@ -190,7 +191,6 @@ cd </path/to/PDF_DIR>
 python3 scripts/extract_pdf_assets.py \
   --pdf "$(pwd)/<paper>.pdf" \
   --preset robust \
-  --anchor-mode v1 \
   --below 2,3 \
   --allow-continued
 ```

@@ -1,5 +1,15 @@
 # 存储库指南（Agent 工作流）
 
+## 2025-12-22（V0.1.5-build0034）P0-01~07 修复摘要
+
+- **P0-01 环境变量优先级**：统一参数优先级为 **CLI 显式传参 > 环境变量 > 默认值**，避免环境变量导致“参数静默失效/不可复现”。（脚本内部仅在检测到你显式传了对应 CLI 参数时才覆盖同名 ENV）
+- **P0-02 两行检测保护图注**：增强“两行检测”，当两行文本属于图注本身（长标题换行）时不再误裁；正文顶部“两行噪声”仍可被正确清除。
+- **P0-03 Supplementary 编号不再冲突**：支持 `S1/S2/...` 作为完整标识符（图与表均可），避免与 `1/2/...` 冲突；可用 `--above S1` / `--below S2` / `--t-above S1` 等精确命中；输出文件名前缀保留 `Figure_S1` / `Table_S1`。
+- **P0-04 Anchor v2 支持强制方向**：默认 Anchor v2 下，`--above/--below`（图）与 `--t-above/--t-below`（表）按编号强制方向直接生效；无需为了强制方向切换到 `--anchor-mode v1`。
+- **P0-05 表格 `text_trim` 可正确关闭**：修复表格提取中 `text_trim` 被“永远开启”的问题，`--no-text-trim` 对表格也生效；`--preset robust` 仍默认开启 `text_trim`。
+- **P0-06 输出隔离默认开启**：默认启用 `--prune-images`，在写入最新 `images/index.json` 后自动清理 `images/` 中未被本次索引引用的旧 `Figure_*/Table_*` PNG；如需保留旧图用于对比，使用 `--no-prune-images`。
+- **P0-07 文件名碰撞自动消歧**：当 sanitize 后文件名碰撞时自动追加 `_1/_2/...` 并输出警告，避免静默覆盖与 index/file 不一致。
+
 ## 目标与产出
 - 输入：一份论文 PDF。
 - 过程：用 `scripts/extract_pdf_assets.py` 提取正文与“附图与表格”（Figure x / Table x）。
@@ -89,12 +99,13 @@ Get-Location
 - 强制方向：
   - `--above 4` 仅对图 4 强制从图注上方取图。
   - `--below 2,3` 对图 2 与 3 强制从图注下方取图。
+  - 表格：`--t-above 1,S1` / `--t-below 2`（表号同样支持 `S1` 等附录编号）。
   - 进阶：也可设置环境变量 `EXTRACT_FORCE_ABOVE="1,4"`（可选）。
-  - 重要：当使用默认“锚点 V2”时，`--above/--below` 与 `EXTRACT_FORCE_ABOVE/EXTRACT_FORCE_TABLE_ABOVE` 不生效；如需按编号强制方向，请添加 `--anchor-mode v1`（或设置 `EXTRACT_ANCHOR_MODE=v1`）后再结合上述参数使用。
+  - 环境变量：`EXTRACT_FORCE_TABLE_ABOVE="1,S1"` 可对表强制上方裁剪（可选）。
+  - 重要：强制方向在 **锚点 V1/V2 均生效**；优先级为 **CLI 显式传参 > 环境变量**。`--anchor-mode v1|v2` 只影响锚点策略本身，不影响强制方向是否生效。
 - 同号多页（continued）：
   - `--allow-continued` 允许输出同一图号的多页内容，命名为 `..._continued_p{page}.png`。
   - 表格同理：再次命中相同“表号”将输出 `Table_<id>_continued_p{page}.png`。
-  - 环境变量：`EXTRACT_FORCE_TABLE_ABOVE="1,S1"` 可对表强制上方裁剪。
 
 ### 锚点 V2（默认）与"全局锚点一致性"
 - 锚点 V2：围绕 caption 多尺度滑窗（默认高度：240,320,420,520,640,720,820），结合结构打分（墨迹/对象覆盖/段落占比/组件数量；表格再加"列对齐峰+线段密度"），并做边缘"吸附"。

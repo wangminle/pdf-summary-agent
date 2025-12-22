@@ -906,6 +906,8 @@ def _trim_clip_head_by_text_v2(
     far_side_para_min_ratio: float = 0.20,
     # Adaptive line height
     typical_line_h: Optional[float] = None,
+    # Debug
+    debug: bool = False,
 ) -> fitz.Rect:
     """
     Enhanced dual-threshold text trimming.
@@ -1087,7 +1089,8 @@ def _trim_clip_head_by_text_v2(
         # Decision: trim far-side if coverage >= threshold (default 0.20)
         if far_side_para_coverage >= far_side_para_min_ratio:
             try:
-                print(f"[DBG] Far-side trim: direction={'above' if near_is_top else 'below'} far_is_top={far_is_top} coverage={far_side_para_coverage:.3f} th={far_side_para_min_ratio}")
+                if debug:
+                    print(f"[DBG] Far-side trim: direction={'above' if near_is_top else 'below'} far_is_top={far_is_top} coverage={far_side_para_coverage:.3f} th={far_side_para_min_ratio}")
             except Exception:
                 pass
             if far_is_top:
@@ -1159,7 +1162,8 @@ def _trim_clip_head_by_text_v2(
                     fallback_lines.append(lb)
             if fallback_lines:
                 try:
-                    print(f"[DBG] Far-side fallback trim: lines={len(fallback_lines)}")
+                    if debug:
+                        print(f"[DBG] Far-side fallback trim: lines={len(fallback_lines)}")
                 except Exception:
                     pass
                 if far_is_top:
@@ -2464,6 +2468,25 @@ def extract_figures(
                 clip = chosen_clip
             else:
                 # Anchor V2：多尺度滑窗
+                # --- P0-04 修复：V2 也支持 --above/--below 强制方向 ---
+                # 检查当前图号是否被强制指定方向
+                forced_side: Optional[str] = None
+                if below_figs is not None and fig_no in below_figs:
+                    forced_side = 'below'
+                    if debug_captions:
+                        print(f"[DBG] Figure {fig_no}: forced direction=below (--below)")
+                elif above_figs is not None and fig_no in above_figs:
+                    forced_side = 'above'
+                    if debug_captions:
+                        print(f"[DBG] Figure {fig_no}: forced direction=above (--above)")
+                elif fig_no in force_above:
+                    forced_side = 'above'
+                    if debug_captions:
+                        print(f"[DBG] Figure {fig_no}: forced direction=above (EXTRACT_FORCE_ABOVE)")
+                
+                # 确定扫描方向：强制方向 > 全局方向 > 双向扫描
+                effective_side = forced_side if forced_side else global_side
+                
                 scan_heights = os.getenv('SCAN_HEIGHTS', '')
                 if scan_heights:
                     heights = [float(h) for h in scan_heights.split(',') if h.strip()]
@@ -2565,7 +2588,8 @@ def extract_figures(
                 if prev_cap is not None:
                     mid_prev = 0.5 * (prev_cap.y1 + cap_rect.y0)
                     y0_min_guard = max(y0_min_guard, mid_prev + cap_mid_guard)
-                if global_side in (None, 'above'):
+                # P0-04: 使用 effective_side（含强制方向）控制扫描
+                if effective_side in (None, 'above'):
                     for h in heights:
                         y1 = bot_bound
                         y0_min = max(page_rect.y0, y0_min_guard)
@@ -2588,7 +2612,8 @@ def extract_figures(
                 if next_cap is not None:
                     mid_next = 0.5 * (cap_rect.y1 + next_cap.y0)
                     y1_max_guard = min(y1_max_guard, mid_next - cap_mid_guard)
-                if global_side in (None, 'below'):
+                # P0-04: 使用 effective_side（含强制方向）控制扫描
+                if effective_side in (None, 'below'):
                     for h in heights:
                         y0 = min(max(page_rect.y0, top2), page_rect.y1 - 40)
                         y1_max = y1_max_guard
@@ -2622,10 +2647,11 @@ def extract_figures(
                         )
                     side = best[1]
                     clip = snap_clip_edges(best[2], draw_items)
-                    try:
-                        print(f"[DBG] Select side={side} for Figure {fig_no} on page {pno+1}")
-                    except Exception:
-                        pass
+                    if debug_captions:
+                        try:
+                            print(f"[DBG] Select side={side} for Figure {fig_no} on page {pno+1}")
+                        except Exception:
+                            pass
 
             # clip 已选定（V1/V2）
             
@@ -2686,6 +2712,7 @@ def extract_figures(
                     far_side_min_dist=far_side_min_dist,
                     far_side_para_min_ratio=far_side_para_min_ratio,
                     typical_line_h=typical_lh,
+                    debug=debug_captions,
                 )
                 clip_after_A = fitz.Rect(clip)
                 
@@ -2949,6 +2976,7 @@ def extract_figures(
                         far_side_min_dist=far_side_min_dist,
                         far_side_para_min_ratio=far_side_para_min_ratio,
                         typical_line_h=typical_lh_fallback,
+                        debug=debug_captions,
                     ) if text_trim else base_clip
                     rA_h, rA_a = max(1.0, clip_A.height), max(1.0, clip_A.width * clip_A.height)
                     if (rA_h >= 0.60 * base_height) and (rA_a >= 0.55 * base_area):
@@ -3009,6 +3037,8 @@ def extract_figures(
             if count_prev >= 1 and allow_continued:
                 base = f"{base}_continued_p{pno+1}"
             out_path = os.path.join(out_dir, base + ".png")
+            # P0-07: 文件名碰撞处理
+            out_path, had_collision = get_unique_path(out_path)
             pix.save(out_path)
             seen_counts[fig_no] = count_prev + 1
             records.append(AttachmentRecord('figure', str(fig_no), pno + 1, caption, out_path, continued=(count_prev>=1)))
@@ -3087,6 +3117,27 @@ def build_output_basename(kind: str, ident: str, caption: str, max_chars: int = 
     # 限制标号后的单词数量
     s = _limit_words_after_prefix(s, prefix, max_words=max_words)
     return s
+
+
+# ---- P0-07: 文件名碰撞处理 ----
+def get_unique_path(base_path: str) -> Tuple[str, bool]:
+    """
+    检查文件路径是否存在，如果存在则追加后缀 _1, _2, ... 直到找到唯一路径。
+    
+    返回：(unique_path, had_collision)
+    - unique_path: 唯一的文件路径
+    - had_collision: 是否发生了碰撞
+    """
+    if not os.path.exists(base_path):
+        return base_path, False
+    
+    stem, ext = os.path.splitext(base_path)
+    counter = 1
+    while os.path.exists(f"{stem}_{counter}{ext}"):
+        counter += 1
+    unique_path = f"{stem}_{counter}{ext}"
+    print(f"[WARN] Filename collision detected: {os.path.basename(base_path)} -> {os.path.basename(unique_path)}")
+    return unique_path, True
 
 
 # ---- JSON 索引：images/index.json ----
@@ -3827,6 +3878,21 @@ def extract_tables(
                 clip = chosen_clip
             else:
                 # Anchor V2：多尺度滑窗 + 吸附
+                # --- P0-04 修复：V2 也支持 --t-above/--t-below 强制方向 ---
+                # 检查当前表号是否被强制指定方向
+                forced_side_table: Optional[str] = None
+                if ident in t_below_set:
+                    forced_side_table = 'below'
+                    if debug_captions:
+                        print(f"[DBG] Table {ident}: forced direction=below (--t-below)")
+                elif ident in t_above_set:
+                    forced_side_table = 'above'
+                    if debug_captions:
+                        print(f"[DBG] Table {ident}: forced direction=above (--t-above)")
+                
+                # 确定扫描方向：强制方向 > 全局方向 > 双向扫描
+                effective_side_table = forced_side_table if forced_side_table else global_side_table
+                
                 scan_heights = os.getenv('SCAN_HEIGHTS', '')
                 heights = (
                     [float(h) for h in scan_heights.split(',') if h.strip()]
@@ -3866,8 +3932,9 @@ def extract_tables(
                 
                 cands: List[Tuple[float, str, fitz.Rect]] = []
 
-                # above (respect global anchor for tables)
-                if global_side_table in (None, 'above'):
+                # above (respect forced/global anchor for tables)
+                # P0-04: 使用 effective_side_table（含强制方向）控制扫描
+                if effective_side_table in (None, 'above'):
                     top_bound = (prev_cap.y1 + 8) if prev_cap else page_rect.y0
                     bot_bound = cap_rect.y0 - table_caption_gap
                     for h in heights:
@@ -3884,8 +3951,9 @@ def extract_tables(
                             y0 -= step
                             if y0 < y0_min:
                                 break
-                # below (respect global anchor for tables)
-                if global_side_table in (None, 'below'):
+                # below (respect forced/global anchor for tables)
+                # P0-04: 使用 effective_side_table（含强制方向）控制扫描
+                if effective_side_table in (None, 'below'):
                     top2 = cap_rect.y1 + table_caption_gap
                     bot2 = (next_cap.y0 - 8) if next_cap else page_rect.y1
                     for h in heights:
@@ -3980,6 +4048,7 @@ def extract_tables(
                     far_side_min_dist=far_side_min_dist,
                     far_side_para_min_ratio=far_side_para_min_ratio,
                     typical_line_h=typical_lh,
+                    debug=debug_captions,
                 )
                 clip_after_A = fitz.Rect(clip)
                 if debug_visual and (clip_after_A != base_clip):
@@ -4175,6 +4244,7 @@ def extract_tables(
                         far_side_min_dist=far_side_min_dist,
                         far_side_para_min_ratio=far_side_para_min_ratio,
                         typical_line_h=typical_lh_fallback_tbl,
+                        debug=debug_captions,
                     ) if text_trim else base_clip
                     # 二次门槛：如 A-only 过小则回退到基线
                     rA_h, rA_a = max(1.0, clip_A.height), max(1.0, clip_A.width * clip_A.height)
@@ -4235,6 +4305,8 @@ def extract_tables(
                 base_name = f"{base_name}_continued_p{pno+1}"
                 cont = True
             out_path = os.path.join(out_dir, base_name + ".png")
+            # P0-07: 文件名碰撞处理
+            out_path, had_collision = get_unique_path(out_path)
             pix.save(out_path)
             seen_counts[ident] = count_prev + 1
             records.append(AttachmentRecord('table', ident, pno + 1, caption, out_path, continued=cont))
@@ -5067,7 +5139,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--out-dir", default=None, help="Directory for output image PNGs. If omitted, writes to <pdf_dir>/images/")
     p.add_argument("--manifest", default=None, help="Path to CSV manifest of extracted items (figures/tables)")
     p.add_argument("--index-json", default=None, help="Path to JSON index (default: <pdf_dir>/images/index.json)")
-    p.add_argument("--prune-images", action="store_true", help="After extraction, remove Figure_*/Table_* PNGs in out-dir that are not referenced by the written index.json")
+    # P0-06: 默认启用输出隔离，避免旧 PNG 混入新结果
+    p.add_argument("--prune-images", action="store_true", default=True, help="After extraction, remove Figure_*/Table_* PNGs in out-dir that are not referenced by the written index.json (default: enabled)")
+    p.add_argument("--no-prune-images", action="store_false", dest="prune_images", help="Disable automatic pruning of unindexed images")
     p.add_argument("--dpi", type=int, default=300, help="Render DPI for figure images")
     p.add_argument("--clip-height", type=float, default=650.0, help="Clip window height above caption (pt)")
     p.add_argument("--margin-x", type=float, default=20.0, help="Horizontal page margin (pt)")
@@ -5108,7 +5182,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--no-adaptive-line-height", action="store_false", dest="adaptive_line_height", help="Disable adaptive line height (use fixed default parameters)")
     
     # A) text trimming options
-    p.add_argument("--text-trim", action="store_true", help="Trim paragraph-like text near caption side inside chosen clip")
+    p.add_argument("--text-trim", action="store_true", default=False, help="Trim paragraph-like text near caption side inside chosen clip")
+    p.add_argument("--no-text-trim", action="store_false", dest="text_trim", help="Disable text trimming (overrides --text-trim and preset defaults)")
     p.add_argument("--text-trim-width-ratio", type=float, default=0.5, help="Min horizontal overlap ratio to treat a line as paragraph text")
     p.add_argument("--text-trim-font-min", type=float, default=7.0, help="Min font size for paragraph detection")
     p.add_argument("--text-trim-font-max", type=float, default=16.0, help="Max font size for paragraph detection")
@@ -5173,6 +5248,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"[ERROR] PDF not found: {pdf_path}", file=sys.stderr)
         return 2
 
+    # --- P0-01：辅助 - 显式参数检测（支持 main(argv=...) 程序化调用） ---
+    argv_for_cli_check = list(argv) if argv is not None else sys.argv[1:]
+
+    def _cli_has_arg(arg_name: str) -> bool:
+        """检查 argv 中是否包含指定的参数名（支持 --kebab-case / --snake_case / --arg=val）"""
+        kebab = arg_name.replace('_', '-')
+        snake = arg_name.replace('-', '_')
+        variants = {f'--{kebab}', f'--{snake}'}
+        for a in argv_for_cli_check:
+            for v in variants:
+                if a == v or a.startswith(v + '='):
+                    return True
+        return False
+
     # Resolve defaults relative to PDF dir
     pdf_dir = os.path.dirname(os.path.abspath(pdf_path))
     pdf_stem = os.path.splitext(os.path.basename(pdf_path))[0]
@@ -5192,7 +5281,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.clip_height = 520.0
         args.margin_x = 26.0
         args.caption_gap = 6.0
-        args.text_trim = True
+        # P0-05: 允许 --no-text-trim 覆盖 robust 预设的默认开启
+        if not _cli_has_arg("no-text-trim"):
+            args.text_trim = True
         args.autocrop = True
         args.autocrop_pad = 30
         args.autocrop_white_th = 250
@@ -5221,21 +5312,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.table_object_merge_gap = 4.0
 
     # --- P0-01 修复：环境变量优先级（CLI > ENV > 默认值）---
-    # NOTE: main(argv=...) 可能被程序化调用；显式参数检测需基于 argv 而非 sys.argv。
-    argv_for_cli_check = list(argv) if argv is not None else sys.argv[1:]
-
-    # 辅助函数：检查用户是否在命令行中显式传递了参数
-    def _cli_has_arg(arg_name: str) -> bool:
-        """检查 argv 中是否包含指定的参数名（支持 --kebab-case / --snake_case / --arg=val）"""
-        kebab = arg_name.replace('_', '-')
-        snake = arg_name.replace('-', '_')
-        variants = {f'--{kebab}', f'--{snake}'}
-        for a in argv_for_cli_check:
-            for v in variants:
-                if a == v or a.startswith(v + '='):
-                    return True
-        return False
-    
     # 辅助函数：设置环境变量，实现 CLI > ENV > 默认值 优先级
     def _set_env_with_priority(env_key: str, cli_arg_name: str, cli_val, default_val):
         """
