@@ -84,17 +84,24 @@ Get-Location
   - 表格特化（自动启用）：表格提取默认开启（用 `--no-tables` 禁用），`--table-clip-height 520 --table-margin-x 26 --table-caption-gap 6 --table-object-min-area-ratio 0.005 --table-object-merge-gap 4 --table-autocrop --table-autocrop-pad 20`（默认关闭表格文本掩膜，用 `--table-mask-text` 启用）
   - 验收保护：高度≥0.6×、面积≥0.55×、对象覆盖率≥0.85×、墨迹密度≥0.9×，并保护多子图不被缩并。
   - **重要说明**：若启用"自适应行高"（默认启用），上述 `adjacent_th`、`far_text_th`、`text_trim_gap`、`far_side_min_dist` 等阈值参数会根据文档的典型行高动态调整（如 `adjacent_th` = 2.0×行高）。上述列出的是基准出厂值，最终运行值会根据文档自适应。
+  - **✨ V0.1.4 修复**：参数优先级现为 **CLI参数 > 环境变量 > 默认值**。CLI 显式传参始终优先，避免用户 shell 中预设的环境变量意外覆盖命令行参数。
 
 ### 方向与续页控制
 - 强制方向：
   - `--above 4` 仅对图 4 强制从图注上方取图。
   - `--below 2,3` 对图 2 与 3 强制从图注下方取图。
   - 进阶：也可设置环境变量 `EXTRACT_FORCE_ABOVE="1,4"`（可选）。
-  - 重要：当使用默认“锚点 V2”时，`--above/--below` 与 `EXTRACT_FORCE_ABOVE/EXTRACT_FORCE_TABLE_ABOVE` 不生效；如需按编号强制方向，请添加 `--anchor-mode v1`（或设置 `EXTRACT_ANCHOR_MODE=v1`）后再结合上述参数使用。
+  - **✨ V0.1.5 更新**：`--above/--below` 和 `--t-above/--t-below` 现在在锚点 V2 模式下也生效。优先级：强制方向 > 全局方向 > 双向扫描。
+  - `--t-above 1,S1` 对表 1 和表 S1 强制从表注上方取表。
+  - `--t-below 2` 对表 2 强制从表注下方取表。
 - 同号多页（continued）：
   - `--allow-continued` 允许输出同一图号的多页内容，命名为 `..._continued_p{page}.png`。
   - 表格同理：再次命中相同“表号”将输出 `Table_<id>_continued_p{page}.png`。
   - 环境变量：`EXTRACT_FORCE_TABLE_ABOVE="1,S1"` 可对表强制上方裁剪。
+- 附录图表编号（**V0.1.4 新增**）：
+  - `Figure S1`、`Table S2`、`Extended Data Figure 1` 等附录编号现在作为独立 ID 处理。
+  - 编号保持字符串格式（如 `"S1"` 而非 `1`），不与主图 `Figure 1` 冲突。
+  - `--above S1`、`--below S2` 可正确匹配附录图表。
 
 ### 锚点 V2（默认）与"全局锚点一致性"
 - 锚点 V2：围绕 caption 多尺度滑窗（默认高度：240,320,420,520,640,720,820），结合结构打分（墨迹/对象覆盖/段落占比/组件数量；表格再加"列对齐峰+线段密度"），并做边缘"吸附"。
@@ -144,6 +151,14 @@ python3 scripts/extract_pdf_assets.py --pdf paper.pdf --preset robust --no-adapt
 - 表格参数：`--table-*` 同名选项与图相近，但默认对表关闭文本掩膜、降低连通域面积阈值。
 - 关闭表格提取：`--no-tables`（默认开启表格提取）。
 - 导出 CSV 清单：`--manifest <path>` 可生成包含 `(type,id,page,caption,file,continued)` 的 CSV；与 `images/index.json` 字段一致。
+- 自动清理旧图（**V0.1.5 新增，默认启用**）：
+  - `--prune-images`（默认开启）：提取完成后，自动删除 `images/` 目录中未被新 `index.json` 引用的旧 `Figure_*/Table_*` PNG。
+  - `--no-prune-images`：禁用自动清理，保留旧文件。
+  - 作用：避免重复运行时旧图混入"全量喂给模型"的集合。
+- 文件名碰撞保护（**V0.1.5 新增**）：
+  - 当两个图表 sanitize 后生成相同文件名时，自动追加后缀 `_1`、`_2` 等，不再静默覆盖。
+  - 日志会输出警告：`[WARN] Filename collision detected: ... -> ..._1.png`
+  - `index.json` 记录实际使用的文件名。
 
 ### 智能 Caption 识别（默认开启）
 **问题背景**：论文中的图表标号（如 Figure 1、Table 2）可能出现在三种位置：
