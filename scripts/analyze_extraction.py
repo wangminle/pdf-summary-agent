@@ -7,6 +7,34 @@
 import json
 import sys
 from pathlib import Path
+from typing import Any
+
+
+def _load_index_json_items(index_path: Path) -> list[dict]:
+    """
+    兼容层：从 index.json 中加载 items 列表，同时支持旧格式（list）和新格式（dict）。
+    
+    旧格式: [{"type": ..., "id": ..., "file": ...}, ...]
+    新格式: {"version": "2.0", "items": [...], "figures": [...], "tables": [...], ...}
+    
+    Returns:
+        items 列表
+    """
+    data = json.loads(index_path.read_text(encoding="utf-8"))
+    
+    if isinstance(data, list):
+        # 旧格式：直接是 items 列表
+        return data
+    elif isinstance(data, dict):
+        # 新格式：从 "items" 字段获取，或合并 "figures" + "tables"
+        if "items" in data:
+            return data["items"]
+        else:
+            figures = data.get("figures", [])
+            tables = data.get("tables", [])
+            return figures + tables
+    else:
+        return []
 
 
 def _resolve_image_file(images_dir: Path, item: dict) -> Path | None:
@@ -64,9 +92,8 @@ def analyze_extraction_results(pdf_dir: Path):
         print(f"[错误] 未找到索引文件: {index_file}")
         return
     
-    # 读取索引
-    with open(index_file, 'r', encoding='utf-8') as f:
-        items = json.load(f)
+    # 读取索引（兼容新旧格式）
+    items = _load_index_json_items(index_file)
     
     print("=" * 70)
     print(f"[提取结果分析] {pdf_dir.name}")
@@ -195,11 +222,11 @@ def compare_extractions(dirs: list[Path]):
         if not index_file.exists():
             continue
         
-        with open(index_file, 'r', encoding='utf-8') as f:
-            items = json.load(f)
+        # 读取索引（兼容新旧格式）
+        items = _load_index_json_items(index_file)
         
-        figures = [x for x in items if x['type'] == 'figure']
-        tables = [x for x in items if x['type'] == 'table']
+        figures = [x for x in items if x.get('type') == 'figure']
+        tables = [x for x in items if x.get('type') == 'table']
         
         # 计算平均文件大小
         total_size = 0

@@ -13,6 +13,58 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Any
+
+
+def _load_index_json(index_path: Path) -> tuple[list[dict], dict | None]:
+    """
+    兼容层：加载 index.json，同时支持旧格式（list）和新格式（dict）。
+    
+    Returns:
+        (items 列表, 原始 dict 结构 或 None)
+        - 如果是旧格式（list），返回 (items, None)
+        - 如果是新格式（dict），返回 (items, original_dict)
+    """
+    data = json.loads(index_path.read_text(encoding="utf-8"))
+    
+    if isinstance(data, list):
+        # 旧格式：直接是 items 列表
+        return data, None
+    elif isinstance(data, dict):
+        # 新格式：从 "items" 字段获取，或合并 "figures" + "tables"
+        if "items" in data:
+            items = data["items"]
+        else:
+            items = data.get("figures", []) + data.get("tables", [])
+        return items, data
+    else:
+        return [], None
+
+
+def _save_index_json(index_path: Path, items: list[dict], original_dict: dict | None) -> None:
+    """
+    兼容层：保存 index.json，保持原有格式。
+    
+    Args:
+        items: 更新后的 items 列表
+        original_dict: 原始 dict 结构（新格式）或 None（旧格式）
+    """
+    if original_dict is None:
+        # 旧格式：直接写 list
+        output: Any = items
+    else:
+        # 新格式：更新 items 和 figures/tables
+        output = original_dict.copy()
+        output["items"] = items
+        
+        # 同步更新 figures 和 tables（如果存在）
+        if "figures" in output or "tables" in output:
+            figures = [it for it in items if (it.get("type") or "").lower() == "figure"]
+            tables = [it for it in items if (it.get("type") or "").lower() == "table"]
+            output["figures"] = figures
+            output["tables"] = tables
+    
+    index_path.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def resolve_image_file(images_dir: Path, item: dict) -> Path | None:
@@ -67,9 +119,10 @@ def main() -> int:
         print(f"[ERROR] index.json not found: {index_path}")
         return 2
 
-    items = json.loads(index_path.read_text(encoding="utf-8"))
-    if not isinstance(items, list):
-        print(f"[ERROR] index.json is not a list: {index_path}")
+    # 兼容新旧格式读取
+    items, original_dict = _load_index_json(index_path)
+    if not items and original_dict is None:
+        print(f"[ERROR] index.json is empty or invalid: {index_path}")
         return 2
 
     changed = 0
@@ -92,7 +145,8 @@ def main() -> int:
         print(f"[DRY-RUN] Would update {changed} entries, missing={missing}")
         return 0
 
-    index_path.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 兼容新旧格式写入
+    _save_index_json(index_path, items, original_dict)
     print(f"[OK] Synced index: {index_path} (updated={changed}, missing={missing})")
     return 0
 

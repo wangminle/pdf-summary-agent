@@ -99,6 +99,285 @@ def try_extract_text(pdf_path: str, out_text: Optional[str]) -> Optional[str]:
         return None
 
 
+# P1-03: PDF 预验证函数
+def pre_validate_pdf(pdf_path: str) -> "PDFValidationResult":
+    """
+    预验证 PDF 文件，检测潜在问题。
+    
+    检测内容：
+    - 文件是否存在且可读
+    - 是否加密
+    - 是否有文本层
+    - 页数和文件大小
+    
+    Args:
+        pdf_path: PDF 文件路径
+    
+    Returns:
+        PDFValidationResult 对象
+    """
+    warnings: List[str] = []
+    errors: List[str] = []
+    
+    # 检查文件存在性和大小
+    if not os.path.exists(pdf_path):
+        return PDFValidationResult(
+            is_valid=False, page_count=0, has_text_layer=False,
+            text_layer_ratio=0.0, is_encrypted=False, pdf_version="",
+            file_size_mb=0.0, warnings=[], errors=["File not found"]
+        )
+    
+    file_size_mb = os.path.getsize(pdf_path) / (1024 * 1024)
+    
+    # 尝试打开 PDF
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception as e:
+        return PDFValidationResult(
+            is_valid=False, page_count=0, has_text_layer=False,
+            text_layer_ratio=0.0, is_encrypted=False, pdf_version="",
+            file_size_mb=file_size_mb, warnings=[], errors=[f"Cannot open PDF: {e}"]
+        )
+    
+    try:
+        page_count = len(doc)
+        is_encrypted = doc.is_encrypted
+        
+        # 获取 PDF 版本
+        try:
+            pdf_version = doc.metadata.get("format", "unknown") if doc.metadata else "unknown"
+        except Exception:
+            pdf_version = "unknown"
+        
+        # 检测加密：尝试空密码解锁，很多"加密"PDF实际可用空密码打开
+        if is_encrypted:
+            # 尝试用空密码解锁
+            try:
+                unlock_result = doc.authenticate("")  # 空密码
+                if unlock_result:
+                    # 成功解锁，仅作为 warning
+                    warnings.append("PDF was encrypted but accessible with empty password")
+                    is_encrypted = False  # 标记为已解锁
+                else:
+                    # 空密码无效，但检查是否仍可读取内容
+                    try:
+                        _ = doc[0].get_text("text")[:100]  # 尝试读取首页部分内容
+                        warnings.append("PDF is marked as encrypted but content is readable")
+                    except Exception:
+                        warnings.append("PDF is encrypted; extraction may be incomplete (consider providing password)")
+            except Exception:
+                warnings.append("PDF is encrypted; extraction may be incomplete")
+        
+        # 检测文本层
+        pages_with_text = 0
+        sample_pages = min(10, page_count)  # 采样检测
+        
+        for pno in range(sample_pages):
+            try:
+                page = doc[pno]
+                text = page.get_text("text").strip()
+                if len(text) > 50:  # 至少 50 个字符才算有文本
+                    pages_with_text += 1
+            except Exception:
+                pass
+        
+        text_layer_ratio = pages_with_text / sample_pages if sample_pages > 0 else 0.0
+        has_text_layer = text_layer_ratio > 0.3  # 超过 30% 页面有文本
+        
+        # 生成警告
+        if not has_text_layer:
+            warnings.append("PDF may be scanned/image-only (limited text layer detected)")
+        
+        if page_count > 100:
+            warnings.append(f"Large document ({page_count} pages), extraction may be slow")
+        
+        if file_size_mb > 50:
+            warnings.append(f"Large file ({file_size_mb:.1f} MB), processing may be slow")
+        
+        doc.close()
+        
+        is_valid = len(errors) == 0
+        
+        return PDFValidationResult(
+            is_valid=is_valid,
+            page_count=page_count,
+            has_text_layer=has_text_layer,
+            text_layer_ratio=text_layer_ratio,
+            is_encrypted=is_encrypted,
+            pdf_version=pdf_version,
+            file_size_mb=file_size_mb,
+            warnings=warnings,
+            errors=errors
+        )
+        
+    except Exception as e:
+        doc.close()
+        return PDFValidationResult(
+            is_valid=False, page_count=0, has_text_layer=False,
+            text_layer_ratio=0.0, is_encrypted=False, pdf_version="",
+            file_size_mb=file_size_mb, warnings=[], errors=[f"Validation error: {e}"]
+        )
+
+
+# P1-04: 质量控制（QC）独立化
+def quality_check(
+    records: List["AttachmentRecord"],
+    pdf_path: str,
+    text_path: Optional[str] = None
+) -> List["QualityIssue"]:
+    """
+    独立的质量检查阶段，验证提取结果的完整性和一致性。
+    
+    检查项：
+    1. 提取数量与文本中引用的一致性
+    2. 图像尺寸合理性
+    3. 编号连续性
+    4. 续页完整性
+    
+    Args:
+        records: 提取记录列表
+        pdf_path: PDF 文件路径
+        text_path: 提取的文本文件路径（可选）
+    
+    Returns:
+        QualityIssue 列表
+    """
+    issues: List[QualityIssue] = []
+    
+    # 分离图片和表格记录
+    figures = [r for r in records if r.kind == 'figure']
+    tables = [r for r in records if r.kind == 'table']
+    
+    # 1. 检查编号连续性（从最小编号开始，而非固定从 1 开始，避免对部分提取的误报）
+    def check_numbering(items: List["AttachmentRecord"], kind: str) -> List["QualityIssue"]:
+        numbering_issues = []
+        # 过滤出非附录编号（纯数字）
+        numeric_ids = []
+        for item in items:
+            try:
+                if not item.ident.upper().startswith('S'):
+                    numeric_ids.append(int(item.ident))
+            except ValueError:
+                pass
+        
+        if numeric_ids:
+            numeric_ids = sorted(set(numeric_ids))
+            min_id = min(numeric_ids)
+            max_id = max(numeric_ids)
+            # 从最小编号到最大编号检查连续性（而非固定从 1 开始）
+            expected = list(range(min_id, max_id + 1))
+            missing = set(expected) - set(numeric_ids)
+            if missing:
+                numbering_issues.append(QualityIssue(
+                    level='warning',
+                    category='numbering_gap',
+                    message=f"{kind.title()} numbering has gaps: missing {sorted(missing)} (range: {min_id}-{max_id})",
+                    details={'kind': kind, 'missing': sorted(missing), 'found': numeric_ids, 'range': [min_id, max_id]}
+                ))
+            # 额外提示：如果最小编号不是 1，提示用户可能是部分提取
+            if min_id > 1:
+                numbering_issues.append(QualityIssue(
+                    level='info',
+                    category='partial_extraction',
+                    message=f"{kind.title()} starts from {min_id} (not 1), may be partial extraction",
+                    details={'kind': kind, 'start': min_id, 'found': numeric_ids}
+                ))
+        return numbering_issues
+    
+    issues.extend(check_numbering(figures, 'figure'))
+    issues.extend(check_numbering(tables, 'table'))
+    
+    # 2. 检查图像尺寸合理性
+    for record in records:
+        if os.path.exists(record.out_path):
+            file_size = os.path.getsize(record.out_path)
+            if file_size < 1000:  # 小于 1KB
+                issues.append(QualityIssue(
+                    level='warning',
+                    category='size_anomaly',
+                    message=f"{record.kind.title()} {record.ident} has very small file size ({file_size} bytes)",
+                    details={'file': record.out_path, 'size': file_size}
+                ))
+            elif file_size > 10 * 1024 * 1024:  # 大于 10MB
+                issues.append(QualityIssue(
+                    level='info',
+                    category='size_anomaly',
+                    message=f"{record.kind.title()} {record.ident} has large file size ({file_size / 1024 / 1024:.1f} MB)",
+                    details={'file': record.out_path, 'size': file_size}
+                ))
+    
+    # 3. 检查续页完整性
+    continued_records = [r for r in records if r.continued]
+    for cr in continued_records:
+        # 检查是否有对应的主记录
+        main_records = [r for r in records if r.kind == cr.kind and r.ident == cr.ident and not r.continued]
+        if not main_records:
+            issues.append(QualityIssue(
+                level='warning',
+                category='continued_incomplete',
+                message=f"Continued {cr.kind} {cr.ident} has no main record",
+                details={'kind': cr.kind, 'ident': cr.ident, 'page': cr.page}
+            ))
+    
+    # 4. 与文本中引用的一致性检查
+    if text_path and os.path.exists(text_path):
+        try:
+            with open(text_path, 'r', encoding='utf-8') as f:
+                text_content = f.read()
+            
+            # 统计文本中的 Figure/Table 引用
+            fig_pattern = re.compile(r'\b(?:Figure|Fig\.?)\s*(\d+|S\d+)', re.IGNORECASE)
+            tbl_pattern = re.compile(r'\b(?:Table)\s*(\d+|S\d+)', re.IGNORECASE)
+            
+            text_figures = set(m.group(1).upper() for m in fig_pattern.finditer(text_content))
+            text_tables = set(m.group(1).upper() for m in tbl_pattern.finditer(text_content))
+            
+            extracted_figures = set(r.ident.upper() for r in figures if not r.continued)
+            extracted_tables = set(r.ident.upper() for r in tables if not r.continued)
+            
+            # 检查文本中引用但未提取的
+            missing_figures = text_figures - extracted_figures
+            missing_tables = text_tables - extracted_tables
+            
+            if missing_figures:
+                issues.append(QualityIssue(
+                    level='warning',
+                    category='count_mismatch',
+                    message=f"Figures referenced in text but not extracted: {sorted(missing_figures)}",
+                    details={'missing': sorted(missing_figures), 'text_refs': sorted(text_figures), 'extracted': sorted(extracted_figures)}
+                ))
+            
+            if missing_tables:
+                issues.append(QualityIssue(
+                    level='warning',
+                    category='count_mismatch',
+                    message=f"Tables referenced in text but not extracted: {sorted(missing_tables)}",
+                    details={'missing': sorted(missing_tables), 'text_refs': sorted(text_tables), 'extracted': sorted(extracted_tables)}
+                ))
+            
+            # 检查提取了但文本中未引用的（可能是正常的，仅作 info 级别）
+            extra_figures = extracted_figures - text_figures
+            extra_tables = extracted_tables - text_tables
+            
+            if extra_figures:
+                issues.append(QualityIssue(
+                    level='info',
+                    category='count_mismatch',
+                    message=f"Figures extracted but not found in text references: {sorted(extra_figures)}",
+                    details={'extra': sorted(extra_figures)}
+                ))
+            
+        except Exception as e:
+            issues.append(QualityIssue(
+                level='info',
+                category='validation_error',
+                message=f"Could not validate against text file: {e}",
+                details={'error': str(e)}
+            ))
+    
+    return issues
+
+
 # 限制文件名中标号后的单词数量
 def _limit_words_after_prefix(filename: str, prefix_pattern: str, max_words: int = 12) -> str:
     """
@@ -334,6 +613,40 @@ def estimate_ink_ratio(pix: "fitz.Pixmap", white_threshold: int = 250) -> float:
     if total == 0:
         return 0.0
     return nonwhite / float(total)
+
+
+# P1-03: PDF 预验证结果数据类
+@dataclass
+class PDFValidationResult:
+    """PDF 预验证结果，用于在提取前检测潜在问题"""
+    is_valid: bool               # 是否可以正常处理
+    page_count: int              # 页数
+    has_text_layer: bool         # 是否有文本层
+    text_layer_ratio: float      # 有文本层的页面占比（0.0~1.0）
+    is_encrypted: bool           # 是否加密
+    pdf_version: str             # PDF 版本
+    file_size_mb: float          # 文件大小（MB）
+    warnings: List[str]          # 警告列表
+    errors: List[str]            # 错误列表
+    
+    def __str__(self) -> str:
+        status = "VALID" if self.is_valid else "INVALID"
+        return (f"PDFValidationResult({status}, pages={self.page_count}, "
+                f"text_ratio={self.text_layer_ratio:.1%}, encrypted={self.is_encrypted})")
+
+
+# P1-04: 质量问题数据类
+@dataclass
+class QualityIssue:
+    """质量问题记录"""
+    level: str        # 'error' | 'warning' | 'info'
+    category: str     # 'count_mismatch' | 'size_anomaly' | 'numbering_gap' | 'continued_incomplete'
+    message: str      # 问题描述
+    details: Dict[str, Any] = None  # 详细信息（可选）
+    
+    def __post_init__(self):
+        if self.details is None:
+            self.details = {}
 
 
 @dataclass
@@ -2209,12 +2522,28 @@ def extract_figures(
                     ink_b = 0.0
                 above_total += 0.6 * ink_a + 0.4 * obj_ratio(clip_above)
                 below_total += 0.6 * ink_b + 0.4 * obj_ratio(clip_below)
-        if below_total > above_total * (1.0 + ga_margin):
+        # P1-05: 全局锚点微弱优势回退 - 当差距很小时回退到按页独立决策
+        total_score = above_total + below_total
+        if total_score > 0:
+            score_diff_ratio = abs(below_total - above_total) / total_score
+        else:
+            score_diff_ratio = 0
+        
+        CLOSE_MARGIN = 0.05  # 5% 以内视为"势均力敌"
+        
+        if score_diff_ratio < CLOSE_MARGIN:
+            # 差距太小，不使用全局方向，按页独立决策
+            global_side = None
+            print(f"[INFO] Global figure anchor: UNDECIDED (diff={score_diff_ratio:.1%} < {CLOSE_MARGIN:.0%}, using per-page decision)")
+        elif below_total > above_total * (1.0 + ga_margin):
             global_side = 'below'
+            print(f"[INFO] Global figure anchor: BELOW (below={below_total:.2f} vs above={above_total:.2f}, diff={score_diff_ratio:.1%})")
         elif above_total > below_total * (1.0 + ga_margin):
             global_side = 'above'
+            print(f"[INFO] Global figure anchor: ABOVE (above={above_total:.2f} vs below={below_total:.2f}, diff={score_diff_ratio:.1%})")
         else:
             global_side = None
+            print(f"[INFO] Global figure anchor: AUTO (no clear preference, diff={score_diff_ratio:.1%})")
     # === 存储智能选择的结果（用于跨页查找）===
     smart_caption_cache: Dict[int, Tuple[fitz.Rect, str, int]] = {}  # {fig_no: (rect, caption, page_num)}
     
@@ -3067,13 +3396,41 @@ def write_manifest(records: List[AttachmentRecord], manifest_path: Optional[str]
     return manifest_path
 
 
+def _load_index_json_items(index_json_path: str) -> List[Dict[str, Any]]:
+    """
+    兼容层：从 index.json 中加载 items 列表，同时支持旧格式（list）和新格式（dict）。
+    
+    旧格式: [{"type": ..., "id": ..., "file": ...}, ...]
+    新格式: {"version": "2.0", "items": [...], "figures": [...], "tables": [...], ...}
+    
+    Returns:
+        items 列表
+    """
+    import json
+    with open(index_json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    
+    if isinstance(data, list):
+        # 旧格式：直接是 items 列表
+        return data
+    elif isinstance(data, dict):
+        # 新格式：从 "items" 字段获取，或合并 "figures" + "tables"
+        if "items" in data:
+            return data["items"]
+        else:
+            # 兜底：合并 figures 和 tables
+            figures = data.get("figures", [])
+            tables = data.get("tables", [])
+            return figures + tables
+    else:
+        return []
+
+
 def prune_unindexed_images(*, out_dir: str, index_json_path: str) -> int:
     """Remove Figure_*/Table_* PNGs in out_dir that are NOT referenced by index_json_path."""
     try:
-        import json
         base_dir = os.path.dirname(os.path.abspath(index_json_path))
-        with open(index_json_path, "r", encoding="utf-8") as f:
-            items = json.load(f)
+        items = _load_index_json_items(index_json_path)
         referenced_abs: set[str] = set()
         for it in items:
             rel = (it.get("file") or "").replace("\\", "/")
@@ -3141,24 +3498,120 @@ def get_unique_path(base_path: str) -> Tuple[str, bool]:
 
 
 # ---- JSON 索引：images/index.json ----
-def write_index_json(records: List[AttachmentRecord], index_path: str) -> Optional[str]:
+# P1-06: 扩展版 index.json 写入函数
+def write_index_json(
+    records: List[AttachmentRecord],
+    index_path: str,
+    *,
+    # P1-06: 可选的元数据参数
+    pdf_path: Optional[str] = None,
+    preset: Optional[str] = None,
+    layout_model: Optional["DocumentLayoutModel"] = None,
+    validation: Optional["PDFValidationResult"] = None,
+    qc_issues: Optional[List["QualityIssue"]] = None,
+    extractor_version: str = "2.0.0"
+) -> Optional[str]:
+    """
+    写入扩展版 index.json，包含元数据便于复现和诊断。
+    
+    P1-06: 新增字段
+    - version: index 格式版本
+    - meta: PDF 信息、提取时间、版本、preset 等
+    - layout: 版式信息（如果启用了 layout-driven）
+    - quality_issues: 质量检查结果
+    - figures/tables: 分开的图表列表
+    """
     import json
+    from datetime import datetime
+    import hashlib
+    
     base_dir = os.path.dirname(os.path.abspath(index_path))
     os.makedirs(base_dir, exist_ok=True)
-    out: List[Dict[str, Any]] = []
+    
+    # 计算 PDF 文件哈希（用于可复现性验证）
+    pdf_hash = ""
+    pdf_pages = 0
+    if pdf_path and os.path.exists(pdf_path):
+        try:
+            with open(pdf_path, 'rb') as f:
+                pdf_hash = f"sha256:{hashlib.sha256(f.read()).hexdigest()[:16]}"
+            doc = fitz.open(pdf_path)
+            pdf_pages = len(doc)
+            doc.close()
+        except Exception:
+            pass
+    
+    # 构建记录列表
+    figures_list: List[Dict[str, Any]] = []
+    tables_list: List[Dict[str, Any]] = []
+    
     for r in records:
         rel = os.path.relpath(os.path.abspath(r.out_path), base_dir).replace('\\', '/')
-        out.append({
+        entry = {
             "type": r.kind,
             "id": r.ident,
             "page": r.page,
             "caption": r.caption,
             "file": rel,
             "continued": bool(r.continued),
-        })
+        }
+        if r.kind == 'figure':
+            figures_list.append(entry)
+        else:
+            tables_list.append(entry)
+    
+    # 构建输出结构
+    output: Dict[str, Any] = {
+        "version": "2.0",
+        "meta": {
+            "pdf": os.path.basename(pdf_path) if pdf_path else "",
+            "pdf_hash": pdf_hash,
+            "pages": pdf_pages,
+            "extracted_at": datetime.now().isoformat(),
+            "extractor_version": extractor_version,
+            "preset": preset or "custom"
+        },
+        "figures": figures_list,
+        "tables": tables_list,
+    }
+    
+    # 添加版式信息（如果有）
+    if layout_model is not None:
+        output["layout"] = {
+            "columns": layout_model.num_columns,
+            "typical_line_height": round(layout_model.typical_line_height, 2),
+            "typical_font_size": round(layout_model.typical_font_size, 2),
+            "page_size": [round(layout_model.page_size[0], 1), round(layout_model.page_size[1], 1)],
+        }
+    
+    # 添加验证信息（如果有）
+    if validation is not None:
+        output["validation"] = {
+            "is_valid": validation.is_valid,
+            "has_text_layer": validation.has_text_layer,
+            "text_layer_ratio": round(validation.text_layer_ratio, 2),
+            "warnings": validation.warnings,
+        }
+    
+    # 添加质量问题（如果有）
+    if qc_issues:
+        output["quality_issues"] = [
+            {
+                "level": issue.level,
+                "category": issue.category,
+                "message": issue.message,
+            }
+            for issue in qc_issues
+        ]
+    
+    # 兼容性：保留 items 字段（旧版格式）
+    all_items = figures_list + tables_list
+    output["items"] = all_items
+    
     with open(index_path, 'w', encoding='utf-8') as f:
-        json.dump(out, f, ensure_ascii=False, indent=2)
-    print(f"[INFO] Wrote index: {index_path} (items={len(out)})")
+        json.dump(output, f, ensure_ascii=False, indent=2)
+    
+    print(f"[INFO] Wrote index: {index_path} (figures={len(figures_list)}, tables={len(tables_list)})")
     return index_path
 
 
@@ -3605,15 +4058,28 @@ def extract_tables(
                 score_b = 0.4 * ink_b + 0.25 * min(1.0, cols_b) + 0.2 * line_b + 0.15 * obj_b
                 above_total_tbl += score_a
                 below_total_tbl += score_b
-        if below_total_tbl > above_total_tbl * (1.0 + ga_margin_tbl):
+        # P1-05: 全局锚点微弱优势回退（表格）
+        total_score_tbl = above_total_tbl + below_total_tbl
+        if total_score_tbl > 0:
+            score_diff_ratio_tbl = abs(below_total_tbl - above_total_tbl) / total_score_tbl
+        else:
+            score_diff_ratio_tbl = 0
+        
+        CLOSE_MARGIN_TBL = 0.05  # 5% 以内视为"势均力敌"
+        
+        if score_diff_ratio_tbl < CLOSE_MARGIN_TBL:
+            # 差距太小，不使用全局方向，按页独立决策
+            global_side_table = None
+            print(f"[INFO] Global table anchor: UNDECIDED (diff={score_diff_ratio_tbl:.1%} < {CLOSE_MARGIN_TBL:.0%}, using per-page decision)")
+        elif below_total_tbl > above_total_tbl * (1.0 + ga_margin_tbl):
             global_side_table = 'below'
-            print(f"[INFO] Global table anchor: BELOW (below={below_total_tbl:.2f} vs above={above_total_tbl:.2f})")
+            print(f"[INFO] Global table anchor: BELOW (below={below_total_tbl:.2f} vs above={above_total_tbl:.2f}, diff={score_diff_ratio_tbl:.1%})")
         elif above_total_tbl > below_total_tbl * (1.0 + ga_margin_tbl):
             global_side_table = 'above'
-            print(f"[INFO] Global table anchor: ABOVE (above={above_total_tbl:.2f} vs below={below_total_tbl:.2f})")
+            print(f"[INFO] Global table anchor: ABOVE (above={above_total_tbl:.2f} vs below={below_total_tbl:.2f}, diff={score_diff_ratio_tbl:.1%})")
         else:
             global_side_table = None
-            print(f"[INFO] Global table anchor: AUTO (no clear preference)")
+            print(f"[INFO] Global table anchor: AUTO (no clear preference, diff={score_diff_ratio_tbl:.1%})")
     
     # === Cache for smart-selected table captions ===
     smart_caption_cache_table: Dict[str, Tuple[fitz.Rect, str, int]] = {}
@@ -4957,6 +5423,317 @@ def _adjust_clip_with_layout(
     return adjusted_clip
 
 
+# P1-01: Auto-detect whether to enable layout-driven extraction
+def _should_enable_layout_driven(pdf_path: str, debug: bool = False) -> Tuple[bool, str]:
+    """
+    快速预扫描 PDF，判断是否需要启用版式驱动提取。
+    
+    检测标准（满足任一即启用）：
+    1. 双栏布局
+    2. 图表附近存在密集正文段落
+    3. 页面文本区块复杂度高
+    
+    Args:
+        pdf_path: PDF 文件路径
+        debug: 调试模式
+    
+    Returns:
+        (enable, reason): 是否启用，以及原因说明
+    """
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception as e:
+        return False, f"cannot open PDF: {e}"
+    
+    try:
+        # 采样前 5 页（或全部，取较小者）
+        sample_count = min(5, len(doc))
+        
+        # 统计双栏特征
+        dual_column_pages = 0
+        dense_text_pages = 0
+        figure_with_dense_text = 0
+        
+        for pno in range(sample_count):
+            page = doc[pno]
+            page_rect = page.rect
+            page_width = page_rect.width
+            
+            # 获取文本块
+            blocks = page.get_text("dict")["blocks"]
+            text_blocks = [b for b in blocks if b.get("type") == 0]  # type=0 是文本块
+            
+            if not text_blocks:
+                continue
+            
+            # 检测双栏布局：统计文本块的 x 中心分布
+            x_centers = []
+            for block in text_blocks:
+                bbox = block.get("bbox", (0, 0, 0, 0))
+                x_center = (bbox[0] + bbox[2]) / 2
+                x_centers.append(x_center)
+            
+            if x_centers:
+                # 双栏检测：x 中心是否明显分布在页面左右两侧
+                left_count = sum(1 for x in x_centers if x < page_width * 0.4)
+                right_count = sum(1 for x in x_centers if x > page_width * 0.6)
+                if left_count >= 3 and right_count >= 3:
+                    dual_column_pages += 1
+            
+            # 检测文本密度
+            total_text_area = sum(
+                (b["bbox"][2] - b["bbox"][0]) * (b["bbox"][3] - b["bbox"][1])
+                for b in text_blocks
+            )
+            page_area = page_rect.width * page_rect.height
+            text_density = total_text_area / page_area if page_area > 0 else 0
+            
+            if text_density > 0.4:  # 文本覆盖超过 40%
+                dense_text_pages += 1
+            
+            # 检测图表附近是否有密集文本
+            # 简单启发：如果页面有图片且文本密度高，认为是复杂布局
+            images = page.get_images(full=True)
+            if images and text_density > 0.3:
+                figure_with_dense_text += 1
+        
+        doc.close()
+        
+        # 判定逻辑
+        if dual_column_pages >= sample_count * 0.5:
+            return True, f"dual-column layout detected ({dual_column_pages}/{sample_count} pages)"
+        
+        if figure_with_dense_text >= 2:
+            return True, f"dense text near figures ({figure_with_dense_text} pages)"
+        
+        if dense_text_pages >= sample_count * 0.6:
+            return True, f"high text density ({dense_text_pages}/{sample_count} pages)"
+        
+        return False, "simple layout, layout-driven not needed"
+        
+    except Exception as e:
+        doc.close()
+        return False, f"detection error: {e}"
+
+
+# P1-02: Gathering 阶段 - 结构化文本提取
+@dataclass
+class GatheredParagraph:
+    """结构化段落"""
+    text: str                    # 段落文本
+    page: int                    # 页码（1-based）
+    bbox: Tuple[float, float, float, float]  # 边界框 (x0, y0, x1, y1)
+    paragraph_type: str          # 'heading' | 'body' | 'caption' | 'list' | 'equation'
+    column: int                  # 栏位（0=左栏/单栏，1=右栏）
+    order: int                   # 阅读顺序
+
+
+@dataclass
+class GatheredText:
+    """结构化文本结果"""
+    paragraphs: List[GatheredParagraph]
+    headers_removed: List[str]   # 被剔除的页眉
+    footers_removed: List[str]   # 被剔除的页脚
+    is_dual_column: bool         # 是否双栏
+    page_count: int              # 总页数
+
+
+def gather_structured_text(
+    pdf_path: str,
+    out_json: Optional[str] = None,
+    debug: bool = False
+) -> GatheredText:
+    """
+    P1-02: 结构化文本提取（Gathering 阶段）
+    
+    功能：
+    1. Header/footer 检测与剔除（基于重复行/位置）
+    2. 双栏顺序重排（基于 x 坐标与列检测）
+    3. 段落分类（标题/正文/图注/列表）
+    
+    Args:
+        pdf_path: PDF 文件路径
+        out_json: 输出 JSON 路径（可选）
+        debug: 调试模式
+    
+    Returns:
+        GatheredText 结构化结果
+    """
+    import json
+    from collections import Counter
+    
+    doc = fitz.open(pdf_path)
+    page_count = len(doc)
+    
+    # Step 1: 收集所有页面的文本块
+    all_blocks: List[Dict[str, Any]] = []
+    header_candidates: List[str] = []
+    footer_candidates: List[str] = []
+    
+    for pno in range(page_count):
+        page = doc[pno]
+        page_rect = page.rect
+        page_height = page_rect.height
+        
+        # 获取文本块
+        blocks = page.get_text("dict")["blocks"]
+        
+        for block in blocks:
+            if block.get("type") != 0:  # 只处理文本块
+                continue
+            
+            bbox = block.get("bbox", (0, 0, 0, 0))
+            lines = block.get("lines", [])
+            
+            # 提取文本
+            block_text = ""
+            for line in lines:
+                for span in line.get("spans", []):
+                    block_text += span.get("text", "")
+                block_text += "\n"
+            block_text = block_text.strip()
+            
+            if not block_text:
+                continue
+            
+            # 检测页眉页脚候选（顶部/底部 5% 区域的短文本）
+            y_center = (bbox[1] + bbox[3]) / 2
+            if y_center < page_height * 0.05:  # 顶部 5%
+                if len(block_text) < 100:
+                    header_candidates.append(block_text)
+            elif y_center > page_height * 0.95:  # 底部 5%
+                if len(block_text) < 100:
+                    footer_candidates.append(block_text)
+            
+            all_blocks.append({
+                "page": pno + 1,
+                "bbox": bbox,
+                "text": block_text,
+                "lines": lines
+            })
+    
+    # Step 2: 检测重复的页眉页脚
+    header_counter = Counter(header_candidates)
+    footer_counter = Counter(footer_candidates)
+    
+    # 出现超过 30% 页数的文本视为页眉/页脚
+    threshold = max(2, page_count * 0.3)
+    headers_to_remove = {text for text, count in header_counter.items() if count >= threshold}
+    footers_to_remove = {text for text, count in footer_counter.items() if count >= threshold}
+    
+    if debug:
+        print(f"[DEBUG] Detected headers to remove: {headers_to_remove}")
+        print(f"[DEBUG] Detected footers to remove: {footers_to_remove}")
+    
+    # Step 3: 检测双栏布局
+    # 统计文本块的 x 中心分布
+    x_centers = [(b["bbox"][0] + b["bbox"][2]) / 2 for b in all_blocks]
+    if x_centers:
+        page_width = doc[0].rect.width
+        left_count = sum(1 for x in x_centers if x < page_width * 0.45)
+        right_count = sum(1 for x in x_centers if x > page_width * 0.55)
+        is_dual_column = left_count > len(x_centers) * 0.3 and right_count > len(x_centers) * 0.3
+    else:
+        is_dual_column = False
+    
+    if debug:
+        print(f"[DEBUG] Dual column detected: {is_dual_column}")
+    
+    # Step 4: 构建段落列表（剔除页眉页脚，按阅读顺序排序）
+    paragraphs: List[GatheredParagraph] = []
+    
+    for block in all_blocks:
+        text = block["text"]
+        
+        # 剔除页眉页脚
+        if text in headers_to_remove or text in footers_to_remove:
+            continue
+        
+        bbox = block["bbox"]
+        page = block["page"]
+        
+        # 确定栏位
+        if is_dual_column:
+            page_width = doc[0].rect.width
+            x_center = (bbox[0] + bbox[2]) / 2
+            column = 0 if x_center < page_width * 0.5 else 1
+        else:
+            column = 0
+        
+        # 简单段落类型检测
+        lines = block.get("lines", [])
+        first_span = lines[0]["spans"][0] if lines and lines[0].get("spans") else {}
+        font_size = first_span.get("size", 10)
+        font_flags = first_span.get("flags", 0)
+        is_bold = bool(font_flags & 2 ** 4)  # bit 4 = bold
+        
+        # 启发式分类
+        if len(text) < 50 and is_bold:
+            para_type = "heading"
+        elif text.lower().startswith(("figure", "fig.", "table", "图", "表")):
+            para_type = "caption"
+        elif text.startswith(("•", "-", "*", "1.", "2.", "(1)", "(a)")):
+            para_type = "list"
+        else:
+            para_type = "body"
+        
+        paragraphs.append(GatheredParagraph(
+            text=text,
+            page=page,
+            bbox=bbox,
+            paragraph_type=para_type,
+            column=column,
+            order=0  # 稍后计算
+        ))
+    
+    # Step 5: 计算阅读顺序
+    # 排序规则：页码 → 栏位 → y 坐标
+    paragraphs.sort(key=lambda p: (p.page, p.column, p.bbox[1]))
+    for i, para in enumerate(paragraphs):
+        para.order = i
+    
+    doc.close()
+    
+    result = GatheredText(
+        paragraphs=paragraphs,
+        headers_removed=list(headers_to_remove),
+        footers_removed=list(footers_to_remove),
+        is_dual_column=is_dual_column,
+        page_count=page_count
+    )
+    
+    # 输出 JSON
+    if out_json:
+        output = {
+            "version": "1.0",
+            "is_dual_column": result.is_dual_column,
+            "page_count": result.page_count,
+            "headers_removed": result.headers_removed,
+            "footers_removed": result.footers_removed,
+            "paragraphs": [
+                {
+                    "text": p.text,
+                    "page": p.page,
+                    "bbox": list(p.bbox),
+                    "type": p.paragraph_type,
+                    "column": p.column,
+                    "order": p.order
+                }
+                for p in result.paragraphs
+            ]
+        }
+        out_dir = os.path.dirname(out_json)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        with open(out_json, 'w', encoding='utf-8') as f:
+            json.dump(output, f, ensure_ascii=False, indent=2)
+        
+        if debug:
+            print(f"[INFO] Wrote gathered text: {out_json} ({len(paragraphs)} paragraphs)")
+    
+    return result
+
+
 def extract_text_with_format(
     pdf_path: str,
     out_json: Optional[str] = None,
@@ -5174,7 +5951,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--debug-visual", action="store_true", help="Enable visual debugging mode: save multi-stage boundary boxes overlaid on full page (output to images/debug/)")
     
     # Layout-driven extraction (V2 Architecture - NEW)
-    p.add_argument("--layout-driven", action="store_true", help="Enable layout-driven extraction (V2): build document layout model first, then use it to guide figure/table extraction (experimental)")
+    # P1-01: Layout-driven extraction with three-state control (auto|on|off)
+    # nargs='?' + const='on' 保持向后兼容：--layout-driven (无值) 等价于 --layout-driven on
+    p.add_argument("--layout-driven", nargs='?', const="on", default="auto", choices=["auto", "on", "off"],
+                   help="Layout-driven extraction mode (V2): 'auto'=enable for complex layouts (dual-column/dense text near figures), 'on'=always enable, 'off'=disable; flag-style '--layout-driven' equals '--layout-driven on' (default: auto)")
     p.add_argument("--layout-json", default=None, help="Path to save/load layout model JSON (default: <out_dir>/layout_model.json)")
     
     # Adaptive line height
@@ -5248,6 +6028,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"[ERROR] PDF not found: {pdf_path}", file=sys.stderr)
         return 2
 
+    # P1-03: PDF 预验证阶段
+    validation = pre_validate_pdf(pdf_path)
+    print(f"[INFO] PDF Validation: {validation}")
+    if validation.warnings:
+        for warn in validation.warnings:
+            print(f"[WARN] {warn}")
+    if not validation.is_valid:
+        for err in validation.errors:
+            print(f"[ERROR] {err}", file=sys.stderr)
+        return 3
+
     # --- P0-01：辅助 - 显式参数检测（支持 main(argv=...) 程序化调用） ---
     argv_for_cli_check = list(argv) if argv is not None else sys.argv[1:]
 
@@ -5274,6 +6065,23 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Extract text by default（若安装 pdfminer.six 且指定 out-text，默认尝试提取文本）
     try_extract_text(pdf_path, out_text)
+    
+    # P1-02: Gathering 阶段 - 生成结构化文本
+    gathered_text_path = os.path.join(os.path.dirname(out_text), "gathered_text.json") if out_text else None
+    gathered_text = None
+    try:
+        if gathered_text_path:
+            gathered_text = gather_structured_text(
+                pdf_path=pdf_path,
+                out_json=gathered_text_path,
+                debug=args.debug_captions
+            )
+            print(f"[INFO] Gathered text: {len(gathered_text.paragraphs)} paragraphs, "
+                  f"dual_column={gathered_text.is_dual_column}, "
+                  f"headers_removed={len(gathered_text.headers_removed)}, "
+                  f"footers_removed={len(gathered_text.footers_removed)}")
+    except Exception as e:
+        print(f"[WARN] Gathering failed: {e}")
 
     # Apply presets if requested
     if getattr(args, "preset", None) == "robust":
@@ -5351,8 +6159,27 @@ def main(argv: Optional[List[str]] = None) -> int:
         os.environ['DUMP_CANDIDATES'] = '1'
 
     # Build layout model if --layout-driven is enabled (V2 Architecture)
+    # P1-01: Build layout model with three-state control (auto|on|off)
     layout_model: Optional[DocumentLayoutModel] = None
-    if args.layout_driven:
+    layout_driven_mode = getattr(args, 'layout_driven', 'auto')
+    enable_layout_driven = False
+    
+    if layout_driven_mode == 'on':
+        enable_layout_driven = True
+        print("[INFO] Layout-driven extraction: ENABLED (explicit --layout-driven on)")
+    elif layout_driven_mode == 'off':
+        enable_layout_driven = False
+        print("[INFO] Layout-driven extraction: DISABLED (explicit --layout-driven off)")
+    elif layout_driven_mode == 'auto':
+        # P1-01: Auto-detect whether to enable layout-driven extraction
+        # Criteria: dual-column layout, or dense text near figure/table areas
+        enable_layout_driven, auto_reason = _should_enable_layout_driven(pdf_path, debug=args.debug_captions)
+        if enable_layout_driven:
+            print(f"[INFO] Layout-driven extraction: AUTO-ENABLED ({auto_reason})")
+        else:
+            print(f"[INFO] Layout-driven extraction: AUTO-SKIPPED ({auto_reason})")
+    
+    if enable_layout_driven:
         print("\n" + "=" * 70)
         print("LAYOUT-DRIVEN EXTRACTION (V2 Architecture)")
         print("=" * 70)
@@ -5364,8 +6191,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         layout_model = extract_text_with_format(
             pdf_path=pdf_path,
             out_json=layout_json_path,
-            sample_pages=None,  # Analyze全部页面
-            debug=args.debug_captions  # 复用debug_captions开关
+            sample_pages=None,  # Analyze 全部页面
+            debug=args.debug_captions  # 复用 debug_captions 开关
         )
         
         print(f"[INFO] Layout model built successfully")
@@ -5495,10 +6322,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     # 统一排序：按页码 → Figure 优先 → 编号/标识
     all_records.sort(key=lambda r: (r.page, 0 if r.kind == 'figure' else 1, r.num_key(), r.ident))
 
+    # P1-04: 独立质量检查阶段（在写入 index.json 之前执行，以便写入 QC 结果）
+    qc_issues = quality_check(all_records, pdf_path, out_text)
+
     # 写出 index.json（默认 images/index.json）
     index_json_path = args.index_json or os.path.join(out_dir, 'index.json')
     try:
-        write_index_json(all_records, index_json_path)
+        # P1-06: 使用扩展版 index.json，包含元数据和 QC 结果
+        write_index_json(
+            all_records,
+            index_json_path,
+            pdf_path=pdf_path,
+            preset=getattr(args, 'preset', None),
+            layout_model=layout_model,
+            validation=validation,
+            qc_issues=qc_issues  # 包含 QC 结果
+        )
     except Exception as e:
         print(f"[WARN] Write index.json failed: {e}")
 
@@ -5506,6 +6345,25 @@ def main(argv: Optional[List[str]] = None) -> int:
     if getattr(args, "prune_images", False):
         removed = prune_unindexed_images(out_dir=out_dir, index_json_path=index_json_path)
         print(f"[INFO] Pruned unindexed images: {removed}")
+    if qc_issues:
+        print("\n" + "=" * 50)
+        print("QUALITY CHECK RESULTS")
+        print("=" * 50)
+        errors = [i for i in qc_issues if i.level == 'error']
+        warnings = [i for i in qc_issues if i.level == 'warning']
+        infos = [i for i in qc_issues if i.level == 'info']
+        
+        for issue in errors:
+            print(f"[ERROR] {issue.message}")
+        for issue in warnings:
+            print(f"[WARN] {issue.message}")
+        for issue in infos:
+            print(f"[INFO] {issue.message}")
+        
+        print(f"\nQC Summary: {len(errors)} errors, {len(warnings)} warnings, {len(infos)} info")
+        print("=" * 50 + "\n")
+    else:
+        print("[INFO] Quality check passed: no issues found")
 
     # Manifest：若用户指定 --manifest，则将记录写入 CSV
     write_manifest(all_records, args.manifest)
