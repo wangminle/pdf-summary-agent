@@ -2,10 +2,17 @@
 """
 Sync images/index.json after manual/AI renaming of Figure_/Table_ PNGs.
 
+P1-10 + QA-05 增强：支持记录 original_file 和 current_file 映射关系，便于审计与回滚。
+
 Typical workflow:
   1) extract -> images/index.json + temporary filenames
   2) rename PNGs to final descriptive names (keep Figure_N_/Table_N_ prefix)
   3) run this script to update index.json "file" fields
+
+New features (P1-10):
+  - Records original_file and current_file in index.json
+  - Validates all files exist after sync
+  - Warns on missing files
 """
 
 from __future__ import annotations
@@ -127,27 +134,47 @@ def main() -> int:
 
     changed = 0
     missing = 0
+    missing_items = []
+    
     for it in items:
         if not isinstance(it, dict):
             continue
         resolved = resolve_image_file(images_dir, it)
         if not resolved:
             missing += 1
+            missing_items.append(f"{it.get('type')} {it.get('id')} p{it.get('page')}")
             continue
         new_rel = resolved.relative_to(images_dir).as_posix()
         old_rel = (it.get("file") or "").replace("\\", "/")
+        
         if new_rel != old_rel:
             changed += 1
             print(f"[UPDATE] {it.get('type')} {it.get('id')} p{it.get('page')}: '{old_rel}' -> '{new_rel}'")
+            
+            # P1-10 + QA-05: 记录 original_file（仅首次重命名时记录）
+            if "original_file" not in it:
+                it["original_file"] = old_rel
+            
             it["file"] = new_rel
+            it["current_file"] = new_rel  # 当前生效文件名
 
     if args.dry_run:
         print(f"[DRY-RUN] Would update {changed} entries, missing={missing}")
+        if missing_items:
+            print(f"[WARN] Missing files for: {', '.join(missing_items)}")
         return 0
 
     # 兼容新旧格式写入
     _save_index_json(index_path, items, original_dict)
     print(f"[OK] Synced index: {index_path} (updated={changed}, missing={missing})")
+    
+    # 验证一致性
+    if missing > 0:
+        print(f"[WARN] {missing} items have missing files:")
+        for item in missing_items:
+            print(f"  - {item}")
+        print("[HINT] These entries may need manual attention or re-extraction")
+    
     return 0
 
 

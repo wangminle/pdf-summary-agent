@@ -408,37 +408,186 @@ def _limit_words_after_prefix(filename: str, prefix_pattern: str, max_words: int
     return '_'.join(prefix_parts + desc_parts)
 
 
-# --- P0-03 修复：从正则匹配结果中提取完整的图表标识符 ---
+# --- P0-03 + P1-08 修复：从正则匹配结果中提取完整的图表标识符 ---
 def _extract_figure_ident(match: re.Match) -> str:
     """
     从 figure_line_re 的匹配结果中提取完整的图表标识符。
     
-    匹配组结构（P0-03 更新后）：
-      group(1): S 前缀（可选），如 "S" 或 None
-      group(2): 数字编号，如 "1", "2"
+    支持两种捕获结构：
+    1) 旧的分组结构（group 1..4）：
+       group(1): S 前缀（可选），如 "S" 或 None
+       group(2): S前缀后的数字编号，如 "1", "2"
+       group(3): 罗马数字编号，如 "I", "II", "III"
+       group(4): 普通数字编号，如 "1", "2"
+    2) 新的命名分组结构（推荐）：
+       label:  图注类型前缀（含 Supplementary/Extended Data 等）
+       s_prefix/s_id: S 前缀 + 编号（阿拉伯或罗马）
+       roman/num: 普通罗马/阿拉伯编号
     
     Returns:
-        完整标识符，如 "S1", "1", "S2" 等
+        完整标识符，如 "S1", "1", "S2", "I", "II", "SIV" 等
     """
-    s_prefix = match.group(1) or ""
-    number = match.group(2) or ""
-    return (s_prefix + number).strip()
+    # --- 新结构：命名分组（优先）---
+    try:
+        if getattr(match.re, "groupindex", None) and match.re.groupindex:
+            label = (match.groupdict().get("label") or "").strip().lower()
+            is_supp_kw = label.startswith("supplementary")
+
+            s_prefix = (match.groupdict().get("s_prefix") or "").strip()
+            s_id = (match.groupdict().get("s_id") or "").strip()
+            roman = (match.groupdict().get("roman") or "").strip()
+            number = (match.groupdict().get("num") or "").strip()
+
+            ident = ""
+            if s_prefix and s_id:
+                ident = f"S{s_id}".strip().upper()
+            elif roman:
+                ident = roman.upper()
+            elif number:
+                ident = number
+
+            # "Supplementary Figure IV" / "Supplementary Figure 1" 等：强制补齐 S 前缀，避免与正文 Figure 冲突
+            if is_supp_kw and ident and (not ident.upper().startswith("S")):
+                ident = f"S{ident}".upper()
+            return ident.strip()
+    except Exception:
+        # 命名分组失败则回退到旧逻辑
+        pass
+
+    # --- 旧结构：按 group(1..4) 回退 ---
+    # 优先匹配 S前缀+数字（兼容旧版只支持 S+digits 的情况）
+    try:
+        s_prefix = match.group(1) or ""
+        s_number = match.group(2) or ""
+        if s_prefix and s_number:
+            return (s_prefix + s_number).strip()
+    except Exception:
+        pass
+
+    # 其次匹配罗马数字
+    try:
+        roman = match.group(3) or ""
+        if roman:
+            return roman.strip().upper()
+    except Exception:
+        pass
+
+    # 最后匹配普通数字
+    try:
+        number = match.group(4) or ""
+        return number.strip()
+    except Exception:
+        return ""
+
+
+def _extract_table_ident(match: re.Match) -> str:
+    """
+    从 table_line_re 的匹配结果中提取完整的表格标识符。
+
+    兼容：
+    - 新的命名分组结构（label/s_prefix/s_id/letter_id/roman/num）
+    - 旧的分组结构（group 1..3）
+
+    Returns:
+        表格标识符，如 "1", "S1", "A1", "IV", "SIV" 等
+    """
+    # --- 新结构：命名分组（优先）---
+    try:
+        if getattr(match.re, "groupindex", None) and match.re.groupindex:
+            gd = match.groupdict()
+            label = (gd.get("label") or "").strip().lower()
+            is_supp_kw = label.startswith("supplementary")
+
+            s_prefix = (gd.get("s_prefix") or "").strip()
+            s_id = (gd.get("s_id") or "").strip()
+            letter_id = (gd.get("letter_id") or "").strip()
+            roman = (gd.get("roman") or "").strip()
+            number = (gd.get("num") or "").strip()
+
+            ident = ""
+            if s_prefix and s_id:
+                ident = f"S{s_id}".strip().upper()
+            elif letter_id:
+                ident = letter_id.strip().upper()
+            elif roman:
+                ident = roman.strip().upper()
+            elif number:
+                ident = number.strip()
+
+            if is_supp_kw and ident and (not ident.upper().startswith("S")):
+                ident = f"S{ident}".upper()
+            return ident.strip()
+    except Exception:
+        pass
+
+    # --- 旧结构：按 group(1..3) 回退 ---
+    for idx in (1, 2, 3):
+        try:
+            value = match.group(idx)
+        except IndexError:
+            continue
+        except Exception:
+            continue
+        if value:
+            return str(value).strip()
+    return ""
+
+
+def _roman_to_int(roman: str) -> int:
+    """
+    P1-08: 罗马数字转阿拉伯数字。
+    
+    Examples:
+        "I" -> 1, "II" -> 2, "III" -> 3, "IV" -> 4, "V" -> 5,
+        "VI" -> 6, "VII" -> 7, "VIII" -> 8, "IX" -> 9, "X" -> 10
+    """
+    roman_map = {'I': 1, 'V': 5, 'X': 10, 'L': 50, 'C': 100, 'D': 500, 'M': 1000}
+    roman = roman.upper()
+    result = 0
+    prev = 0
+    for char in reversed(roman):
+        val = roman_map.get(char, 0)
+        if val < prev:
+            result -= val
+        else:
+            result += val
+        prev = val
+    return result
+
+
+def _is_roman_numeral(s: str) -> bool:
+    """P1-08: 检查字符串是否为有效的罗马数字。"""
+    if not s:
+        return False
+    return bool(re.match(r'^[IVXLCDMivxlcdm]+$', s))
 
 
 def _parse_figure_ident(ident: str) -> Tuple[bool, int]:
     """
     解析图表标识符，返回 (is_supplementary, numeric_part)。
     
+    P1-08 扩展：支持罗马数字。
+    
     Examples:
         "S1" -> (True, 1)
         "1" -> (False, 1)
         "S12" -> (True, 12)
+        "I" -> (False, 1)   # 罗马数字
+        "II" -> (False, 2)
+        "III" -> (False, 3)
     """
-    if ident.upper().startswith('S'):
-        try:
-            return True, int(ident[1:])
-        except ValueError:
-            return True, 0
+    if ident.upper().startswith('S') and len(ident) > 1:
+        rest = ident[1:].strip()
+        # 支持：S1 / S12
+        if rest.isdigit():
+            return True, int(rest)
+        # 支持：SIV / SX 等（附录罗马数字）
+        if _is_roman_numeral(rest):
+            return True, _roman_to_int(rest)
+        return True, 0
+    elif _is_roman_numeral(ident):
+        # 罗马数字：转换为阿拉伯数字
+        return False, _roman_to_int(ident)
     else:
         try:
             return False, int(ident)
@@ -1708,6 +1857,92 @@ def _build_text_masks_px(
     return masks
 
 
+# ---------- P1-07: 精裁验收阈值动态化 ----------
+@dataclass
+class AcceptanceThresholds:
+    """验收阈值配置（根据图表尺寸动态调整）"""
+    relax_h: float      # 高度保留比例阈值
+    relax_a: float      # 面积保留比例阈值
+    relax_ink: float    # 墨迹密度保留比例阈值
+    relax_cov: float    # 对象覆盖率保留比例阈值（用于 Figure）
+    relax_text: float   # 文本行数保留比例阈值（用于 Table）
+    description: str    # 阈值级别描述
+
+
+def _adaptive_acceptance_thresholds(
+    base_height: float,
+    *,
+    is_table: bool = False,
+    far_cov: float = 0.0,
+) -> AcceptanceThresholds:
+    """
+    P1-07: 根据基线高度和远侧覆盖率动态计算验收阈值。
+    
+    策略：
+    - 大图（>400pt）：允许更激进的精裁，因为大图有更多余量
+    - 中等图（200-400pt）：使用默认阈值
+    - 小图（<200pt）：更保守，避免过度裁切导致内容丢失
+    - 远侧文字覆盖率越高，允许缩小得越多（优先移除正文）
+    
+    Args:
+        base_height: 基线窗口高度（pt）
+        is_table: 是否为表格（表格使用更宽松的阈值）
+        far_cov: 远侧文字覆盖率（0.0-1.0）
+    
+    Returns:
+        AcceptanceThresholds 对象
+    """
+    # 基础阈值（根据尺寸分层）
+    if base_height > 400:
+        # 大图：可以更激进
+        base_h, base_a = (0.50, 0.45) if is_table else (0.55, 0.50)
+        base_ink, base_cov, base_text = 0.85, 0.80, 0.70
+        desc = "large"
+    elif base_height > 200:
+        # 中等图：默认阈值
+        base_h, base_a = (0.50, 0.45) if is_table else (0.60, 0.55)
+        base_ink, base_cov, base_text = 0.90, 0.85, 0.75
+        desc = "medium"
+    else:
+        # 小图：更保守
+        base_h, base_a = (0.65, 0.60) if is_table else (0.70, 0.65)
+        base_ink, base_cov, base_text = 0.92, 0.88, 0.80
+        desc = "small"
+    
+    # 根据远侧覆盖率进一步调整（远侧文字越多，允许缩小得越多）
+    # 这部分逻辑与原来的分层策略一致，但现在集中在一个函数中
+    if far_cov >= 0.60:  # 极高覆盖率（>60%）：很可能是大段正文
+        base_h = min(base_h, 0.35)
+        base_a = min(base_a, 0.25)
+        base_ink = min(base_ink, 0.70)
+        base_cov = min(base_cov, 0.70)
+        base_text = min(base_text, 0.55)
+        desc += "+high_far_cov"
+    elif far_cov >= 0.30:  # 高覆盖率（30-60%）：可能是多行段落
+        base_h = min(base_h, 0.45)
+        base_a = min(base_a, 0.35)
+        base_ink = min(base_ink, 0.75)
+        base_cov = min(base_cov, 0.75)
+        base_text = min(base_text, 0.60)
+        desc += "+med_far_cov"
+    elif far_cov >= 0.18:  # 中等覆盖率（18-30%）：少量文字
+        base_h = min(base_h, 0.50)
+        base_a = min(base_a, 0.40)
+        base_ink = min(base_ink, 0.80)
+        base_cov = min(base_cov, 0.80)
+        base_text = min(base_text, 0.65)
+        desc += "+low_far_cov"
+    
+    return AcceptanceThresholds(
+        relax_h=base_h,
+        relax_a=base_a,
+        relax_ink=base_ink,
+        relax_cov=base_cov,
+        relax_text=base_text,
+        description=desc
+    )
+
+
 # ---------- Paragraph/column heuristics for table scoring ----------
 def _paragraph_ratio(
     clip: fitz.Rect,
@@ -1959,19 +2194,16 @@ def find_all_caption_candidates(
                 # 尝试匹配 pattern
                 match = pattern.match(text_stripped)
                 if match:
-                    # --- P0-03 修复：根据 kind 提取正确的编号 ---
+                    # --- P0-03 + P1-08: 根据 kind 提取正确的编号（兼容多种捕获结构）---
                     if kind == 'figure':
-                        # Figure 正则：group(1) = S前缀（可选），group(2) = 数字
-                        s_prefix = match.group(1) or ""
-                        num_part = match.group(2) or ""
-                        number = (s_prefix + num_part).strip()
+                        number = _extract_figure_ident(match)
                     elif kind == 'table':
-                        # Table 正则：group(1) = 附录表(A1), group(2) = 罗马数字, group(3) = 普通数字
-                        # 取第一个非空的捕获组
-                        number = (match.group(1) or match.group(2) or match.group(3) or "").strip()
+                        number = _extract_table_ident(match)
                     else:
-                        # 其他类型：尝试 group(1)
-                        number = (match.group(1) or "").strip()
+                        try:
+                            number = (match.group(1) or "").strip()
+                        except Exception:
+                            number = ""
                     
                     if not number:
                         continue  # 跳过无效的编号
@@ -2248,12 +2480,12 @@ def build_caption_index(
     """
     # --- P0-03 修复：默认 pattern 使用更新后的捕获组结构 ---
     if figure_pattern is None:
-        # Figure 正则：group(1) = S前缀（可选），group(2) = 数字
+        # Figure 正则（命名分组）：与 extract_figures 内部的 figure_line_re 对齐，供 _extract_figure_ident 解析
         figure_pattern = re.compile(
-            r"^\s*(?:Extended\s+Data\s+Figure|Supplementary\s+Figure|Figure|Fig\.?|图表|附图|图)\s*"
-            r"(S)?\s*"                   # group(1): 可选的 S 前缀
-            r"(\d+)"                     # group(2): 数字编号
-            r"(?:\s*[A-Za-z]|\s*\([A-Za-z]\))?",  # 可选的子图标签
+            r"^\s*(?P<label>Extended\s+Data\s+Figure|Supplementary\s+(?:Figure|Fig\.?)|Figure|Fig\.?|图表|附图|图)\s*"
+            r"(?:(?P<s_prefix>S)\s*(?P<s_id>(?:\d+|[IVX]{1,6}))|(?P<roman>[IVX]{1,6})|(?P<num>\d+))"
+            r"(?:\s*[-–]?\s*[A-Za-z]|\s*\([A-Za-z]\))?"
+            r"(?:\s*\(continued\)|\s*续|\s*接上页)?",
             re.IGNORECASE
         )
     
@@ -2382,16 +2614,22 @@ def extract_figures(
     # 打开 PDF 文档并准备输出目录
     doc = fitz.open(pdf_path)
     os.makedirs(out_dir, exist_ok=True)
-    # --- P0-03 修复：匹配 "Figure N" 或 "图 N" 的图注起始行，支持 S 前缀和子图标签 ---
-    # 捕获组说明：
-    #   group(1): S 前缀（可选），如 "S" 或 None
-    #   group(2): 数字编号，如 "1", "2"
-    # 完整标识符：若 group(1) 存在则 "S" + group(2)，否则 group(2)
+    # --- P0-03 + P1-08 修复：匹配多种图注格式，支持 S 前缀、罗马数字、子图标签 ---
+    # 2025-12-23 补充：支持 Supplementary + 罗马数字（如 "Supplementary Figure IV" / "Figure SIV"）
+    # 命名分组说明（供 _extract_figure_ident 使用）：
+    #   label:  图注类型前缀（含 Supplementary/Extended Data 等）
+    #   s_prefix/s_id: 显式 S 前缀 + 编号（阿拉伯或罗马）
+    #   roman:  普通罗马数字编号（I, II, III, IV, ...）
+    #   num:    普通数字编号（1, 2, 3, ...）
+    # P1-08 新增支持：
+    #   - "Fig. 1A" / "Figure 1a"（带子图标签）
+    #   - "图1"（中文无空格）
+    #   - "Figure I" / "Figure II"（罗马数字）
+    #   - "Figure 1 (a)"（子图在括号中）
     figure_line_re = re.compile(
-        r"^\s*(?:Extended\s+Data\s+Figure|Supplementary\s+Figure|Figure|Fig\.?|图表|附图|图)\s*"
-        r"(S)?\s*"                   # group(1): 可选的 S 前缀
-        r"(\d+)"                     # group(2): 数字编号
-        r"(?:\s*[A-Za-z]|\s*\([A-Za-z]\))?"  # 可选的子图标签（如 1a, 1(a)）
+        r"^\s*(?P<label>Extended\s+Data\s+Figure|Supplementary\s+(?:Figure|Fig\.?)|Figure|Fig\.?|图表|附图|图)\s*"
+        r"(?:(?P<s_prefix>S)\s*(?P<s_id>(?:\d+|[IVX]{1,6}))|(?P<roman>[IVX]{1,6})|(?P<num>\d+))"
+        r"(?:\s*[-–]?\s*[A-Za-z]|\s*\([A-Za-z]\))?"  # 可选的子图标签（如 1a, 1-a, 1(a)）
         r"(?:\s*\(continued\)|\s*续|\s*接上页)?",  # 可选的续页标记
         re.IGNORECASE,
     )
@@ -3220,11 +3458,9 @@ def extract_figures(
                 r_cov = object_area_ratio(refined)
                 r_ink = ink_ratio_small(refined)
                 r_comp = comp_count(refined)
-                # Adaptive relaxation: if the FAR side of the base clip contains
-                # substantial paragraph text (likely headers/bullets), allow a
-                # stronger shrink since we are intentionally removing that region.
-                relax_h = 0.60
-                relax_a = 0.55
+                # P1-07: 动态计算验收阈值（基于基线高度和远侧覆盖率）
+                # 先计算远侧覆盖率，再调用统一的阈值函数
+                far_cov = 0.0
                 try:
                     near_is_top = (side == 'below')
                     far_is_top = not near_is_top
@@ -3246,35 +3482,25 @@ def extract_figures(
                             in_far = (lb.y1 > base_clip.y0 + 0.5 * base_clip.height)
                         if in_far:
                             far_lines.append(lb)
-                    far_cov = 0.0
                     if far_lines:
                         if far_is_top:
                             region_h = max(1.0, (base_clip.y0 + 0.5 * base_clip.height) - base_clip.y0)
                         else:
                             region_h = max(1.0, base_clip.y1 - (base_clip.y0 + 0.5 * base_clip.height))
                         far_cov = sum(lb.height for lb in far_lines) / region_h
-                    # Relax thresholds if far-side paragraphs are present
-                    # 分层策略：远侧文字越多，允许缩小得越多
-                    # 同时调整 ink 和 coverage 的阈值
-                    relax_ink = 0.90
-                    relax_cov = 0.85
-                    if far_cov >= 0.60:  # 极高覆盖率（>60%）：很可能是大段正文
-                        relax_h = 0.35
-                        relax_a = 0.25
-                        relax_ink = 0.70  # 允许 ink 降到70%
-                        relax_cov = 0.70  # 允许 coverage 降到70%
-                    elif far_cov >= 0.30:  # 高覆盖率（30-60%）：可能是多行段落
-                        relax_h = 0.45
-                        relax_a = 0.35
-                        relax_ink = 0.75
-                        relax_cov = 0.75
-                    elif far_cov >= 0.18:  # 中等覆盖率（18-30%）：少量文字
-                        relax_h = 0.50
-                        relax_a = 0.40
-                        relax_ink = 0.80
-                        relax_cov = 0.80
                 except Exception:
                     pass
+                
+                # P1-07: 使用动态阈值函数
+                thresholds = _adaptive_acceptance_thresholds(
+                    base_height=base_height,
+                    is_table=False,
+                    far_cov=far_cov
+                )
+                relax_h = thresholds.relax_h
+                relax_a = thresholds.relax_a
+                relax_ink = thresholds.relax_ink
+                relax_cov = thresholds.relax_cov
                 ok_h = (r_height >= relax_h * base_height)
                 ok_a = (r_area >= relax_a * base_area)
                 ok_c = (r_cov >= (relax_cov * base_cov) if base_cov > 0 else True)
@@ -3308,9 +3534,11 @@ def extract_figures(
                         debug=debug_captions,
                     ) if text_trim else base_clip
                     rA_h, rA_a = max(1.0, clip_A.height), max(1.0, clip_A.width * clip_A.height)
-                    if (rA_h >= 0.60 * base_height) and (rA_a >= 0.55 * base_area):
+                    # P1-07: A-only fallback 也使用动态阈值
+                    fallback_th = _adaptive_acceptance_thresholds(base_height, is_table=False, far_cov=0.0)
+                    if (rA_h >= fallback_th.relax_h * base_height) and (rA_a >= fallback_th.relax_a * base_area):
                         clip = clip_A
-                        print(f"[INFO] Fig {fig_no} p{pno+1}: using A-only fallback")
+                        print(f"[INFO] Fig {fig_no} p{pno+1}: using A-only fallback (thresholds: {fallback_th.description})")
                     else:
                         clip = base_clip
                         print(f"[INFO] Fig {fig_no} p{pno+1}: reverted to baseline")
@@ -3913,9 +4141,9 @@ def extract_tables(
             doc,
             figure_pattern=None,  # Skip figures
             table_pattern=re.compile(
-                r"^\s*(?:(?:Extended\s+Data\s+Table|Supplementary\s+Table|Table|Tab\.?|表)\s*"
-                r"(?:S\s*)?"
-                r"([A-Z]\d+|[IVX]{1,5}|\d+))",  # 单一捕获组，支持附录表/罗马数字/普通数字
+                r"^\s*(?P<label>Extended\s+Data\s+Table|Supplementary\s+Table|Table|Tab\.?|表)\s*"
+                r"(?:(?P<s_prefix>S)\s*(?P<s_id>(?:\d+|[IVX]{1,6}))|(?P<letter_id>[A-Z]\d+)|(?P<roman>[IVX]{1,6})|(?P<num>\d+))"
+                r"(?:\s*\(continued\)|\s*续|\s*接上页)?",
                 re.IGNORECASE
             ),
             debug=debug_captions
@@ -3945,17 +4173,17 @@ def extract_tables(
             print(f"  far_side_min_dist:{far_side_min_dist:.1f} pt (8.0× line_height)")
             print()
 
-    # --- P0-03 修复：改进正则表达式，正确捕获 S 前缀 ---
-    # 支持罗马数字、附录表、补充材料表、续页标记
-    # 捕获组：group(1) = S前缀编号或附录表(S1, A1, B2), group(2) = 罗马数字, group(3) = 普通数字
+    # --- P0-03 + P1-08 修复：表格编号解析，支持 S 前缀 + 罗马数字（如 "Supplementary Table IV" / "Table SIV"）---
+    # 命名分组说明（供 _extract_table_ident 使用）：
+    #   label:  表注类型前缀（含 Supplementary/Extended Data 等）
+    #   s_prefix/s_id: 显式 S 前缀 + 编号（阿拉伯或罗马）
+    #   letter_id: 附录表编号（A1/B2/...）
+    #   roman:  普通罗马数字编号
+    #   num:    普通数字编号
     table_line_re = re.compile(
-        r"^\s*(?:Extended\s+Data\s+Table|Supplementary\s+Table|Table|Tab\.?|表)\s*"
-        r"(?:"
-        r"(S?\d+|[A-Z]\d+)|"        # group(1): S前缀编号或附录表 (S1, A1, B2)
-        r"([IVX]{1,5})|"            # group(2): 罗马数字 (I, II, III, IV, V)
-        r"(\d+)"                    # group(3): 普通数字 (1, 2, 3)
-        r")"
-        r"(?:\s*\(continued\)|\s*续|\s*接上页)?",  # 可选的续页标记
+        r"^\s*(?P<label>Extended\s+Data\s+Table|Supplementary\s+Table|Table|Tab\.?|表)\s*"
+        r"(?:(?P<s_prefix>S)\s*(?P<s_id>(?:\d+|[IVX]{1,6}))|(?P<letter_id>[A-Z]\d+)|(?P<roman>[IVX]{1,6})|(?P<num>\d+))"
+        r"(?:\s*\(continued\)|\s*续|\s*接上页)?",
         re.IGNORECASE,
     )
 
@@ -4098,7 +4326,7 @@ def extract_tables(
                     text = "".join(sp.get("text", "") for sp in ln.get("spans", []))
                     m = table_line_re.match(text.strip())
                     if m:
-                        ident = (m.group(1) or m.group(2) or m.group(3) or "").strip()
+                        ident = _extract_table_ident(m)
                         if ident:
                             page_table_ids.add(ident)
             
@@ -4162,7 +4390,7 @@ def extract_tables(
                         text = "".join(sp.get("text", "") for sp in ln.get("spans", []))
                         m = table_line_re.match(text.strip())
                         if m:
-                            ident = (m.group(1) or m.group(2) or m.group(3) or "").strip()
+                            ident = _extract_table_ident(m)
                             if ident:
                                 page_table_ids.add(ident)
 
@@ -4212,7 +4440,7 @@ def extract_tables(
                         i += 1
                         continue
                     # 提取表号：优先附录表、罗马数字、普通数字
-                    ident = (m.group(1) or m.group(2) or m.group(3) or "").strip()
+                    ident = _extract_table_ident(m)
                     if not ident:
                         i += 1
                         continue
@@ -4631,9 +4859,8 @@ def extract_tables(
                     r_ink = estimate_ink_ratio(pix_small2)
                 except Exception:
                     pass
-                # 表格也检测远侧文字覆盖率，分层放宽阈值
-                relax_h = 0.50
-                relax_a = 0.45
+                # P1-07: 动态计算表格验收阈值（基于基线高度和远侧覆盖率）
+                far_cov_tbl = 0.0
                 try:
                     near_is_top = (side == 'below')
                     far_is_top = not near_is_top
@@ -4654,34 +4881,25 @@ def extract_tables(
                             in_far = (lb.y1 > base_clip.y0 + 0.5 * base_clip.height)
                         if in_far:
                             far_lines_tbl.append(lb)
-                    far_cov_tbl = 0.0
                     if far_lines_tbl:
                         if far_is_top:
                             region_h_tbl = max(1.0, (base_clip.y0 + 0.5 * base_clip.height) - base_clip.y0)
                         else:
                             region_h_tbl = max(1.0, base_clip.y1 - (base_clip.y0 + 0.5 * base_clip.height))
                         far_cov_tbl = sum(lb.height for lb in far_lines_tbl) / region_h_tbl
-                    # 分层策略（与 figure 一致）
-                    # 同时调整 ink 和 text_lines 的阈值
-                    relax_ink = 0.85
-                    relax_text = 0.75
-                    if far_cov_tbl >= 0.60:
-                        relax_h = 0.35
-                        relax_a = 0.25
-                        relax_ink = 0.70  # 极高覆盖率：允许 ink 降到70%
-                        relax_text = 0.55  # 允许 text_lines 降到55%
-                    elif far_cov_tbl >= 0.30:
-                        relax_h = 0.45
-                        relax_a = 0.35
-                        relax_ink = 0.75
-                        relax_text = 0.60
-                    elif far_cov_tbl >= 0.18:
-                        relax_h = 0.50
-                        relax_a = 0.40
-                        relax_ink = 0.80
-                        relax_text = 0.65
                 except Exception:
                     pass
+                
+                # P1-07: 使用动态阈值函数（表格模式）
+                thresholds_tbl = _adaptive_acceptance_thresholds(
+                    base_height=base_height,
+                    is_table=True,
+                    far_cov=far_cov_tbl
+                )
+                relax_h = thresholds_tbl.relax_h
+                relax_a = thresholds_tbl.relax_a
+                relax_ink = thresholds_tbl.relax_ink
+                relax_text = thresholds_tbl.relax_text
                 ok_h = (r_height >= relax_h * base_height)
                 ok_a = (r_area >= relax_a * base_area)
                 ok_i = (r_ink >= (relax_ink * base_ink) if base_ink > 0 else True)
@@ -4712,9 +4930,10 @@ def extract_tables(
                         typical_line_h=typical_lh_fallback_tbl,
                         debug=debug_captions,
                     ) if text_trim else base_clip
-                    # 二次门槛：如 A-only 过小则回退到基线
+                    # P1-07: 二次门槛也使用动态阈值
                     rA_h, rA_a = max(1.0, clip_A.height), max(1.0, clip_A.width * clip_A.height)
-                    if (rA_h >= 0.60 * base_height) and (rA_a >= 0.55 * base_area):
+                    fallback_th_tbl = _adaptive_acceptance_thresholds(base_height, is_table=True, far_cov=0.0)
+                    if (rA_h >= fallback_th_tbl.relax_h * base_height) and (rA_a >= fallback_th_tbl.relax_a * base_area):
                         clip = clip_A
                     else:
                         clip = base_clip
@@ -5734,6 +5953,226 @@ def gather_structured_text(
     return result
 
 
+# ========== P1-09: 图表正文上下文锚点 ==========
+@dataclass
+class FigureMention:
+    """图表在正文中的提及位置"""
+    page: int                    # 页码（1-based）
+    paragraph_order: int         # 段落阅读顺序
+    text_window: str             # 提及位置附近的文本窗口（1-2段）
+    bbox: Tuple[float, float, float, float]  # 提及所在段落的边界框
+    is_first: bool               # 是否为首次提及
+
+
+@dataclass
+class FigureContext:
+    """单个图表的正文上下文信息"""
+    ident: str                   # 图表标识符（如 "1", "S1", "I"）
+    kind: str                    # "figure" 或 "table"
+    caption: str                 # 图注文本
+    caption_page: int            # 图注所在页码
+    first_mention: Optional[FigureMention]  # 首次提及位置
+    all_mentions: List[FigureMention]       # 所有提及位置
+    caption_page_text_window: str           # 图注所在页附近的正文窗口
+
+
+def build_figure_contexts(
+    pdf_path: str,
+    records: List[AttachmentRecord],
+    gathered_text: Optional[GatheredText] = None,
+    out_json: Optional[str] = None,
+    debug: bool = False
+) -> List[FigureContext]:
+    """
+    P1-09: 为每个 Figure/Table 建立正文上下文锚点。
+    
+    功能：
+    1. 搜索每个图表在正文中的所有提及位置
+    2. 提取首次提及位置附近的文本窗口
+    3. 提取图注所在页附近的正文窗口
+    
+    Args:
+        pdf_path: PDF 文件路径
+        records: 提取的图表记录列表
+        gathered_text: 结构化文本（如果已有）
+        out_json: 输出 JSON 路径（可选）
+        debug: 调试模式
+    
+    Returns:
+        List[FigureContext] 图表上下文列表
+    """
+    import json
+    
+    if debug:
+        print(f"\n{'='*60}")
+        print("P1-09: Building Figure Contexts")
+        print(f"{'='*60}")
+    
+    # 如果没有提供结构化文本，先生成
+    if gathered_text is None:
+        gathered_text = gather_structured_text(pdf_path, debug=debug)
+    
+    paragraphs = gathered_text.paragraphs
+    
+    # 构建图表提及的正则模式
+    # 支持：Figure 1, Fig. 1, Figure S1, Table 1, 图1, 图 1, 表1, 表 1
+    # 以及罗马数字：Figure I, Figure II
+    mention_patterns = {
+        'figure': re.compile(
+            r"(?:Figure|Fig\.?|图|附图)\s*(S(?:\d+|[IVX]{1,6})|\d+|[IVX]{1,6})",
+            re.IGNORECASE
+        ),
+        'table': re.compile(
+            r"(?:Table|Tab\.?|表)\s*(S(?:\d+|[IVX]{1,6})|\d+|[A-Z]\d+|[IVX]{1,6})",
+            re.IGNORECASE
+        )
+    }
+    
+    # 为每个段落建立索引
+    para_by_page: Dict[int, List[GatheredParagraph]] = {}
+    for para in paragraphs:
+        if para.page not in para_by_page:
+            para_by_page[para.page] = []
+        para_by_page[para.page].append(para)
+    
+    contexts: List[FigureContext] = []
+    
+    for rec in records:
+        ident = rec.ident
+        kind = rec.kind.lower()
+        caption = rec.caption
+        caption_page = rec.page
+        
+        if debug:
+            print(f"\n[DEBUG] Processing {kind} {ident} (page {caption_page})")
+        
+        # 搜索所有提及
+        pattern = mention_patterns.get(kind)
+        if not pattern:
+            continue
+        
+        all_mentions: List[FigureMention] = []
+        first_mention: Optional[FigureMention] = None
+        
+        for para in paragraphs:
+            # 跳过图注本身（caption 类型）
+            if para.paragraph_type == 'caption':
+                continue
+            
+            # 搜索提及
+            matches = pattern.findall(para.text)
+            for match in matches:
+                # 标准化标识符进行比较
+                match_ident = match.upper().strip()
+                rec_ident = ident.upper().strip()
+                
+                # 检查是否匹配当前图表
+                if match_ident == rec_ident:
+                    # 提取文本窗口（当前段落 + 上下各一段）
+                    window_paras = [para]
+                    
+                    # 查找同页的上一段和下一段
+                    page_paras = [p for p in paragraphs 
+                                  if p.page == para.page and p.paragraph_type != 'caption']
+                    page_paras.sort(key=lambda p: p.order)
+                    
+                    para_idx = None
+                    for i, p in enumerate(page_paras):
+                        if p.order == para.order:
+                            para_idx = i
+                            break
+                    
+                    if para_idx is not None:
+                        if para_idx > 0:
+                            window_paras.insert(0, page_paras[para_idx - 1])
+                        if para_idx < len(page_paras) - 1:
+                            window_paras.append(page_paras[para_idx + 1])
+                    
+                    text_window = "\n\n".join(p.text for p in window_paras)
+                    
+                    mention = FigureMention(
+                        page=para.page,
+                        paragraph_order=para.order,
+                        text_window=text_window[:1000],  # 限制长度
+                        bbox=para.bbox,
+                        is_first=(first_mention is None)
+                    )
+                    
+                    all_mentions.append(mention)
+                    
+                    if first_mention is None:
+                        first_mention = mention
+                        if debug:
+                            print(f"  First mention: page {para.page}, order {para.order}")
+        
+        # 提取图注所在页附近的正文窗口
+        caption_page_paras = para_by_page.get(caption_page, [])
+        caption_page_window = "\n\n".join(
+            p.text for p in caption_page_paras 
+            if p.paragraph_type in ('body', 'heading') and len(p.text) > 20
+        )[:1500]  # 限制长度
+        
+        ctx = FigureContext(
+            ident=ident,
+            kind=kind,
+            caption=caption,
+            caption_page=caption_page,
+            first_mention=first_mention,
+            all_mentions=all_mentions,
+            caption_page_text_window=caption_page_window
+        )
+        contexts.append(ctx)
+        
+        if debug:
+            print(f"  Total mentions: {len(all_mentions)}")
+            if first_mention:
+                print(f"  First mention window: {first_mention.text_window[:100]}...")
+    
+    # 输出 JSON
+    if out_json:
+        output = {
+            "version": "1.0",
+            "pdf": os.path.basename(pdf_path),
+            "generated_at": __import__('datetime').datetime.now().isoformat(),
+            "contexts": [
+                {
+                    "ident": ctx.ident,
+                    "kind": ctx.kind,
+                    "caption": ctx.caption,
+                    "caption_page": ctx.caption_page,
+                    "first_mention": {
+                        "page": ctx.first_mention.page,
+                        "paragraph_order": ctx.first_mention.paragraph_order,
+                        "text_window": ctx.first_mention.text_window,
+                        "bbox": list(ctx.first_mention.bbox),
+                    } if ctx.first_mention else None,
+                    "all_mentions_count": len(ctx.all_mentions),
+                    "all_mentions": [
+                        {
+                            "page": m.page,
+                            "paragraph_order": m.paragraph_order,
+                            "is_first": m.is_first,
+                        }
+                        for m in ctx.all_mentions
+                    ],
+                    "caption_page_text_window": ctx.caption_page_text_window,
+                }
+                for ctx in contexts
+            ]
+        }
+        
+        out_dir = os.path.dirname(out_json)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        with open(out_json, 'w', encoding='utf-8') as f:
+            json.dump(output, f, ensure_ascii=False, indent=2)
+        
+        if debug:
+            print(f"\n[INFO] Wrote figure contexts: {out_json} ({len(contexts)} items)")
+    
+    return contexts
+
+
 def extract_text_with_format(
     pdf_path: str,
     out_json: Optional[str] = None,
@@ -6345,6 +6784,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     if getattr(args, "prune_images", False):
         removed = prune_unindexed_images(out_dir=out_dir, index_json_path=index_json_path)
         print(f"[INFO] Pruned unindexed images: {removed}")
+    
+    # P1-09: 生成图表正文上下文锚点
+    try:
+        figure_contexts_path = os.path.join(out_dir, 'figure_contexts.json')
+        figure_contexts = build_figure_contexts(
+            pdf_path=pdf_path,
+            records=all_records,
+            gathered_text=gathered_text,
+            out_json=figure_contexts_path,
+            debug=getattr(args, 'debug_captions', False)
+        )
+        mentions_found = sum(1 for ctx in figure_contexts if ctx.first_mention is not None)
+        print(f"[INFO] Figure contexts: {len(figure_contexts)} items, {mentions_found} with mentions")
+    except Exception as e:
+        print(f"[WARN] Figure contexts failed: {e}")
+    
     if qc_issues:
         print("\n" + "=" * 50)
         print("QUALITY CHECK RESULTS")
@@ -6385,6 +6840,57 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"[QC] Text counts (rough): Figure={text_counts['Figure']} Table={text_counts['Table']} 图={text_counts['图']} 表={text_counts['表']}")
     except Exception as e:
         print(f"[WARN] QC summary failed: {e}")
+    
+    # P1-11: 结构化输入合同验证与摘要
+    print("\n" + "=" * 60)
+    print("P1-11: STRUCTURED INPUT CONTRACT FOR SUMMARY GENERATION")
+    print("=" * 60)
+    
+    contract_files = {
+        "index.json": index_json_path,
+        "gathered_text.json": gathered_text_path if out_text else None,
+        "figure_contexts.json": os.path.join(out_dir, 'figure_contexts.json'),
+        "plain_text.txt": out_text,
+    }
+    
+    contract_status = []
+    all_present = True
+    
+    for name, path in contract_files.items():
+        if path is None:
+            status = "⚠️  NOT CONFIGURED"
+            all_present = False
+        elif os.path.exists(path):
+            size = os.path.getsize(path)
+            status = f"✅ PRESENT ({size:,} bytes)"
+        else:
+            status = "❌ MISSING"
+            all_present = False
+        contract_status.append((name, path or "N/A", status))
+        print(f"  {name:25s} {status}")
+    
+    # 列出 PNG 文件数量
+    png_files = [f for f in os.listdir(out_dir) if f.endswith('.png') and (f.startswith('Figure_') or f.startswith('Table_'))]
+    print(f"  {'PNG files':25s} ✅ {len(png_files)} files")
+    
+    print()
+    if all_present:
+        print("[CONTRACT] ✅ All required files present - ready for summary generation")
+        print()
+        print("NEXT STEPS:")
+        print(f"  1. Review extracted content in: {out_dir}")
+        print(f"  2. (Optional) Rename files: python scripts/generate_rename_plan.py {pdf_dir}")
+        print(f"  3. Generate summary using: index.json + gathered_text.json + figure_contexts.json + PNG files")
+    else:
+        print("[CONTRACT] ⚠️  Some files missing - summary generation may be incomplete")
+        print()
+        print("MISSING FILES:")
+        for name, path, status in contract_status:
+            if "MISSING" in status or "NOT CONFIGURED" in status:
+                print(f"  - {name}: {path}")
+    
+    print("=" * 60)
+    
     return 0
 
 
