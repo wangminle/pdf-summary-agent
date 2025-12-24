@@ -48,7 +48,7 @@ Common flags: `--allow-continued`, `--anchor-mode v1`, `--below/--above`, `--t-a
 - **Image pruning**: Enabled by default; after writing `images/index.json`, the extractor removes unreferenced `Figure_*/Table_*` PNGs from `images/`. Use `--no-prune-images` to disable.
 - **Forced direction**: With Anchor v2 (default) or v1, per-id `--above/--below` (figures) and `--t-above/--t-below` (tables) work as expected; use `--anchor-mode v1` only if you prefer the legacy anchoring strategy.
 - **Smart caption detection**: Enabled by default, automatically distinguishes real captions from in-text references; use `--no-smart-caption-detection` to disable, or `--debug-captions` to see scoring details. See `AGENTS.md` for more.
-- **Visual debug mode**: Use `--debug-visual` to save multi-stage boundary boxes overlaid on full pages (**supports both figures and tables**); outputs to `images/debug/Figure_N_pX_debug_stages.png` / `Table_N_pX_debug_stages.png` + legend files. Paragraph boundaries are drawn as pink dashed lines when using `--layout-driven`. See `AGENTS.md` for color scheme and usage.
+- **Visual debug mode**: Use `--debug-visual` to save multi-stage boundary boxes overlaid on full pages (**supports both figures and tables**); outputs to `images/debug/Figure_N_pX_debug_stages.png` / `Table_N_pX_debug_stages.png` + legend files. Generated debug files are linked back in `images/index.json` via each item's `debug_artifacts` field. Paragraph boundaries are drawn as pink dashed lines when using `--layout-driven`. See `AGENTS.md` for color scheme and usage.
 - **Adaptive line height**: Enabled by default, automatically adjusts trimming parameters (`adjacent_th`, `far_text_th`, etc.) based on document's typical line height; use `--no-adaptive-line-height` to disable and use fixed default parameters.
 - **Layout-driven extraction (V2)**: Use `--layout-driven` to enable layout modeling for more precise extraction; particularly useful for papers with complex layouts or dense text around figures/tables.
 - **Table text masking**: For tables, text masking is disabled by default (table text is usually content); use `--table-mask-text` to enable if needed.
@@ -146,7 +146,7 @@ python3 scripts/extract_pdf_assets.py --pdf <PDF_DIR>/<paper>.pdf --preset robus
 - **输出隔离**：默认已启用 `--prune-images`（写入最新 `images/index.json` 后自动清理未引用旧图）；如需关闭，使用 `--no-prune-images`。
 - **强制方向**：默认 Anchor v2 下（或切换 v1 也同样可用），`--above/--below`（图）与 `--t-above/--t-below`（表）按编号强制方向直接生效。
 - **智能图注识别**：默认启用，自动区分真实图注与正文引用；如需关闭，使用 `--no-smart-caption-detection`；如需查看评分详情，使用 `--debug-captions`。详见 `AGENTS.md`。
-- **可视化调试模式**：使用 `--debug-visual` 保存多阶段边界框叠加的完整页面（**图与表均支持**）；输出到 `images/debug/Figure_N_pX_debug_stages.png` / `Table_N_pX_debug_stages.png` 及图例文件。配合 `--layout-driven` 使用时，段落边界以粉红色虚线显示。颜色方案和使用方法详见 `AGENTS.md`。
+- **可视化调试模式**：使用 `--debug-visual` 保存多阶段边界框叠加的完整页面（**图与表均支持**）；输出到 `images/debug/Figure_N_pX_debug_stages.png` / `Table_N_pX_debug_stages.png` 及图例文件；生成的 debug 文件会通过 `images/index.json` 中每个条目的 `debug_artifacts` 字段回链。配合 `--layout-driven` 使用时，段落边界以粉红色虚线显示。颜色方案和使用方法详见 `AGENTS.md`。
 - **自适应行高**：默认启用，根据文档典型行高自动调整裁切参数（`adjacent_th`、`far_text_th` 等）；如需禁用并使用固定默认参数，使用 `--no-adaptive-line-height`。
 - **版式驱动提取（V2）**：使用 `--layout-driven` 启用版式建模以获得更精确的提取；特别适用于版式复杂或图表周围文字密集的论文。
 - **表格文本掩膜**：对于表格，文本掩膜默认关闭（表格内文字通常是内容的一部分）；如需启用，使用 `--table-mask-text`。

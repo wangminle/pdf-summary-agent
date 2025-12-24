@@ -75,12 +75,16 @@ def _save_index_json(index_path: Path, items: list[dict], original_dict: dict | 
 
 
 def resolve_image_file(images_dir: Path, item: dict) -> Path | None:
-    rel = (item.get("file") or "").replace("\\", "/")
-    if rel:
-        p = images_dir / rel
-        if p.exists():
-            return p
+    # Bug-1 修复：按优先级循环尝试每个字段，选择第一个实际存在的文件
+    # 而不是简单地选择第一个非空值（可能指向不存在的文件）
+    for key in ("current_file", "file", "original_file"):
+        rel = (item.get(key) or "").replace("\\", "/")
+        if rel:
+            p = images_dir / rel
+            if p.exists():
+                return p
 
+    # 所有字段都不存在或指向不存在的文件，回退到 glob 搜索
     kind = (item.get("type") or "").lower()
     ident = str(item.get("id") or "").strip()
     page = int(item.get("page") or 0)
