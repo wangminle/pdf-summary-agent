@@ -7,7 +7,7 @@
 # - 可选写出 TXT 文本与 CSV 清单。
 #
 # 方法概述：
-# - 文本提取：使用 pdfminer.six（若未安装则跳过，不会中断脚本）。
+# - 文本提取：使用 PyMuPDF（fitz）导出纯文本（UTF-8）。
 # - 图像/表格提取：扫描页面 text dict，定位以 “Figure N/图 N” 与 “Table N/表 N” 开头的图/表注行块；
 #   在图注“上方”与“下方”分别构造候选裁剪窗口，通过简易评分（墨迹密度+对象占比）
 #   或用户显式指定（--below）确定最终窗口，并按 DPI 渲染为 PNG；
@@ -24,7 +24,7 @@
 Extract text and figure/table images from a PDF.
 
 Features
-- Text extraction via pdfminer.six (optional: skip if unavailable)
+- Text extraction via PyMuPDF (fitz)
 - Figure detection by caption blocks starting with "Figure N"
 - Table detection by caption blocks starting with "Table N"
 - Parameterized clipping window above caption with margins
@@ -148,20 +148,21 @@ except Exception as e:  # pragma: no cover
 def _rect_to_list(r: "fitz.Rect") -> List[float]:
     return [round(float(r.x0), 1), round(float(r.y0), 1), round(float(r.x1), 1), round(float(r.y1), 1)]
 
-# 文本提取：若提供 out_text 路径且安装了 pdfminer.six，则将 PDF 全文提取为 UTF-8 文本文件
+# 文本提取：若提供 out_text 路径，则将 PDF 全文提取为 UTF-8 文本文件（使用 PyMuPDF）。
 # 返回写入路径或 None（未提取/失败）。
 def try_extract_text(pdf_path: str, out_text: Optional[str]) -> Optional[str]:
     if out_text is None:
         # 未指定输出路径：直接跳过文本提取
         return None
     try:
-        from pdfminer.high_level import extract_text  # type: ignore
-    except ImportError:
-        logger.warning("pdfminer.six not installed; skip text extraction.")
-        return None
-    try:
-        # 调用 pdfminer 的高层 API 提取整文文本
-        txt = extract_text(pdf_path)
+        doc = fitz.open(pdf_path)
+        try:
+            pages = []
+            for pno in range(len(doc)):
+                pages.append(doc[pno].get_text("text"))
+            txt = "\n\n".join(pages)
+        finally:
+            doc.close()
         with open(out_text, "w", encoding="utf-8") as f:
             f.write(txt)
         logger.info(f"Wrote text: {out_text} (chars={len(txt)})")
@@ -7155,7 +7156,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     return True
         return False
 
-    # Extract text by default（若安装 pdfminer.six 且指定 out-text，默认尝试提取文本）
+    # Extract text by default（若指定 out-text，默认尝试提取文本；使用 PyMuPDF）
     try_extract_text(pdf_path, out_text)
     
     # P1-02: Gathering 阶段 - 生成结构化文本

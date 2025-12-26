@@ -4,7 +4,7 @@
 Extract text and figure/table PNGs from a research PDF and produce a JSON index. Designed for robust caption-anchored cropping (Anchor v2 with multi-scale scanning, global anchor consistency for both figures and tables), **smart caption detection** (distinguishes real captions from in-text references for both figures and tables), **far-side text trimming** (removes distant paragraphs like Abstract/Introduction), **adaptive line height** (auto-adjusts parameters based on document metrics), **layout-driven extraction** (V2 architecture with document layout modeling), optional auto-cropping, and safety checks to avoid over/under-trimming.
 
 - Requirements: Python 3.12+, macOS/Linux recommended
-- Dependencies: PyMuPDF (pymupdf), pdfminer.six
+- Dependencies: PyMuPDF (pymupdf)
 - Outputs (relative to the input PDF directory):
   - `text/<paper>.txt`
   - `images/*.png` (Figure_* and Table_*)
@@ -21,7 +21,7 @@ Extract text and figure/table PNGs from a research PDF and produce a JSON index.
   - **(2025-10-11)** Far-side text trimming (Phase C) automatically removes distant paragraphs based on global anchor direction
 
 ### Install
-- Quick: `python3 -m pip install --user pymupdf pdfminer.six`
+- Quick: `python3 -m pip install --user pymupdf`
 - Or: `python3 -m pip install --user -r scripts/requirements.txt` (if provided)
 
 ### Quickstart
@@ -72,7 +72,7 @@ cd </path/to/PDF_DIR>
 ```
 
 - What the Agent will do automatically:
-  - Install dependencies (pymupdf, pdfminer.six)
+  - Install dependencies (pymupdf)
   - Run the extractor (equivalent to):
     ```bash
     python3 scripts/extract_pdf_assets.py --pdf "$(pwd)/<paper>.pdf" --preset robust --allow-continued
@@ -104,7 +104,7 @@ python3 scripts/extract_pdf_assets.py \
 从论文 PDF 中提取正文文本与图表 PNG，并生成统一索引 JSON。内置稳健的基于图注定位（Anchor v2 多尺度滑窗，图与表独立全局锚点一致性）、**智能图注识别**（图与表均支持，区分真实图注与正文引用）、**远距文字清除**（自动移除Abstract/Introduction等大段正文）、**自适应行高**（根据文档特征自动调整参数）、**版式驱动提取**（V2架构，文档版式建模），可选像素级去白边，以及多重安全校验，避免过裁/漏裁。
 
 - 环境：Python 3.12+（建议 macOS/Linux）
-- 依赖：PyMuPDF（pymupdf）、pdfminer.six
+- 依赖：PyMuPDF（pymupdf）
 - 输出（相对 PDF 所在目录）：
   - `text/<paper>.txt`
   - `images/*.png`（含 Figure_* 与 Table_*）
@@ -121,7 +121,7 @@ python3 scripts/extract_pdf_assets.py \
   - **(2025-10-11)** 远距文字清除（Phase C）基于全局锚点方向自动移除远距大段正文
 
 ### 安装
-- 直接安装：`python3 -m pip install --user pymupdf pdfminer.six`
+- 直接安装：`python3 -m pip install --user pymupdf`
 - 或使用清单：`python3 -m pip install --user -r scripts/requirements.txt`（如提供）
 
 ### 快速开始
@@ -170,7 +170,7 @@ cd </path/to/PDF_DIR>
 ```
 
 - Agent 将自动完成以下步骤：
-  - 安装 Python 依赖（pymupdf、pdfminer.six）
+  - 安装 Python 依赖（pymupdf）
   - 运行提取脚本（等价于）：
     ```bash
     python3 scripts/extract_pdf_assets.py --pdf "$(pwd)/<paper>.pdf" --preset robust --allow-continued

@@ -25,7 +25,7 @@
 - 摘要文档：置于 PDF 同级，命名 `/<paper>_阅读摘要-yyyymmdd.md`；在 MD 中以 `images/...` 相对路径嵌图。
 
 ## 一次跑通（提取文本与图片）
- - 环境：Python 3.12+；依赖安装：`python3 -m pip install --user pymupdf pdfminer.six`
+ - 环境：Python 3.12+；依赖安装：`python3 -m pip install --user pymupdf`
  - 基本执行：`python3 scripts/extract_pdf_assets.py --pdf <PDF_DIR>/<paper>.pdf`
 
 ### 环境与命令差异（macOS/Linux vs Windows/PowerShell）
