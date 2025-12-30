@@ -54,3 +54,6 @@ cython_debug/
 
 # Test files and PDFs
 tests/
+
+# Reference files and documents
+ref/

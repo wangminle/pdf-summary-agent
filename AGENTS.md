@@ -1,12 +1,29 @@
 # 存储库指南（Agent 工作流）
 
-## 2025-12-22（V0.1.5-build0034）P0-01~07 修复摘要
+## 2025-12-29（V0.1.6）P1-01~11 + QA-06 功能增强
 
-- **P0-01 环境变量优先级**：统一参数优先级为 **CLI 显式传参 > 环境变量 > 默认值**，避免环境变量导致“参数静默失效/不可复现”。（脚本内部仅在检测到你显式传了对应 CLI 参数时才覆盖同名 ENV）
-- **P0-02 两行检测保护图注**：增强“两行检测”，当两行文本属于图注本身（长标题换行）时不再误裁；正文顶部“两行噪声”仍可被正确清除。
+### P1 显著提升（全部已完成 2025-12-23~24）
+- **P1-01 版式分析阶段强化**：`--layout-driven` 改为三态控制（`auto|on|off`），默认 `on`：始终启用版式驱动提取以正确排除章节标题。
+- **P1-02 Gathering 阶段显式化**：生成 `text/gathered_text.json`，含页眉页脚移除、双栏重排、段落分组。
+- **P1-03 PDF 预验证**：提取前检查加密、文本层存在性、页数；输出 `PDFValidationResult`。
+- **P1-04 QC 独立化**：质量控制阶段独立，检查提取数量与文本引用一致性、尺寸合理性、编号连续性。
+- **P1-05 全局锚点微弱优势回退**：当 above/below 总分差距 < 5% 时回退到按页决策，避免噪声导致全篇错选。
+- **P1-06 index.json 扩展为可追溯格式**：新增 `meta`、`layout`、`stages_applied`、`confidence`、`bbox_pt` 等字段。
+- **P1-07 精裁验收阈值动态化**：根据基线高度和远侧覆盖率动态计算验收阈值（大图更激进，小图更保守）。
+- **P1-08 正则表达式覆盖扩展**：支持 `Figure I`（罗马数字）、`Figure S1`（S前缀）、`Figure 1a`（子图标签）、`图1`（中文无空格）。
+- **P1-09 图表正文上下文锚点**：生成 `images/figure_contexts.json`，含每个图表的首次提及位置和周围段落。
+- **P1-10 重命名工作流半自动化**：新增 `scripts/generate_rename_plan.py`，生成带碰撞检测的重命名脚本（.sh/.ps1）。
+- **P1-11 结构化输入合同**：提取完成后显示合同状态，列出摘要生成所需的全部文件。
+
+### QA 质量保证
+- **QA-06 QC 引用检测增强**（2025-12-24）：支持罗马数字、S前缀、Extended Data 格式，使用 `\b` 边界减少误报。
+
+### P0 紧急修复（全部已完成 2025-12-22）
+- **P0-01 环境变量优先级**：统一参数优先级为 **CLI 显式传参 > 环境变量 > 默认值**，避免环境变量导致"参数静默失效/不可复现"。（脚本内部仅在检测到你显式传了对应 CLI 参数时才覆盖同名 ENV）
+- **P0-02 两行检测保护图注**：增强"两行检测"，当两行文本属于图注本身（长标题换行）时不再误裁；正文顶部"两行噪声"仍可被正确清除。
 - **P0-03 Supplementary 编号不再冲突**：支持 `S1/S2/...` 作为完整标识符（图与表均可），避免与 `1/2/...` 冲突；可用 `--above S1` / `--below S2` / `--t-above S1` 等精确命中；输出文件名前缀保留 `Figure_S1` / `Table_S1`。
 - **P0-04 Anchor v2 支持强制方向**：默认 Anchor v2 下，`--above/--below`（图）与 `--t-above/--t-below`（表）按编号强制方向直接生效；无需为了强制方向切换到 `--anchor-mode v1`。
-- **P0-05 表格 `text_trim` 可正确关闭**：修复表格提取中 `text_trim` 被“永远开启”的问题，`--no-text-trim` 对表格也生效；`--preset robust` 仍默认开启 `text_trim`。
+- **P0-05 表格 `text_trim` 可正确关闭**：修复表格提取中 `text_trim` 被"永远开启"的问题，`--no-text-trim` 对表格也生效；`--preset robust` 仍默认开启 `text_trim`。
 - **P0-06 输出隔离默认开启**：默认启用 `--prune-images`，在写入最新 `images/index.json` 后自动清理 `images/` 中未被本次索引引用的旧 `Figure_*/Table_*` PNG；如需保留旧图用于对比，使用 `--no-prune-images`。
 - **P0-07 文件名碰撞自动消歧**：当 sanitize 后文件名碰撞时自动追加 `_1/_2/...` 并输出警告，避免静默覆盖与 index/file 不一致。
 
@@ -19,9 +36,18 @@
 ## 目录与命名
 - 输入 PDF：`<PDF_DIR>/<paper>.pdf`
 - 脚本默认输出：
-- 文本：`<PDF_DIR>/text/<paper>.txt`
-- 图片：`<PDF_DIR>/images/*.png`（包含 Figure_* 与 Table_* ）
-- 索引：`<PDF_DIR>/images/index.json`（统一清单，字段：type/id/page/caption/file/continued）
+  - 文本：`<PDF_DIR>/text/<paper>.txt` — 纯文本
+  - 结构化文本：`<PDF_DIR>/text/gathered_text.json` — 含页眉页脚移除、双栏重排 **(P1-02 新增)**
+  - 图片：`<PDF_DIR>/images/*.png`（包含 Figure_* 与 Table_*）
+  - 索引：`<PDF_DIR>/images/index.json` — 统一清单，字段扩展为可追溯格式 **(P1-06 增强)**：
+    - 基础字段：`type/id/page/caption/file/continued`
+    - 元数据：`meta.pdf/pdf_hash/pages/extracted_at/extractor_version/preset`
+    - 版式信息：`layout.columns/typical_line_height`
+    - 追溯字段：`anchor_mode/side/stages_applied/confidence/bbox_pt`
+    - 调试字段：`debug_artifacts`（如启用 `--debug-visual`）
+  - 图表上下文：`<PDF_DIR>/images/figure_contexts.json` — 每个图表的首次提及和周围段落 **(P1-09 新增)**
+  - 版式模型：`<PDF_DIR>/images/layout_model.json` — 默认自动生成（layout-driven 默认启用） **(P1-01 增强)**
+  - 重命名映射：`<PDF_DIR>/images/rename_mapping.json` — 重命名计划记录 **(P1-10 新增)**
 - 摘要文档：置于 PDF 同级，命名 `/<paper>_阅读摘要-yyyymmdd.md`；在 MD 中以 `images/...` 相对路径嵌图。
 
 ## 一次跑通（提取文本与图片）
@@ -326,27 +352,38 @@ Phase D (Final - Autocrop):
 - ✅ 验收失败时查看 Fallback 的回退范围
 - ✅ **图与表均支持**：所有裁剪阶段的可视化调试（Baseline → Phase A → Phase B → Phase D → Fallback）
 
-### 版式驱动提取（V2 Architecture - Layout-Driven，可选）
+### 版式驱动提取（V2 Architecture - Layout-Driven）
 **问题背景**：传统的Caption驱动提取依赖固定窗口，可能误包含正文段落（如Abstract、Introduction顶部文字），导致图表PNG中包含多余内容。
+
+**P1-01 增强（2025-12-29 更新）**：改为三态控制（`auto|on|off`），**默认 `on`**：
+- **on**（默认）：始终启用版式驱动提取，确保正确排除章节标题（如 "3.5 Positional Encoding"）。
+- **auto**：检测到双栏或图表附近正文密集时自动启用；简单单栏文档走轻量路径。
+- **off**：禁用版式驱动提取（不推荐，可能导致章节标题被误包含）。
 
 **核心思路**：
 - **Step 1**: 提取文本并保留完整格式信息（字体、字号、加粗、颜色）
 - **Step 2**: 构建版式模型（文本区块、留白区域、双栏检测）
 - **Step 3**: 利用版式信息优化图表裁剪（主动避开正文段落）
 
-**启用方法**：
+**使用方法**：
 ```bash
-# macOS/Linux
-python3 scripts/extract_pdf_assets.py --pdf paper.pdf --preset robust --layout-driven
+# 默认启用版式驱动（on）
+python3 scripts/extract_pdf_assets.py --pdf paper.pdf --preset robust
+
+# 使用 auto 模式（复杂版式自动启用，简单版式跳过）
+python3 scripts/extract_pdf_assets.py --pdf paper.pdf --preset robust --layout-driven auto
+
+# 强制关闭版式驱动（不推荐，可能导致章节标题被误包含）
+python3 scripts/extract_pdf_assets.py --pdf paper.pdf --preset robust --layout-driven off
 
 # 启用版式驱动 + 可视化调试（推荐）
-python3 scripts/extract_pdf_assets.py --pdf paper.pdf --preset robust --layout-driven --debug-visual
+python3 scripts/extract_pdf_assets.py --pdf paper.pdf --preset robust --debug-visual
 ```
 
-**新增参数**：
+**参数说明**：
 | 参数 | 说明 |
 |------|------|
-| `--layout-driven` | 启用版式驱动提取（V2 Architecture） |
+| `--layout-driven [auto\|on\|off]` | 版式驱动模式：on=始终启用（默认），auto=复杂版式自动启用，off=禁用 |
 | `--layout-json <path>` | 指定layout_model.json保存路径（可选） |
 
 **输出文件**：
@@ -433,6 +470,108 @@ Text Block 7 (title_h2):
 - 需要numpy和scipy库（可选，用于双栏检测和留白区域识别）
 - 如果未安装，会跳过相关功能，核心功能仍可使用
 - V1（Caption驱动）和V2（版式驱动）并存，用户可选
+
+### Gathering 阶段（P1-02 新增）
+**问题背景**：纯文本输出（`<paper>.txt`）无法保留段落结构、双栏顺序和页眉页脚信息。
+
+**核心功能**：
+- **页眉页脚检测与剔除**：基于重复行和位置检测
+- **双栏顺序重排**：基于 x0/x1 与列检测
+- **段落分组**：保留章节层级和段落边界
+
+**输出文件**：`text/gathered_text.json`
+```json
+{
+  "version": "1.0",
+  "is_dual_column": true,
+  "headers_removed": ["Header text repeated on each page"],
+  "footers_removed": ["Page 1", "Page 2"],
+  "paragraphs": [
+    {
+      "page": 1,
+      "text": "Paragraph content...",
+      "bbox": [72.0, 100.0, 540.0, 120.0],
+      "is_heading": false
+    }
+  ]
+}
+```
+
+### PDF 预验证（P1-03 新增）
+**核心功能**：在提取前检测潜在问题：
+- 文件是否存在且可读
+- 是否加密
+- 是否有嵌入文本层（提前警告 OCR-only PDF）
+- 页数和基本元信息
+
+### 质量控制独立化（P1-04 新增）
+**核心功能**：独立的 QC 阶段，检查：
+- 提取数量与文本中引用的一致性
+- 图像尺寸合理性
+- 编号连续性（是否有跳跃）
+- 续页完整性
+
+**QA-06 增强（2025-12-24）**：
+- 支持罗马数字引用检测（`Figure I`~`Figure X`）
+- 支持 Supplementary + 罗马数字（`Figure SIV`）
+- 支持 Extended Data 引用
+- 使用 `\b` 边界减少误报
+
+### 图表正文上下文锚点（P1-09 新增）
+**问题背景**：图表重命名与 1–2 句解释的质量，往往取决于正文中首次提及与邻近段落对图表的解释。
+
+**核心功能**：
+- 生成 `images/figure_contexts.json`
+- 每个图表条目包含：
+  - `first_mention`：首次提及的页码、段落顺序、文本窗口（上下各一段）
+  - `all_mentions`：所有提及位置列表
+  - `caption_page_text_window`：图注所在页附近正文窗口
+- 覆盖提及形式：`Figure 3 / Fig. 3 / Figure S1 / Table S2 / 图3 / 表2 / Figure I`
+
+### 重命名工作流半自动化（P1-10 新增）
+**核心功能**：
+- 新增 `scripts/generate_rename_plan.py` 脚本
+- 自动生成重命名计划文件：
+  - macOS/Linux：`rename_plan.sh`
+  - Windows/PowerShell：`rename_plan.ps1`
+- 碰撞检测（同名、sanitize 后同名、大小写冲突）
+- 自动消歧（追加 `_1`, `_2` 后缀）
+- 执行后自动联动 `sync_index_after_rename.py`
+
+**使用示例**：
+```bash
+# 生成重命名计划（不执行）
+python3 scripts/generate_rename_plan.py <PDF_DIR>
+
+# 生成并执行
+python3 scripts/generate_rename_plan.py <PDF_DIR> --execute
+
+# 只检查碰撞（dry-run）
+python3 scripts/generate_rename_plan.py <PDF_DIR> --dry-run
+```
+
+### 结构化输入合同（P1-11 新增）
+**核心功能**：提取完成后显示合同状态，列出摘要生成所需的全部文件：
+- `images/index.json` — 图表清单
+- `text/gathered_text.json` — 结构化正文
+- `images/figure_contexts.json` — 图表正文上下文
+- `text/<paper>.txt` — 纯文本
+- `images/*.png` — 图表 PNG 文件
+
+**输出示例**：
+```
+============================================================
+P1-11: STRUCTURED INPUT CONTRACT FOR SUMMARY GENERATION
+============================================================
+  index.json                ✅ 2.5KB
+  gathered_text.json        ✅ 45.2KB
+  figure_contexts.json      ✅ 8.3KB
+  plain_text.txt            ✅ 32.1KB
+  PNG files                 ✅ 12 files
+============================================================
+CONTRACT STATUS: ✅ ALL FILES PRESENT
+============================================================
+```
 
 ## 生成带图摘要（大模型提示词模板）
 请务必同时提供 `text/<paper>.txt` 与 `images/*.png` 的完整集合。建议将 txt 的要点（或全文）与图片清单（图号+文件名）一并喂给模型。
