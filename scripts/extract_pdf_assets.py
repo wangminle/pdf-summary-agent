@@ -1680,6 +1680,9 @@ def _trim_clip_head_by_text_v2(
     far_side_para_min_ratio: float = 0.12,  # 从 0.20 降低到 0.12
     # Adaptive line height
     typical_line_h: Optional[float] = None,
+    # 2025-12-30 新增：表格保护 - 跳过 adjacent sweep
+    # 表格内容（表头、数据行）紧邻正文段落末尾，容易被 adjacent sweep 误删
+    skip_adjacent_sweep: bool = False,
     # Debug
     debug: bool = False,
 ) -> fitz.Rect:
@@ -1688,6 +1691,7 @@ def _trim_clip_head_by_text_v2(
     
     Phase A: Trim adjacent text (<adjacent_th, default 24pt) using original logic
     Phase B: Detect and remove far-distance text blocks (adjacent_th ~ far_text_th)
+    Phase C: Detect and remove far-side large paragraphs (远端大段落)
     
     Args:
         far_text_th: Maximum distance to detect far text (default 300pt)
@@ -1880,25 +1884,27 @@ def _trim_clip_head_by_text_v2(
                 # 2025-12-30 增强：邻近短行清扫
                 # 检测紧邻已裁切边界的短行（宽度不足但在正文附近，很可能是段落尾行）
                 # 例如 "images of molecules" 这类短行，虽然宽度只有 16%，但紧邻正文段落
-                adjacent_zone = max(40.0, 4.0 * (typical_line_h or 12.0))  # 4行高范围
-                for (lb, size_est, txt) in text_lines:
-                    if not txt.strip() or len(txt.strip()) < 3:
-                        continue
-                    inter = lb & clip
-                    if inter.width <= 0 or inter.height <= 0:
-                        continue
-                    # 只检查紧邻当前 y0 边界的行（在 adjacent_zone 内）
-                    if lb.y0 >= clip.y0 and lb.y0 < clip.y0 + adjacent_zone:
-                        # 宽度门槛放宽到 5%
-                        w_ok = (inter.width / max(1.0, clip.width)) >= 0.05
-                        s_ok = (font_min <= size_est <= font_max)
-                        if w_ok and s_ok:
-                            # 推进 y0 到这行底部
-                            candidate_y0 = lb.y1 + gap
-                            if candidate_y0 > clip.y0 and candidate_y0 <= max_trim:
-                                clip.y0 = candidate_y0
-                                if debug:
-                                    print(f"[DBG] Far-side adjacent sweep: '{txt.strip()[:25]}...' y0 -> {clip.y0:.1f}")
+                # 2025-12-30 修复：表格保护 - 跳过 adjacent sweep（表头紧邻正文末尾会被误删）
+                if not skip_adjacent_sweep:
+                    adjacent_zone = max(40.0, 4.0 * (typical_line_h or 12.0))  # 4行高范围
+                    for (lb, size_est, txt) in text_lines:
+                        if not txt.strip() or len(txt.strip()) < 3:
+                            continue
+                        inter = lb & clip
+                        if inter.width <= 0 or inter.height <= 0:
+                            continue
+                        # 只检查紧邻当前 y0 边界的行（在 adjacent_zone 内）
+                        if lb.y0 >= clip.y0 and lb.y0 < clip.y0 + adjacent_zone:
+                            # 宽度门槛放宽到 5%
+                            w_ok = (inter.width / max(1.0, clip.width)) >= 0.05
+                            s_ok = (font_min <= size_est <= font_max)
+                            if w_ok and s_ok:
+                                # 推进 y0 到这行底部
+                                candidate_y0 = lb.y1 + gap
+                                if candidate_y0 > clip.y0 and candidate_y0 <= max_trim:
+                                    clip.y0 = candidate_y0
+                                    if debug:
+                                        print(f"[DBG] Far-side adjacent sweep: '{txt.strip()[:25]}...' y0 -> {clip.y0:.1f}")
             else:
                 # Move clip.y1 up to before first far-side paragraph
                 first_para_y0 = min(lb.y0 for (lb, _, _) in far_side_para_lines)
@@ -1911,78 +1917,84 @@ def _trim_clip_head_by_text_v2(
                     print(f"[DBG] Far-side trim limited by min_trim ({trim_ratio:.0%}): {new_y1:.1f} -> {clip.y1:.1f}")
                 
                 # 2025-12-30 增强：邻近短行清扫（bottom 方向）
-                adjacent_zone = max(40.0, 4.0 * (typical_line_h or 12.0))
-                for (lb, size_est, txt) in text_lines:
-                    if not txt.strip() or len(txt.strip()) < 3:
-                        continue
-                    inter = lb & clip
-                    if inter.width <= 0 or inter.height <= 0:
-                        continue
-                    # 只检查紧邻当前 y1 边界的行
-                    if lb.y1 <= clip.y1 and lb.y1 > clip.y1 - adjacent_zone:
-                        w_ok = (inter.width / max(1.0, clip.width)) >= 0.05
-                        s_ok = (font_min <= size_est <= font_max)
-                        if w_ok and s_ok:
-                            candidate_y1 = lb.y0 - gap
-                            if candidate_y1 < clip.y1 and candidate_y1 >= min_trim:
-                                clip.y1 = candidate_y1
-                                if debug:
-                                    print(f"[DBG] Far-side adjacent sweep: '{txt.strip()[:25]}...' y1 -> {clip.y1:.1f}")
+                # 2025-12-30 修复：表格保护 - 跳过 adjacent sweep（表头紧邻正文末尾会被误删）
+                if not skip_adjacent_sweep:
+                    adjacent_zone = max(40.0, 4.0 * (typical_line_h or 12.0))
+                    for (lb, size_est, txt) in text_lines:
+                        if not txt.strip() or len(txt.strip()) < 3:
+                            continue
+                        inter = lb & clip
+                        if inter.width <= 0 or inter.height <= 0:
+                            continue
+                        # 只检查紧邻当前 y1 边界的行
+                        if lb.y1 <= clip.y1 and lb.y1 > clip.y1 - adjacent_zone:
+                            w_ok = (inter.width / max(1.0, clip.width)) >= 0.05
+                            s_ok = (font_min <= size_est <= font_max)
+                            if w_ok and s_ok:
+                                candidate_y1 = lb.y0 - gap
+                                if candidate_y1 < clip.y1 and candidate_y1 >= min_trim:
+                                    clip.y1 = candidate_y1
+                                    if debug:
+                                        print(f"[DBG] Far-side adjacent sweep: '{txt.strip()[:25]}...' y1 -> {clip.y1:.1f}")
             
             # 2025-12-30 增强：Phase C 主逻辑执行后，**迭代扫描**短行文字
             # 每次检测到短行后更新 clip，再检测下一批，直到没有新的短行
             # 这解决了 Figure 22 "images of molecules" 等短行残留问题
-            max_iterations = 5  # 防止无限循环
-            for _iter in range(max_iterations):
-                _extra_short_lines: List[fitz.Rect] = []
-                for (lb, size_est, text) in text_lines:
-                    txt = text.strip()
-                    if not txt or len(txt) < 5:
-                        continue
-                    inter = lb & clip  # 使用当前 clip
-                    if inter.width <= 0 or inter.height <= 0:
-                        continue
-                    # 检查是否在远端区域（扩大到整个远端 50%）
+            # 2025-12-30 修复：表格保护 - 跳过迭代扫描（表头紧邻正文末尾会被误删）
+            if skip_adjacent_sweep:
+                pass  # 表格模式：跳过迭代扫描
+            else:
+                max_iterations = 5  # 防止无限循环
+                for _iter in range(max_iterations):
+                    _extra_short_lines: List[fitz.Rect] = []
+                    for (lb, size_est, text) in text_lines:
+                        txt = text.strip()
+                        if not txt or len(txt) < 5:
+                            continue
+                        inter = lb & clip  # 使用当前 clip
+                        if inter.width <= 0 or inter.height <= 0:
+                            continue
+                        # 检查是否在远端区域（扩大到整个远端 50%）
+                        if far_is_top:
+                            far_region_end = clip.y0 + 0.5 * clip.height
+                            in_far = (lb.y0 < far_region_end)
+                        else:
+                            far_region_start = clip.y1 - 0.5 * clip.height
+                            in_far = (lb.y1 > far_region_start)
+                        if not in_far:
+                            continue
+                        # 宽度门槛放宽到 8%
+                        w_ratio_extra = inter.width / max(1.0, clip.width)
+                        if w_ratio_extra < 0.08:
+                            continue
+                        # 字号检查
+                        if not (font_min <= size_est <= font_max):
+                            continue
+                        _extra_short_lines.append(lb)
+                    
+                    if not _extra_short_lines:
+                        break  # 没有新的短行，停止迭代
+                    
                     if far_is_top:
-                        far_region_end = clip.y0 + 0.5 * clip.height
-                        in_far = (lb.y0 < far_region_end)
+                        new_y0 = max(lb.y1 for lb in _extra_short_lines) + gap
+                        # 使用与主裁切相同的 trim_ratio
+                        max_trim2 = original_clip.y0 + trim_ratio * original_clip.height
+                        if new_y0 > clip.y0 + 1e-3:
+                            clip.y0 = min(new_y0, max_trim2)
+                            if debug:
+                                print(f"[DBG] Far-side short-line sweep (iter {_iter+1}): +{len(_extra_short_lines)} lines, y0 -> {clip.y0:.1f}")
+                        else:
+                            break  # 无法再推进，停止
                     else:
-                        far_region_start = clip.y1 - 0.5 * clip.height
-                        in_far = (lb.y1 > far_region_start)
-                    if not in_far:
-                        continue
-                    # 宽度门槛放宽到 8%
-                    w_ratio_extra = inter.width / max(1.0, clip.width)
-                    if w_ratio_extra < 0.08:
-                        continue
-                    # 字号检查
-                    if not (font_min <= size_est <= font_max):
-                        continue
-                    _extra_short_lines.append(lb)
-                
-                if not _extra_short_lines:
-                    break  # 没有新的短行，停止迭代
-                
-                if far_is_top:
-                    new_y0 = max(lb.y1 for lb in _extra_short_lines) + gap
-                    # 使用与主裁切相同的 trim_ratio
-                    max_trim2 = original_clip.y0 + trim_ratio * original_clip.height
-                    if new_y0 > clip.y0 + 1e-3:
-                        clip.y0 = min(new_y0, max_trim2)
-                        if debug:
-                            print(f"[DBG] Far-side short-line sweep (iter {_iter+1}): +{len(_extra_short_lines)} lines, y0 -> {clip.y0:.1f}")
-                    else:
-                        break  # 无法再推进，停止
-                else:
-                    new_y1 = min(lb.y0 for lb in _extra_short_lines) - gap
-                    # 使用与主裁切相同的 trim_ratio
-                    min_trim2 = original_clip.y1 - trim_ratio * original_clip.height
-                    if new_y1 < clip.y1 - 1e-3:
-                        clip.y1 = max(new_y1, min_trim2)
-                        if debug:
-                            print(f"[DBG] Far-side short-line sweep (iter {_iter+1}): +{len(_extra_short_lines)} lines, y1 -> {clip.y1:.1f}")
-                    else:
-                        break  # 无法再推进，停止
+                        new_y1 = min(lb.y0 for lb in _extra_short_lines) - gap
+                        # 使用与主裁切相同的 trim_ratio
+                        min_trim2 = original_clip.y1 - trim_ratio * original_clip.height
+                        if new_y1 < clip.y1 - 1e-3:
+                            clip.y1 = max(new_y1, min_trim2)
+                            if debug:
+                                print(f"[DBG] Far-side short-line sweep (iter {_iter+1}): +{len(_extra_short_lines)} lines, y1 -> {clip.y1:.1f}")
+                        else:
+                            break  # 无法再推进，停止
         else:
             # Fallback: if no strong paragraph coverage on far side, still trim
             # obvious top/bottom stray lines that are far from the caption.
@@ -3814,6 +3826,64 @@ def extract_figures(
                                 return True
                     
                     return False
+                
+                def detect_excluded_sibling_objects(clip: fitz.Rect, objects: List[fitz.Rect], side: str) -> float:
+                    """
+                    2025-12-30 新增：检测窗口外是否存在"同属一组"的绘图对象
+                    
+                    问题背景：
+                        对于多行子图（如 3x2 布局的 Figure 5），当窗口边缘恰好落在两行子图之间的间隙时，
+                        detect_top_edge_truncation 不会检测到截断（因为没有单个对象跨越边界），
+                        但实际上排除了上方的整行子图。
+                    
+                    检测逻辑：
+                        1. 计算窗口内绘图对象的覆盖区域
+                        2. 检测窗口外（远端）是否存在与窗口内对象"水平对齐"的绘图对象
+                        3. 如果存在，返回被排除对象的面积占比（作为惩罚系数）
+                    
+                    参数:
+                        clip: 候选窗口
+                        objects: 页面中的所有对象
+                        side: 窗口方向（'above' = 图在 caption 上方，远端是顶部）
+                    
+                    返回:
+                        被排除对象面积 / 窗口内对象面积（比例越高说明截断越严重）
+                    """
+                    # 收集窗口内和窗口外的对象
+                    inside_objs: List[fitz.Rect] = []
+                    outside_objs: List[fitz.Rect] = []
+                    
+                    for obj in objects:
+                        # 检查对象是否与窗口水平重叠
+                        if not (obj.x0 < clip.x1 and obj.x1 > clip.x0):
+                            continue
+                        
+                        # 对象中心点
+                        obj_cy = (obj.y0 + obj.y1) / 2
+                        
+                        if clip.y0 <= obj_cy <= clip.y1:
+                            # 对象中心在窗口内
+                            inside_objs.append(obj)
+                        elif side == 'above' and obj_cy < clip.y0:
+                            # 对象在窗口上方（远端）
+                            outside_objs.append(obj)
+                        elif side == 'below' and obj_cy > clip.y1:
+                            # 对象在窗口下方（远端）
+                            outside_objs.append(obj)
+                    
+                    if not inside_objs or not outside_objs:
+                        return 0.0
+                    
+                    # 计算窗口内对象的总面积
+                    inside_area = sum(o.width * o.height for o in inside_objs)
+                    if inside_area < 1.0:
+                        return 0.0
+                    
+                    # 计算被排除对象的总面积
+                    outside_area = sum(o.width * o.height for o in outside_objs)
+                    
+                    # 返回比例
+                    return outside_area / inside_area
 
                 def fig_score(clip: fitz.Rect) -> float:
                     # 小分辨率渲染估计墨迹
@@ -3880,6 +3950,13 @@ def extract_figures(
                             # 方案B：边缘截断检测并扣分
                             if detect_top_edge_truncation(c, all_page_objects, 'above'):
                                 sc -= 0.15
+                            # 2025-12-30 新增：检测被排除的兄弟对象（多行子图场景）
+                            # 当窗口边缘落在子图行之间的间隙时，detect_top_edge_truncation 不会触发，
+                            # 但实际上排除了同一图表的其他子图行
+                            sibling_ratio = detect_excluded_sibling_objects(c, all_page_objects, 'above')
+                            if sibling_ratio > 0.3:  # 被排除对象面积 > 窗口内对象面积的 30%
+                                # 惩罚力度与被排除比例成正比，最高 0.20
+                                sc -= min(0.20, 0.15 * sibling_ratio)
                             candidates.append((sc, 'above', c))
                             y0 -= step
                             if y0 < y0_min:
@@ -3916,6 +3993,10 @@ def extract_figures(
                                     sc = fig_score(c)
                                     if detect_top_edge_truncation(c, all_page_objects, 'above'):
                                         sc -= 0.15
+                                    # 2025-12-30: 放松扫描也需要兄弟对象检测
+                                    sibling_ratio = detect_excluded_sibling_objects(c, all_page_objects, 'above')
+                                    if sibling_ratio > 0.3:
+                                        sc -= min(0.20, 0.15 * sibling_ratio)
                                     candidates.append((sc, 'above', c))
                                     y0 -= step
                                     if y0 < y0_min_relaxed:
@@ -3940,6 +4021,10 @@ def extract_figures(
                             # 方案B：边缘截断检测并扣分
                             if detect_top_edge_truncation(c, all_page_objects, 'below'):
                                 sc -= 0.15
+                            # 2025-12-30: below 扫描也需要兄弟对象检测
+                            sibling_ratio = detect_excluded_sibling_objects(c, all_page_objects, 'below')
+                            if sibling_ratio > 0.3:
+                                sc -= min(0.20, 0.15 * sibling_ratio)
                             candidates.append((sc, 'below', c))
                             y0 += step
                             y1 = min(y1_max, y0 + h)
@@ -4269,6 +4354,29 @@ def extract_figures(
                             # adjust top edge only
                             y0_new = min(tight.y0, max(clip.y0, clip.y1 - min_h_pt))
                             tight = fitz.Rect(tight.x0, y0_new, tight.x1, tight.y1)
+                    
+                    # 2025-12-30 新增：宽度方向收缩保护
+                    # 避免 autocrop 在 x 方向过度收缩（如裁掉 y 轴标签）
+                    # 最大允许宽度收缩为 autocrop_shrink_limit（默认 35%）
+                    if autocrop_shrink_limit is not None:
+                        min_w_pt = clip.width * (1.0 - autocrop_shrink_limit)
+                        if tight.width < min_w_pt:
+                            # 计算需要回扩的量，左右各扩一半
+                            expand_total = min_w_pt - tight.width
+                            expand_each = expand_total / 2.0
+                            new_x0 = max(page_rect.x0, tight.x0 - expand_each)
+                            new_x1 = min(page_rect.x1, tight.x1 + expand_each)
+                            # 确保回扩后宽度达到 min_w_pt
+                            if (new_x1 - new_x0) < min_w_pt:
+                                # 如果一侧到边了，另一侧多扩
+                                if new_x0 == page_rect.x0:
+                                    new_x1 = min(page_rect.x1, new_x0 + min_w_pt)
+                                elif new_x1 == page_rect.x1:
+                                    new_x0 = max(page_rect.x0, new_x1 - min_w_pt)
+                            tight = fitz.Rect(new_x0, tight.y0, new_x1, tight.y1)
+                            if debug_captions:
+                                logger.debug(f"Figure {fig_no}: [WIDTH PROTECT] Expanded width from {tight.width:.1f}pt to {new_x1-new_x0:.1f}pt (min={min_w_pt:.1f}pt)")
+                    
                     # Near-edge overshoot pad: expand a bit towards caption side to avoid missing axes/labels
                     if near_edge_pad_px and near_edge_pad_px > 0:
                         pad_pt = near_edge_pad_px / scale
@@ -5138,6 +5246,10 @@ def extract_tables(
     # P1-1: 下调阈值以覆盖"中间地带"（约 3-7 行）
     far_side_min_dist: float = 50.0,  # 从 100.0 降低到 50.0
     far_side_para_min_ratio: float = 0.12,  # 从 0.20 降低到 0.12
+    # 2025-12-30 修复：表格 Phase C 使用更高的宽度阈值
+    # 表格内容（表头、数据行）通常是短文本，而正文段落是长行
+    # 使用更高的宽度阈值可以正确识别正文段落，同时不误判表格内容
+    table_far_side_width_ratio: float = 0.7,  # 表格的 Phase C 使用 70% 宽度阈值（默认 50%）
     # B)
     object_pad: float = 8.0,
     object_min_area_ratio: float = 0.005,
@@ -5796,17 +5908,21 @@ def extract_tables(
                 ))
 
             # A) 文本邻接裁切（含远侧文字 Phase C）
+            # 2025-12-30 修复：表格内容保护 - 跳过 Phase C 以避免表头被误判为正文
             clip_after_A = fitz.Rect(clip)
             if text_trim:
                 # 获取典型行高用于两行检测
                 typical_lh = line_metrics.get('typical_line_height') if (adaptive_line_height and 'line_metrics' in locals()) else None
+                # 2025-12-30 修复：表格使用更高的宽度阈值（70%）来识别正文段落
+                # 这样表格内的短文本（单元格）不会被当作段落，但跨越整行的正文段落仍会被裁剪
+                table_width_ratio = max(text_trim_width_ratio, table_far_side_width_ratio)
                 clip = _trim_clip_head_by_text_v2(
                     clip,
                     page_rect,
                     cap_rect,
                     side,
                     text_lines_all,
-                    width_ratio=text_trim_width_ratio,
+                    width_ratio=table_width_ratio,  # 表格使用更高的宽度阈值
                     font_min=text_trim_font_min,
                     font_max=text_trim_font_max,
                     gap=text_trim_gap,
@@ -5817,6 +5933,7 @@ def extract_tables(
                     far_side_min_dist=far_side_min_dist,
                     far_side_para_min_ratio=far_side_para_min_ratio,
                     typical_line_h=typical_lh,
+                    skip_adjacent_sweep=True,  # 2025-12-30 修复：表格跳过 adjacent sweep（保护表头）
                     debug=debug_captions,
                 )
                 clip_after_A = fitz.Rect(clip)
@@ -5825,7 +5942,7 @@ def extract_tables(
                         name="Phase A (Text Trimming)",
                         rect=fitz.Rect(clip_after_A),
                         color=(0, 200, 0),  # 绿色
-                        description="After removing adjacent text (Phase A+B+C)"
+                        description=f"After removing adjacent text (table width_ratio={table_width_ratio:.0%})"
                     ))
 
             # B) 对象连通域引导
@@ -6133,9 +6250,11 @@ def extract_tables(
                         },
                     )
                     typical_lh_fallback_tbl = line_metrics.get('typical_line_height') if (adaptive_line_height and 'line_metrics' in locals()) else None
+                    # 2025-12-30 修复：表格使用更高的宽度阈值（70%）来识别正文段落
+                    table_width_ratio_fallback = max(text_trim_width_ratio, table_far_side_width_ratio)
                     clip_A = _trim_clip_head_by_text_v2(
                         base_clip, page_rect, cap_rect, side, text_lines_all,
-                        width_ratio=text_trim_width_ratio,
+                        width_ratio=table_width_ratio_fallback,  # 表格使用更高的宽度阈值
                         font_min=text_trim_font_min,
                         font_max=text_trim_font_max,
                         gap=text_trim_gap,
@@ -6146,6 +6265,7 @@ def extract_tables(
                         far_side_min_dist=far_side_min_dist,
                         far_side_para_min_ratio=far_side_para_min_ratio,
                         typical_line_h=typical_lh_fallback_tbl,
+                        skip_adjacent_sweep=True,  # 2025-12-30 修复：表格跳过 adjacent sweep（保护表头）
                         debug=debug_captions,
                     ) if text_trim else base_clip
                     # P1-07: 二次门槛也使用动态阈值
