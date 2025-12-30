@@ -1195,14 +1195,9 @@ class DocumentLayoutModel:
     # 留白区域（可能包含图表的区域）
     vacant_regions: Dict[int, List[fitz.Rect]]     # key=page_num
     
-    def to_dict(self, include_details: bool = True) -> Dict:
-        """
-        转换为可序列化的字典
-        
-        Args:
-            include_details: 是否包含 text_blocks 的 bbox/type 细节（P2-3 增强）
-        """
-        result = {
+    def to_dict(self) -> Dict:
+        """转换为可序列化的字典"""
+        return {
             'page_size': self.page_size,
             'num_columns': self.num_columns,
             'margins': {
@@ -1221,29 +1216,6 @@ class DocumentLayoutModel:
             'text_blocks_count': {str(k): len(v) for k, v in self.text_blocks.items()},
             'vacant_regions_count': {str(k): len(v) for k, v in self.vacant_regions.items()}
         }
-        
-        # P2-3 增强：落盘 text_blocks 的 bbox/type 细节
-        if include_details:
-            text_blocks_detail = {}
-            for page_num, blocks in self.text_blocks.items():
-                page_blocks = []
-                for block in blocks:
-                    block_info = {
-                        'type': block.block_type,
-                        'bbox': [round(block.bbox.x0, 2), round(block.bbox.y0, 2), 
-                                 round(block.bbox.x1, 2), round(block.bbox.y1, 2)],
-                        'column': block.column,
-                        'units_count': len(block.units),
-                    }
-                    # 只保存前 100 字符的文本样本
-                    sample_text = ' '.join(u.text[:50] for u in block.units[:2]).strip()
-                    if sample_text:
-                        block_info['sample'] = sample_text[:100]
-                    page_blocks.append(block_info)
-                text_blocks_detail[str(page_num)] = page_blocks
-            result['text_blocks'] = text_blocks_detail
-        
-        return result
     
     @classmethod
     def from_dict(cls, data: Dict) -> 'DocumentLayoutModel':
@@ -1675,9 +1647,8 @@ def _trim_clip_head_by_text_v2(
     far_text_para_min_ratio: float = 0.30,
     far_text_trim_mode: str = "aggressive",
     # Phase C tuners (far-side paragraphs)
-    # P1-1: 下调阈值以覆盖"中间地带"（约 3-7 行）
-    far_side_min_dist: float = 50.0,  # 从 100.0 降低到 50.0
-    far_side_para_min_ratio: float = 0.12,  # 从 0.20 降低到 0.12
+    far_side_min_dist: float = 100.0,
+    far_side_para_min_ratio: float = 0.20,
     # Adaptive line height
     typical_line_h: Optional[float] = None,
     # Debug
@@ -1868,121 +1839,16 @@ def _trim_clip_head_by_text_v2(
                 # Move clip.y0 down to after last far-side paragraph
                 last_para_y1 = max(lb.y1 for (lb, _, _) in far_side_para_lines)
                 new_y0 = last_para_y1 + gap
-                # 2025-12-30 修复：当远端文字覆盖率高时放宽裁切限制
-                # 高覆盖率（>15%）说明有大量正文需要移除，放宽到 65%
-                # 低覆盖率使用保守的 50% 限制
-                trim_ratio = 0.65 if far_side_para_coverage >= 0.15 else 0.50
-                max_trim = original_clip.y0 + trim_ratio * original_clip.height
+                # Safety: don't trim more than 50% of original clip height
+                max_trim = original_clip.y0 + 0.5 * original_clip.height
                 clip.y0 = min(new_y0, max_trim)
-                if debug and new_y0 > max_trim:
-                    print(f"[DBG] Far-side trim limited by max_trim ({trim_ratio:.0%}): {new_y0:.1f} -> {clip.y0:.1f}")
-                
-                # 2025-12-30 增强：邻近短行清扫
-                # 检测紧邻已裁切边界的短行（宽度不足但在正文附近，很可能是段落尾行）
-                # 例如 "images of molecules" 这类短行，虽然宽度只有 16%，但紧邻正文段落
-                adjacent_zone = max(40.0, 4.0 * (typical_line_h or 12.0))  # 4行高范围
-                for (lb, size_est, txt) in text_lines:
-                    if not txt.strip() or len(txt.strip()) < 3:
-                        continue
-                    inter = lb & clip
-                    if inter.width <= 0 or inter.height <= 0:
-                        continue
-                    # 只检查紧邻当前 y0 边界的行（在 adjacent_zone 内）
-                    if lb.y0 >= clip.y0 and lb.y0 < clip.y0 + adjacent_zone:
-                        # 宽度门槛放宽到 5%
-                        w_ok = (inter.width / max(1.0, clip.width)) >= 0.05
-                        s_ok = (font_min <= size_est <= font_max)
-                        if w_ok and s_ok:
-                            # 推进 y0 到这行底部
-                            candidate_y0 = lb.y1 + gap
-                            if candidate_y0 > clip.y0 and candidate_y0 <= max_trim:
-                                clip.y0 = candidate_y0
-                                if debug:
-                                    print(f"[DBG] Far-side adjacent sweep: '{txt.strip()[:25]}...' y0 -> {clip.y0:.1f}")
             else:
                 # Move clip.y1 up to before first far-side paragraph
                 first_para_y0 = min(lb.y0 for (lb, _, _) in far_side_para_lines)
                 new_y1 = first_para_y0 - gap
-                # 2025-12-30 修复：当远端文字覆盖率高时放宽裁切限制
-                trim_ratio = 0.65 if far_side_para_coverage >= 0.15 else 0.50
-                min_trim = original_clip.y1 - trim_ratio * original_clip.height
+                # Safety: don't trim more than 50% of original clip height
+                min_trim = original_clip.y1 - 0.5 * original_clip.height
                 clip.y1 = max(new_y1, min_trim)
-                if debug and new_y1 < min_trim:
-                    print(f"[DBG] Far-side trim limited by min_trim ({trim_ratio:.0%}): {new_y1:.1f} -> {clip.y1:.1f}")
-                
-                # 2025-12-30 增强：邻近短行清扫（bottom 方向）
-                adjacent_zone = max(40.0, 4.0 * (typical_line_h or 12.0))
-                for (lb, size_est, txt) in text_lines:
-                    if not txt.strip() or len(txt.strip()) < 3:
-                        continue
-                    inter = lb & clip
-                    if inter.width <= 0 or inter.height <= 0:
-                        continue
-                    # 只检查紧邻当前 y1 边界的行
-                    if lb.y1 <= clip.y1 and lb.y1 > clip.y1 - adjacent_zone:
-                        w_ok = (inter.width / max(1.0, clip.width)) >= 0.05
-                        s_ok = (font_min <= size_est <= font_max)
-                        if w_ok and s_ok:
-                            candidate_y1 = lb.y0 - gap
-                            if candidate_y1 < clip.y1 and candidate_y1 >= min_trim:
-                                clip.y1 = candidate_y1
-                                if debug:
-                                    print(f"[DBG] Far-side adjacent sweep: '{txt.strip()[:25]}...' y1 -> {clip.y1:.1f}")
-            
-            # 2025-12-30 增强：Phase C 主逻辑执行后，**迭代扫描**短行文字
-            # 每次检测到短行后更新 clip，再检测下一批，直到没有新的短行
-            # 这解决了 Figure 22 "images of molecules" 等短行残留问题
-            max_iterations = 5  # 防止无限循环
-            for _iter in range(max_iterations):
-                _extra_short_lines: List[fitz.Rect] = []
-                for (lb, size_est, text) in text_lines:
-                    txt = text.strip()
-                    if not txt or len(txt) < 5:
-                        continue
-                    inter = lb & clip  # 使用当前 clip
-                    if inter.width <= 0 or inter.height <= 0:
-                        continue
-                    # 检查是否在远端区域（扩大到整个远端 50%）
-                    if far_is_top:
-                        far_region_end = clip.y0 + 0.5 * clip.height
-                        in_far = (lb.y0 < far_region_end)
-                    else:
-                        far_region_start = clip.y1 - 0.5 * clip.height
-                        in_far = (lb.y1 > far_region_start)
-                    if not in_far:
-                        continue
-                    # 宽度门槛放宽到 8%
-                    w_ratio_extra = inter.width / max(1.0, clip.width)
-                    if w_ratio_extra < 0.08:
-                        continue
-                    # 字号检查
-                    if not (font_min <= size_est <= font_max):
-                        continue
-                    _extra_short_lines.append(lb)
-                
-                if not _extra_short_lines:
-                    break  # 没有新的短行，停止迭代
-                
-                if far_is_top:
-                    new_y0 = max(lb.y1 for lb in _extra_short_lines) + gap
-                    # 使用与主裁切相同的 trim_ratio
-                    max_trim2 = original_clip.y0 + trim_ratio * original_clip.height
-                    if new_y0 > clip.y0 + 1e-3:
-                        clip.y0 = min(new_y0, max_trim2)
-                        if debug:
-                            print(f"[DBG] Far-side short-line sweep (iter {_iter+1}): +{len(_extra_short_lines)} lines, y0 -> {clip.y0:.1f}")
-                    else:
-                        break  # 无法再推进，停止
-                else:
-                    new_y1 = min(lb.y0 for lb in _extra_short_lines) - gap
-                    # 使用与主裁切相同的 trim_ratio
-                    min_trim2 = original_clip.y1 - trim_ratio * original_clip.height
-                    if new_y1 < clip.y1 - 1e-3:
-                        clip.y1 = max(new_y1, min_trim2)
-                        if debug:
-                            print(f"[DBG] Far-side short-line sweep (iter {_iter+1}): +{len(_extra_short_lines)} lines, y1 -> {clip.y1:.1f}")
-                    else:
-                        break  # 无法再推进，停止
         else:
             # Fallback: if no strong paragraph coverage on far side, still trim
             # obvious top/bottom stray lines that are far from the caption.
@@ -2233,57 +2099,13 @@ def _build_text_masks_px(
     near_frac: float = 0.6,
     width_ratio: float = 0.5,
     font_max: float = 14.0,
-    mask_mode: str = 'auto',  # P0-2: 'near' | 'both' | 'auto'
-    far_edge_zone: float = 40.0,  # P0-2: 远端检测区域（pt）
 ) -> List[Tuple[int, int, int, int]]:
     """Convert selected text line rects to PIXEL-space masks relative to clip.
-    
-    P0-2 增强：支持远端掩膜模式
-    - 'near'：仅掩膜靠近 caption 的一侧（原行为）
-    - 'both'：同时掩膜近端和远端的正文行
-    - 'auto'（默认）：智能判断，近端总是掩膜，远端仅当检测到正文行时才掩膜
-    
-    对于 'above'：near side = bottom，far side = top
-    对于 'below'：near side = top，far side = bottom
+    Limit to NEAR-CAPTION portion: for 'above' use bottom fraction; for 'below' use top fraction.
     """
     masks: List[Tuple[int, int, int, int]] = []
     y_thresh_top = clip.y0 + near_frac * clip.height
     y_thresh_bot = clip.y1 - near_frac * clip.height
-    
-    # 确定掩膜区域
-    mask_near = True  # 近端总是掩膜
-    mask_far = (mask_mode == 'both')  # 'both' 模式时掩膜远端
-    
-    # 'auto' 模式：检测远端是否有正文行，有则掩膜
-    far_side_lines: List[Tuple[fitz.Rect, float, str]] = []
-    if mask_mode == 'auto':
-        far_is_top = (direction == 'above')
-        for (lb, fs, text) in text_lines:
-            txt = text.strip()
-            if not txt:
-                continue
-            if fs > font_max:
-                continue
-            inter = lb & clip
-            if inter.width <= 0 or inter.height <= 0:
-                continue
-            # 正文特征：宽度覆盖 + 长度 > 10
-            if (inter.width / max(1.0, clip.width)) < width_ratio:
-                continue
-            if len(txt) < 10:
-                continue
-            # 检查是否在远端边缘附近
-            if far_is_top:
-                dist = lb.y0 - clip.y0
-                if dist < far_edge_zone:
-                    far_side_lines.append((lb, fs, text))
-            else:
-                dist = clip.y1 - lb.y1
-                if dist < far_edge_zone:
-                    far_side_lines.append((lb, fs, text))
-        
-        mask_far = len(far_side_lines) > 0
-    
     for (lb, fs, text) in text_lines:
         if not text.strip():
             continue
@@ -2294,34 +2116,14 @@ def _build_text_masks_px(
             continue
         if (inter.width / max(1.0, clip.width)) < width_ratio:
             continue
-        
-        # 判断该文本行在近端还是远端
-        in_near_side = False
-        in_far_side = False
-        
         if direction == 'above':
-            # near side is bottom, far side is top
-            if inter.y0 >= y_thresh_bot:
-                in_near_side = True
-            if inter.y1 <= y_thresh_top:
-                in_far_side = True
+            # near side is bottom → keep only bottom portion
+            if inter.y0 < y_thresh_bot:
+                continue
         else:
-            # near side is top, far side is bottom
-            if inter.y1 <= y_thresh_top:
-                in_near_side = True
-            if inter.y0 >= y_thresh_bot:
-                in_far_side = True
-        
-        # 根据掩膜模式决定是否添加
-        should_mask = False
-        if mask_near and in_near_side:
-            should_mask = True
-        if mask_far and in_far_side:
-            should_mask = True
-        
-        if not should_mask:
-            continue
-        
+            # near side is top → keep only top portion
+            if inter.y1 > y_thresh_top:
+                continue
         # convert to pixel coords
         l = int(max(0, (inter.x0 - clip.x0) * scale))
         t = int(max(0, (inter.y0 - clip.y0) * scale))
@@ -2330,189 +2132,6 @@ def _build_text_masks_px(
         if r - l > 1 and b - t > 1:
             masks.append((l, t, r, b))
     return masks
-
-
-# ---------- P0-1: 远端正文证据检测（用于 Phase D 单调性约束） ----------
-def _detect_far_side_text_evidence(
-    clip: fitz.Rect,
-    text_lines: List[Tuple[fitz.Rect, float, str]],
-    direction: str,
-    edge_zone: float = 40.0,  # 检测远端边缘附近 40pt 范围
-    min_width_ratio: float = 0.30,  # 正文行的最小宽度比例
-    font_min: float = 7.0,
-    font_max: float = 16.0,
-) -> Tuple[bool, float]:
-    """
-    检测远端边缘附近是否有正文行证据。
-    
-    用于 P0-1 单调性约束：当远端附近有正文行时，Phase D 不应该扩展到这些行的区域。
-    
-    Args:
-        clip: 当前裁剪区域
-        text_lines: 所有文本行 [(rect, font_size, text), ...]
-        direction: 'above' 或 'below'，表示图在 caption 的哪一侧
-        edge_zone: 远端边缘附近的检测范围（pt）
-        min_width_ratio: 被认为是正文的最小宽度比例
-        font_min/font_max: 正文字号范围
-    
-    Returns:
-        (has_evidence, suggested_limit):
-        - has_evidence: 是否检测到正文证据
-        - suggested_limit: 如果有证据，建议的边界限制（远端不应超过此值）
-    """
-    if clip.height <= 1 or clip.width <= 1:
-        return False, 0.0
-    
-    far_is_top = (direction == 'above')
-    evidence_lines: List[fitz.Rect] = []
-    
-    for (lb, fs, text) in text_lines:
-        txt = text.strip()
-        if not txt:
-            continue
-        
-        inter = lb & clip
-        if inter.width <= 0 or inter.height <= 0:
-            continue
-        
-        # 检查宽度比例（正文特征：跨越较大宽度）
-        width_ratio = inter.width / max(1.0, clip.width)
-        if width_ratio < min_width_ratio:
-            continue
-        
-        # 检查字号（正文范围）
-        if not (font_min <= fs <= font_max):
-            continue
-        
-        # 检查文本长度（正文通常较长）
-        if len(txt) < 10:
-            continue
-        
-        # 检查是否在远端边缘附近
-        if far_is_top:
-            dist_to_far_edge = lb.y0 - clip.y0
-            if dist_to_far_edge < edge_zone:
-                evidence_lines.append(lb)
-        else:
-            dist_to_far_edge = clip.y1 - lb.y1
-            if dist_to_far_edge < edge_zone:
-                evidence_lines.append(lb)
-    
-    if evidence_lines:
-        # 建议的边界限制 = 最靠近图表内容的正文行边界 + gap
-        gap = 6.0
-        if far_is_top:
-            # 远端是顶部，限制 = 正文行的最大 y1 + gap
-            suggested_limit = max(lb.y1 for lb in evidence_lines) + gap
-        else:
-            # 远端是底部，限制 = 正文行的最小 y0 - gap
-            suggested_limit = min(lb.y0 for lb in evidence_lines) - gap
-        return True, suggested_limit
-    
-    return False, 0.0
-
-
-# ---------- P0-3: Phase D 后轻量去正文后处理 ----------
-def _trim_far_side_text_post_autocrop(
-    clip: fitz.Rect,
-    text_lines: List[Tuple[fitz.Rect, float, str]],
-    direction: str,
-    *,
-    typical_line_h: Optional[float] = None,
-    scan_lines: int = 3,  # 扫描顶部/底部多少行
-    min_width_ratio: float = 0.30,
-    min_text_len: int = 15,
-    font_min: float = 7.0,
-    font_max: float = 16.0,
-    gap: float = 6.0,
-) -> Tuple[fitz.Rect, bool]:
-    """
-    Phase D 后的轻量去正文后处理（P0-3）。
-    
-    在 autocrop 完成后，扫描远端边缘附近 1-3 个行高范围内的正文行，
-    如果检测到明确的正文，向内推 y0/y1（只动 y，不动 x）。
-    
-    这是对 P0-1 和 P0-2 的补充，用于处理：
-    - 少量正文（1-2 行）
-    - overlap 不够 20%
-    - Phase C 没有触发
-    
-    Args:
-        clip: 当前裁剪区域（Phase D autocrop 后）
-        text_lines: 所有文本行 [(rect, font_size, text), ...]
-        direction: 'above' 或 'below'
-        typical_line_h: 典型行高（用于计算扫描范围）
-        scan_lines: 扫描多少行（默认 3）
-        min_width_ratio: 正文的最小宽度比例
-        min_text_len: 正文的最小长度
-        font_min/font_max: 正文字号范围
-        gap: 裁剪后的间隙
-    
-    Returns:
-        (new_clip, was_trimmed): 新的裁剪区域和是否进行了裁剪
-    """
-    if clip.height <= 1 or clip.width <= 1:
-        return clip, False
-    
-    # 确定扫描范围
-    if typical_line_h and typical_line_h > 0:
-        scan_range = typical_line_h * scan_lines
-    else:
-        scan_range = 45.0  # 默认约 3 行（15pt/行）
-    
-    far_is_top = (direction == 'above')
-    text_to_trim: List[fitz.Rect] = []
-    
-    for (lb, fs, text) in text_lines:
-        txt = text.strip()
-        if not txt:
-            continue
-        
-        inter = lb & clip
-        if inter.width <= 0 or inter.height <= 0:
-            continue
-        
-        # 正文特征检查
-        width_ratio = inter.width / max(1.0, clip.width)
-        if width_ratio < min_width_ratio:
-            continue
-        if len(txt) < min_text_len:
-            continue
-        if not (font_min <= fs <= font_max):
-            continue
-        
-        # 检查是否在远端边缘的扫描范围内
-        if far_is_top:
-            dist = lb.y0 - clip.y0
-            if dist < scan_range:
-                text_to_trim.append(lb)
-        else:
-            dist = clip.y1 - lb.y1
-            if dist < scan_range:
-                text_to_trim.append(lb)
-    
-    if not text_to_trim:
-        return clip, False
-    
-    # 计算新边界
-    new_clip = fitz.Rect(clip)
-    if far_is_top:
-        # 远端是顶部，向内推 y0
-        max_y1 = max(lb.y1 for lb in text_to_trim)
-        new_y0 = max_y1 + gap
-        # 安全检查：不能裁剪超过 50% 高度
-        if new_y0 < clip.y0 + 0.5 * clip.height:
-            new_clip = fitz.Rect(clip.x0, new_y0, clip.x1, clip.y1)
-    else:
-        # 远端是底部，向内推 y1
-        min_y0 = min(lb.y0 for lb in text_to_trim)
-        new_y1 = min_y0 - gap
-        # 安全检查：不能裁剪超过 50% 高度
-        if new_y1 > clip.y0 + 0.5 * clip.height:
-            new_clip = fitz.Rect(clip.x0, clip.y0, clip.x1, new_y1)
-    
-    was_trimmed = (new_clip != clip)
-    return new_clip, was_trimmed
 
 
 # ---------- P1-07: 精裁验收阈值动态化 ----------
@@ -3247,9 +2866,8 @@ def extract_figures(
     far_text_th: float = 300.0,
     far_text_para_min_ratio: float = 0.30,
     far_text_trim_mode: str = "aggressive",
-    # P1-1: 下调阈值以覆盖"中间地带"（约 3-7 行）
-    far_side_min_dist: float = 50.0,  # 从 100.0 降低到 50.0
-    far_side_para_min_ratio: float = 0.12,  # 从 0.20 降低到 0.12
+    far_side_min_dist: float = 100.0,
+    far_side_para_min_ratio: float = 0.20,
     # B: object connectivity options
     object_pad: float = 8.0,
     object_min_area_ratio: float = 0.010,
@@ -3327,23 +2945,18 @@ def extract_figures(
         if adjacent_th == 24.0:  # 默认值
             adjacent_th = 2.0 * typical_line_h
         if far_text_th == 300.0:  # 默认值
-            # 2025-12-30 修复：提高倍数从 10.0 到 15.0
-            # 原因：Figure 18/22/29 残留文字距离 caption 128-142pt，超出 10×行高(109pt)
-            # 15×行高 ≈ 163.5pt 可以覆盖这些情况
-            far_text_th = 15.0 * typical_line_h
+            far_text_th = 10.0 * typical_line_h
         if text_trim_gap == 6.0:  # 默认值
             text_trim_gap = 0.5 * typical_line_h
-        if far_side_min_dist == 50.0:  # P1-1 调整后的新默认值
-            # P1-1 调整：使用 3.0× 行高，以便检测"中间地带"文字（约 3-7 行）
-            # 3.0 × line_height ≈ 33pt，能够覆盖更多的干扰文字
-            far_side_min_dist = 3.0 * typical_line_h
+        if far_side_min_dist == 100.0:  # 默认值
+            far_side_min_dist = 8.0 * typical_line_h
         
         if debug_captions:
             print(f"ADAPTIVE PARAMETERS (based on line_height={typical_line_h:.1f}pt):")
             print(f"  adjacent_th:      {adjacent_th:.1f} pt (2.0× line_height)")
-            print(f"  far_text_th:      {far_text_th:.1f} pt (15.0× line_height)")
+            print(f"  far_text_th:      {far_text_th:.1f} pt (10.0× line_height)")
             print(f"  text_trim_gap:    {text_trim_gap:.1f} pt (0.5× line_height)")
-            print(f"  far_side_min_dist:{far_side_min_dist:.1f} pt (3.0× line_height)")
+            print(f"  far_side_min_dist:{far_side_min_dist:.1f} pt (8.0× line_height)")
             print()
 
     # --- P0-03 修复：改为返回 List[str] 以支持 "S1" 等附录编号 ---
@@ -3884,42 +3497,6 @@ def extract_figures(
                             y0 -= step
                             if y0 < y0_min:
                                 break
-                
-                # ============================================================
-                # P2-2: 同页多图冲突修复（Caption Midline Guard 自适应放松）
-                # ============================================================
-                # 问题：当相邻两个 caption 距离较远，但当前图表内容跨越“中线”，
-                #       固定 midline guard 会硬性抬高 y0_min_guard，导致窗口无法覆盖完整图表。
-                # 典型：gpt-5-system-card Figure 23（同页 Figure 22/23）。
-                #
-                # 策略：仅在以下条件同时满足时放松 guard：
-                # 1) prev_cap 存在且 midline guard 实际生效（y0_min_guard > top_bound）
-                # 2) 在 guard 约束下得到的最优 above 候选，顶部被对象截断（detect_top_edge_truncation==True）
-                # 3) 最优候选的 y0 接近 y0_min_guard（说明确实被 guard 卡住）
-                #
-                # 放松方式：将 y0_min_guard 回退到 top_bound（仍不越过 prev_cap.y1+8），再补扫一次 above 候选。
-                # ============================================================
-                if prev_cap is not None and effective_side in (None, 'above') and (y0_min_guard > top_bound + 1e-3):
-                    cand_above = [t for t in candidates if t[1] == 'above']
-                    if cand_above:
-                        best_above = max(cand_above, key=lambda t: t[0])
-                        best_clip = best_above[2]
-                        if abs(best_clip.y0 - y0_min_guard) <= 2.5 and detect_top_edge_truncation(best_clip, all_page_objects, 'above'):
-                            if debug_captions:
-                                print(f"[DBG] P2-2 relax mid-guard for Figure {fig_no} p{pno+1}: y0_min_guard {y0_min_guard:.1f} -> {top_bound:.1f} (best_above truncated at top)")
-                            y0_min_relaxed = max(page_rect.y0, top_bound)
-                            for h in heights:
-                                y1 = bot_bound
-                                y0 = max(y0_min_relaxed, y1 - h)
-                                while y0 + 40.0 <= y1:
-                                    c = fitz.Rect(x_left, y0, x_right, y1)
-                                    sc = fig_score(c)
-                                    if detect_top_edge_truncation(c, all_page_objects, 'above'):
-                                        sc -= 0.15
-                                    candidates.append((sc, 'above', c))
-                                    y0 -= step
-                                    if y0 < y0_min_relaxed:
-                                        break
                 # below scanning
                 top2 = cap_rect.y1 + caption_gap
                 bot2 = (next_cap.y0 - 8) if next_cap else page_rect.y1
@@ -3945,30 +3522,6 @@ def extract_figures(
                             y1 = min(y1_max, y0 + h)
                             if y0 >= y1_max:
                                 break
-                
-                # P2-2 对称放松：若 midline guard 卡住了 below 候选的底部且检测到对象被底部截断，则放松到 bot2
-                if next_cap is not None and effective_side in (None, 'below') and (y1_max_guard < min(bot2, page_rect.y1) - 1e-3):
-                    cand_below = [t for t in candidates if t[1] == 'below']
-                    if cand_below:
-                        best_below = max(cand_below, key=lambda t: t[0])
-                        best_clip = best_below[2]
-                        if abs(best_clip.y1 - y1_max_guard) <= 2.5 and detect_top_edge_truncation(best_clip, all_page_objects, 'below'):
-                            if debug_captions:
-                                print(f"[DBG] P2-2 relax mid-guard (below) for Figure {fig_no} p{pno+1}: y1_max_guard {y1_max_guard:.1f} -> {min(bot2, page_rect.y1):.1f} (best_below truncated at bottom)")
-                            y1_max_relaxed = min(bot2, page_rect.y1)
-                            for h in heights:
-                                y0 = min(max(page_rect.y0, top2), page_rect.y1 - 40)
-                                y1 = min(y1_max_relaxed, y0 + h)
-                                while y1 - 40.0 >= y0:
-                                    c = fitz.Rect(x_left, y0, x_right, y1)
-                                    sc = fig_score(c)
-                                    if detect_top_edge_truncation(c, all_page_objects, 'below'):
-                                        sc -= 0.15
-                                    candidates.append((sc, 'below', c))
-                                    y0 += step
-                                    y1 = min(y1_max_relaxed, y0 + h)
-                                    if y0 >= y1_max_relaxed:
-                                        break
                 if not candidates:
                     clip = fitz.Rect(x_left, max(page_rect.y0, cap_rect.y0 - 200), x_right, min(page_rect.y1, cap_rect.y1 + 200))
                     side = 'above'
@@ -4170,91 +3723,15 @@ def extract_figures(
                         clip.x0 + r / scale,
                         clip.y0 + b / scale,
                     )
-                    
-                    # ============================================================
-                    # 【P0-1 核心约束】Phase D 远端边界单调性约束
-                    # ============================================================
-                    # 核心原则：Phase D 在远端方向上不应该超过 Phase A/C 已经确定的边界
-                    # 
-                    # 触发条件（满足其一即触发）：
-                    # 1. Phase A/C 在远端做了裁剪（>2pt）
-                    # 2. 远端附近（<40pt）检测到正文行证据
-                    # 
-                    # 约束逻辑：
-                    # - 记录 far_bound_limit（远端边界上限）
-                    # - Phase D 的所有操作（autocrop、protect_far_edge、etc）都不能超过此边界
-                    # ============================================================
-                    far_bound_limit: Optional[float] = None
-                    far_bound_reason = ""
-                    
-                    if side == 'above':
-                        # 远端是顶部
-                        # 条件1：检查 Phase A/C 是否裁剪了顶部
-                        if clip_after_A is not None:
-                            phase_a_far_trim = clip_after_A.y0 - base_clip.y0
-                            if phase_a_far_trim > 2.0:  # 降低阈值从 5pt 到 2pt
-                                far_bound_limit = clip_after_A.y0
-                                far_bound_reason = f"Phase A trimmed {phase_a_far_trim:.1f}pt"
-                        
-                        # 条件2：检测远端附近是否有正文行证据
-                        if far_bound_limit is None:
-                            has_evidence, suggested_limit = _detect_far_side_text_evidence(
-                                base_clip, text_lines_all, side,
-                                edge_zone=40.0, min_width_ratio=0.30
-                            )
-                            if has_evidence:
-                                far_bound_limit = suggested_limit
-                                far_bound_reason = "far-side text evidence detected"
-                    else:
-                        # 远端是底部
-                        # 条件1：检查 Phase A/C 是否裁剪了底部
-                        if clip_after_A is not None:
-                            phase_a_far_trim = base_clip.y1 - clip_after_A.y1
-                            if phase_a_far_trim > 2.0:  # 降低阈值从 5pt 到 2pt
-                                far_bound_limit = clip_after_A.y1
-                                far_bound_reason = f"Phase A trimmed {phase_a_far_trim:.1f}pt"
-                        
-                        # 条件2：检测远端附近是否有正文行证据
-                        if far_bound_limit is None:
-                            has_evidence, suggested_limit = _detect_far_side_text_evidence(
-                                base_clip, text_lines_all, side,
-                                edge_zone=40.0, min_width_ratio=0.30
-                            )
-                            if has_evidence:
-                                far_bound_limit = suggested_limit
-                                far_bound_reason = "far-side text evidence detected"
-                    
-                    # 应用远端边界约束
-                    if far_bound_limit is not None:
-                        if side == 'above':
-                            if tight.y0 < far_bound_limit:
-                                if debug_captions:
-                                    logger.debug(f"Figure {fig_no}: [P0-1 FAR BOUND] Limiting top from {tight.y0:.1f} to {far_bound_limit:.1f} ({far_bound_reason})")
-                                tight = fitz.Rect(tight.x0, far_bound_limit, tight.x1, tight.y1)
-                        else:
-                            if tight.y1 > far_bound_limit:
-                                if debug_captions:
-                                    logger.debug(f"Figure {fig_no}: [P0-1 FAR BOUND] Limiting bottom from {tight.y1:.1f} to {far_bound_limit:.1f} ({far_bound_reason})")
-                                tight = fitz.Rect(tight.x0, tight.y0, tight.x1, far_bound_limit)
-                    
                     # 远端边缘保护：在远离 caption 的一侧向外扩 保护像素，避免轻微顶部/底部被裁
-                    # 【重要】保护扩展不能超过 far_bound_limit
                     far_pad_pt = max(0.0, protect_far_edge_px / scale)
                     if far_pad_pt > 0:
                         if side == 'above':
                             # far edge = TOP
-                            new_y0 = max(page_rect.y0, tight.y0 - far_pad_pt)
-                            # 确保不超过约束边界
-                            if far_bound_limit is not None:
-                                new_y0 = max(new_y0, far_bound_limit)
-                            tight = fitz.Rect(tight.x0, new_y0, tight.x1, tight.y1)
+                            tight = fitz.Rect(tight.x0, max(page_rect.y0, tight.y0 - far_pad_pt), tight.x1, tight.y1)
                         else:
                             # far edge = BOTTOM
-                            new_y1 = min(page_rect.y1, tight.y1 + far_pad_pt)
-                            # 确保不超过约束边界
-                            if far_bound_limit is not None:
-                                new_y1 = min(new_y1, far_bound_limit)
-                            tight = fitz.Rect(tight.x0, tight.y0, tight.x1, new_y1)
+                            tight = fitz.Rect(tight.x0, tight.y0, tight.x1, min(page_rect.y1, tight.y1 + far_pad_pt))
                     # Enforce minimal size in pt, anchored to near-caption side
                     if (autocrop_min_height_px or autocrop_shrink_limit is not None):
                         min_h_pt = max(0.0, (autocrop_min_height_px / scale))
@@ -4294,25 +3771,6 @@ def extract_figures(
                         )
                         if debug_captions and tight != clip_before_post_layout:
                             logger.debug(f"Figure {fig_no}: Post-autocrop layout adjustment applied")
-                    
-                    # ============================================================
-                    # 【P0-3】Phase D 后轻量去正文后处理
-                    # ============================================================
-                    # 在 autocrop 完成后，扫描远端边缘附近的正文行，如果存在则向内推边界
-                    tight_before_post = fitz.Rect(tight)
-                    tight, was_post_trimmed = _trim_far_side_text_post_autocrop(
-                        tight, text_lines_all, side,
-                        typical_line_h=typical_lh,
-                        scan_lines=3,
-                        min_width_ratio=0.30,
-                        min_text_len=15,
-                        gap=6.0,
-                    )
-                    if was_post_trimmed and debug_captions:
-                        if side == 'above':
-                            logger.debug(f"Figure {fig_no}: [P0-3 POST TRIM] y0 pushed from {tight_before_post.y0:.1f} to {tight.y0:.1f}")
-                        else:
-                            logger.debug(f"Figure {fig_no}: [P0-3 POST TRIM] y1 pushed from {tight_before_post.y1:.1f} to {tight.y1:.1f}")
                     
                     pix = page.get_pixmap(matrix=mat, clip=tight, alpha=False)
                     clip = tight
@@ -4375,54 +3833,17 @@ def extract_figures(
                 relax_cov = thresholds.relax_cov
                 ok_h = (r_height >= relax_h * base_height)
                 ok_a = (r_area >= relax_a * base_area)
-                
-                # ============================================================
-                # P2-1: 从密度比转向 mass/保留量指标
-                # ============================================================
-                # 问题：密度比会误伤"更大但更对/留白更多"的 refined clip
-                # 解决：使用 mass (= ratio × area) 代替单纯的 ratio
-                # ============================================================
-                # 计算 mass 指标
-                base_ink_mass = base_ink * base_area
-                r_ink_mass = r_ink * r_area
-                base_cov_mass = base_cov * base_area
-                r_cov_mass = r_cov * r_area
-                
-                # 使用 mass 进行验收（更宽松，减少误拒绝）
-                ok_ink_mass = (r_ink_mass >= relax_ink * base_ink_mass) if base_ink_mass > 1e-9 else True
-                ok_cov_mass = (r_cov_mass >= relax_cov * base_cov_mass) if base_cov_mass > 1e-9 else True
-                
-                # 额外：仅当显著收缩时（< 70% 面积）启用更严格的密度检查作为补充
-                significant_shrink = (r_area < 0.70 * base_area)
-                if significant_shrink:
-                    # 显著收缩时：密度不能下降太多（> 60%）
-                    ok_ink_density = (r_ink >= 0.60 * base_ink) if base_ink > 1e-9 else True
-                    ok_cov_density = (r_cov >= 0.60 * base_cov) if base_cov > 1e-9 else True
-                else:
-                    ok_ink_density = True
-                    ok_cov_density = True
-                
-                # 综合验收：mass 和密度检查都要通过
-                ok_c = ok_cov_mass and ok_cov_density
-                ok_i = ok_ink_mass and ok_ink_density
-                
+                ok_c = (r_cov >= (relax_cov * base_cov) if base_cov > 0 else True)
+                ok_i = (r_ink >= (relax_ink * base_ink) if base_ink > 0 else True)
                 # If stacked components shrink to 1, be cautious
                 ok_comp = (r_comp >= min(2, base_comp)) if base_comp >= 2 else True
                 if not (ok_h and ok_a and ok_c and ok_i and ok_comp):
-                    # 收集失败原因用于调试（P2-1 增强：显示 mass 和密度指标）
+                    # 收集失败原因用于调试
                     reasons = []
                     if not ok_h: reasons.append(f"height={r_height/base_height:.1%}")
                     if not ok_a: reasons.append(f"area={r_area/base_area:.1%}")
-                    if not ok_c:
-                        if not ok_cov_mass:
-                            reasons.append(f"cov_mass={r_cov_mass/base_cov_mass:.1%}" if base_cov_mass > 1e-9 else "cov_mass=low")
-                        if significant_shrink and not ok_cov_density:
-                            reasons.append(f"cov_density={r_cov/base_cov:.1%}" if base_cov > 1e-9 else "cov_density=low")
-                    if not ok_i:
-                        if not ok_ink_mass:
-                            reasons.append(f"ink_mass={r_ink_mass/base_ink_mass:.1%}" if base_ink_mass > 1e-9 else "ink_mass=low")
-                        if significant_shrink and not ok_ink_density:
-                            reasons.append(f"ink_density={r_ink/base_ink:.1%}" if base_ink > 1e-9 else "ink_density=low")
+                    if not ok_c: reasons.append(f"cov={r_cov/base_cov:.1%}" if base_cov > 0 else "cov=low")
+                    if not ok_i: reasons.append(f"ink={r_ink/base_ink:.1%}" if base_ink > 0 else "ink=low")
                     if not ok_comp: reasons.append(f"comp={r_comp}/{base_comp}")
                     logger.warning(
                         f"Fig {fig_no} p{pno+1}: refinement rejected ({', '.join(reasons)}), trying fallback",
@@ -4486,8 +3907,8 @@ def extract_figures(
                         debug=debug_captions,
                     ) if text_trim else base_clip
                     rA_h, rA_a = max(1.0, clip_A.height), max(1.0, clip_A.width * clip_A.height)
-                    # P1-07: A-only fallback 也使用动态阈值（必须沿用同页 far_cov，否则会误拒绝并回退到 baseline）
-                    fallback_th = _adaptive_acceptance_thresholds(base_height, is_table=False, far_cov=far_cov)
+                    # P1-07: A-only fallback 也使用动态阈值
+                    fallback_th = _adaptive_acceptance_thresholds(base_height, is_table=False, far_cov=0.0)
                     if (rA_h >= fallback_th.relax_h * base_height) and (rA_a >= fallback_th.relax_a * base_area):
                         clip = clip_A
                         logger.info(f"Fig {fig_no} p{pno+1}: using A-only fallback (thresholds: {fallback_th.description})")
@@ -5135,9 +4556,8 @@ def extract_tables(
     far_text_th: float = 300.0,
     far_text_para_min_ratio: float = 0.30,
     far_text_trim_mode: str = "aggressive",
-    # P1-1: 下调阈值以覆盖"中间地带"（约 3-7 行）
-    far_side_min_dist: float = 50.0,  # 从 100.0 降低到 50.0
-    far_side_para_min_ratio: float = 0.12,  # 从 0.20 降低到 0.12
+    far_side_min_dist: float = 100.0,
+    far_side_para_min_ratio: float = 0.20,
     # B)
     object_pad: float = 8.0,
     object_min_area_ratio: float = 0.005,
@@ -5198,20 +4618,18 @@ def extract_tables(
         if adjacent_th == 28.0:  # 表格默认值
             adjacent_th = 2.0 * typical_line_h
         if far_text_th == 300.0:  # 默认值
-            # 2025-12-30 修复：提高倍数从 10.0 到 15.0（与 Figure 保持一致）
-            far_text_th = 15.0 * typical_line_h
+            far_text_th = 10.0 * typical_line_h
         if text_trim_gap == 6.0:  # 默认值
             text_trim_gap = 0.5 * typical_line_h
-        if far_side_min_dist == 50.0:  # P1-1 调整后的新默认值
-            # P1-1 调整：使用 3.0× 行高，以便检测"中间地带"文字（约 3-7 行）
-            far_side_min_dist = 3.0 * typical_line_h
+        if far_side_min_dist == 100.0:  # 默认值
+            far_side_min_dist = 8.0 * typical_line_h
         
         if debug_captions:
             print(f"ADAPTIVE TABLE PARAMETERS (based on line_height={typical_line_h:.1f}pt):")
             print(f"  adjacent_th:      {adjacent_th:.1f} pt (2.0× line_height)")
-            print(f"  far_text_th:      {far_text_th:.1f} pt (15.0× line_height)")
+            print(f"  far_text_th:      {far_text_th:.1f} pt (10.0× line_height)")
             print(f"  text_trim_gap:    {text_trim_gap:.1f} pt (0.5× line_height)")
-            print(f"  far_side_min_dist:{far_side_min_dist:.1f} pt (3.0× line_height)")
+            print(f"  far_side_min_dist:{far_side_min_dist:.1f} pt (8.0× line_height)")
             print()
 
     # --- P0-03 + P1-08 修复：表格编号解析，支持 S 前缀 + 罗马数字（如 "Supplementary Table IV" / "Table SIV"）---
@@ -5885,73 +5303,13 @@ def extract_tables(
                         clip.x0 + r / scale,
                         clip.y0 + b / scale,
                     )
-                    
-                    # ============================================================
-                    # 【P0-1 核心约束】Phase D 远端边界单调性约束（表格）
-                    # ============================================================
-                    far_bound_limit_tbl: Optional[float] = None
-                    far_bound_reason_tbl = ""
-                    
-                    if side == 'above':
-                        # 远端是顶部
-                        if clip_after_A is not None:
-                            phase_a_far_trim = clip_after_A.y0 - base_clip.y0
-                            if phase_a_far_trim > 2.0:  # 降低阈值从 5pt 到 2pt
-                                far_bound_limit_tbl = clip_after_A.y0
-                                far_bound_reason_tbl = f"Phase A trimmed {phase_a_far_trim:.1f}pt"
-                        
-                        if far_bound_limit_tbl is None:
-                            has_evidence, suggested_limit = _detect_far_side_text_evidence(
-                                base_clip, text_lines_all, side,
-                                edge_zone=40.0, min_width_ratio=0.30
-                            )
-                            if has_evidence:
-                                far_bound_limit_tbl = suggested_limit
-                                far_bound_reason_tbl = "far-side text evidence detected"
-                    else:
-                        # 远端是底部
-                        if clip_after_A is not None:
-                            phase_a_far_trim = base_clip.y1 - clip_after_A.y1
-                            if phase_a_far_trim > 2.0:
-                                far_bound_limit_tbl = clip_after_A.y1
-                                far_bound_reason_tbl = f"Phase A trimmed {phase_a_far_trim:.1f}pt"
-                        
-                        if far_bound_limit_tbl is None:
-                            has_evidence, suggested_limit = _detect_far_side_text_evidence(
-                                base_clip, text_lines_all, side,
-                                edge_zone=40.0, min_width_ratio=0.30
-                            )
-                            if has_evidence:
-                                far_bound_limit_tbl = suggested_limit
-                                far_bound_reason_tbl = "far-side text evidence detected"
-                    
-                    # 应用远端边界约束
-                    if far_bound_limit_tbl is not None:
-                        if side == 'above':
-                            if tight.y0 < far_bound_limit_tbl:
-                                if debug_captions:
-                                    logger.debug(f"Table {ident}: [P0-1 FAR BOUND] Limiting top from {tight.y0:.1f} to {far_bound_limit_tbl:.1f} ({far_bound_reason_tbl})")
-                                tight = fitz.Rect(tight.x0, far_bound_limit_tbl, tight.x1, tight.y1)
-                        else:
-                            if tight.y1 > far_bound_limit_tbl:
-                                if debug_captions:
-                                    logger.debug(f"Table {ident}: [P0-1 FAR BOUND] Limiting bottom from {tight.y1:.1f} to {far_bound_limit_tbl:.1f} ({far_bound_reason_tbl})")
-                                tight = fitz.Rect(tight.x0, tight.y0, tight.x1, far_bound_limit_tbl)
-                    
                     # 远端边缘保护：表格通常需要保留页眉线等细要素
-                    # 【重要】保护扩展不能超过 far_bound_limit_tbl
                     far_pad_pt = max(0.0, protect_far_edge_px / scale)
                     if far_pad_pt > 0:
                         if side == 'above':
-                            new_y0 = max(page_rect.y0, tight.y0 - far_pad_pt)
-                            if far_bound_limit_tbl is not None:
-                                new_y0 = max(new_y0, far_bound_limit_tbl)
-                            tight = fitz.Rect(tight.x0, new_y0, tight.x1, tight.y1)
+                            tight = fitz.Rect(tight.x0, max(page_rect.y0, tight.y0 - far_pad_pt), tight.x1, tight.y1)
                         else:
-                            new_y1 = min(page_rect.y1, tight.y1 + far_pad_pt)
-                            if far_bound_limit_tbl is not None:
-                                new_y1 = min(new_y1, far_bound_limit_tbl)
-                            tight = fitz.Rect(tight.x0, tight.y0, tight.x1, new_y1)
+                            tight = fitz.Rect(tight.x0, tight.y0, tight.x1, min(page_rect.y1, tight.y1 + far_pad_pt))
                     if (autocrop_min_height_px or autocrop_shrink_limit is not None):
                         min_h_pt = max(0.0, (autocrop_min_height_px / scale))
                         if autocrop_shrink_limit is not None:
@@ -5976,24 +5334,6 @@ def extract_tables(
                         )
                         if debug_captions and tight != clip_before_post_layout:
                             logger.debug(f"Table {ident}: Post-autocrop layout adjustment applied")
-                    
-                    # ============================================================
-                    # 【P0-3】Phase D 后轻量去正文后处理（表格）
-                    # ============================================================
-                    tight_before_post = fitz.Rect(tight)
-                    tight, was_post_trimmed = _trim_far_side_text_post_autocrop(
-                        tight, text_lines_all, side,
-                        typical_line_h=typical_lh,
-                        scan_lines=3,
-                        min_width_ratio=0.30,
-                        min_text_len=15,
-                        gap=6.0,
-                    )
-                    if was_post_trimmed and debug_captions:
-                        if side == 'above':
-                            logger.debug(f"Table {ident}: [P0-3 POST TRIM] y0 pushed from {tight_before_post.y0:.1f} to {tight.y0:.1f}")
-                        else:
-                            logger.debug(f"Table {ident}: [P0-3 POST TRIM] y1 pushed from {tight_before_post.y1:.1f} to {tight.y1:.1f}")
                     
                     pix = page.get_pixmap(matrix=mat, clip=tight, alpha=False)
                     clip = tight
@@ -6061,34 +5401,15 @@ def extract_tables(
                 relax_text = thresholds_tbl.relax_text
                 ok_h = (r_height >= relax_h * base_height)
                 ok_a = (r_area >= relax_a * base_area)
-                
-                # ============================================================
-                # P2-1: 从密度比转向 mass/保留量指标（表格）
-                # ============================================================
-                base_ink_mass_tbl = base_ink * base_area
-                r_ink_mass_tbl = r_ink * r_area
-                
-                ok_ink_mass_tbl = (r_ink_mass_tbl >= relax_ink * base_ink_mass_tbl) if base_ink_mass_tbl > 1e-9 else True
-                
-                significant_shrink_tbl = (r_area < 0.70 * base_area)
-                if significant_shrink_tbl:
-                    ok_ink_density_tbl = (r_ink >= 0.60 * base_ink) if base_ink > 1e-9 else True
-                else:
-                    ok_ink_density_tbl = True
-                
-                ok_i = ok_ink_mass_tbl and ok_ink_density_tbl
+                ok_i = (r_ink >= (relax_ink * base_ink) if base_ink > 0 else True)
                 ok_t = (r_text >= max(1, int(relax_text * base_text))) if base_text > 0 else True
                 ok_comp = (r_comp >= min(2, base_comp)) if base_comp >= 2 else True
                 if not (ok_h and ok_a and ok_i and ok_t and ok_comp):
-                    # 表格验收失败日志（P2-1 增强）
+                    # 表格验收失败日志
                     reasons = []
                     if not ok_h: reasons.append(f"height={r_height/base_height:.1%}")
                     if not ok_a: reasons.append(f"area={r_area/base_area:.1%}")
-                    if not ok_i:
-                        if not ok_ink_mass_tbl:
-                            reasons.append(f"ink_mass={r_ink_mass_tbl/base_ink_mass_tbl:.1%}" if base_ink_mass_tbl > 1e-9 else "ink_mass=low")
-                        if significant_shrink_tbl and not ok_ink_density_tbl:
-                            reasons.append(f"ink_density={r_ink/base_ink:.1%}" if base_ink > 1e-9 else "ink_density=low")
+                    if not ok_i: reasons.append(f"ink={r_ink/base_ink:.1%}" if base_ink > 0 else "ink=low")
                     if not ok_t: reasons.append(f"text_lines={r_text}/{base_text}")
                     if not ok_comp: reasons.append(f"comp={r_comp}/{base_comp}")
                     logger.warning(f"Refinement rejected ({', '.join(reasons)}), using A-only fallback", extra={'page': pno+1, 'kind': 'table', 'id': ident, 'stage': 'validation'})
@@ -6150,8 +5471,7 @@ def extract_tables(
                     ) if text_trim else base_clip
                     # P1-07: 二次门槛也使用动态阈值
                     rA_h, rA_a = max(1.0, clip_A.height), max(1.0, clip_A.width * clip_A.height)
-                    # P1-07: A-only fallback 也使用动态阈值（必须沿用同页 far_cov_tbl，否则会误拒绝并回退到 baseline）
-                    fallback_th_tbl = _adaptive_acceptance_thresholds(base_height, is_table=True, far_cov=far_cov_tbl)
+                    fallback_th_tbl = _adaptive_acceptance_thresholds(base_height, is_table=True, far_cov=0.0)
                     if (rA_h >= fallback_th_tbl.relax_h * base_height) and (rA_a >= fallback_th_tbl.relax_a * base_area):
                         clip = clip_A
                         log_event(
@@ -6761,56 +6081,6 @@ def _adjust_clip_with_layout(
         
         overlap_with_clip = (inter.width * inter.height) / (block.bbox.width * block.bbox.height)
         
-        # 【关键修复】：区分"章节标题"和"表头行"
-        # 章节标题（如 "5.1.2 Performance of Audio→Text" 或 "3.5 Positional Encoding"）应该被排除
-        # 表头行（如 "Gemini-2.5-Flash Qwen3-235B-A22B..."）应该被保留为表格内容
-        # 
-        # 判断标准：
-        # 1. 章节标题通常以数字编号开头（如 "5.1.2"、"3.5"、"4 "）
-        # 2. 章节标题通常距离 caption 较远（>50pt）
-        # 3. 章节标题通常靠近 clip 的远端边界（与 caption 相对的一侧）
-        # 4. 表头行通常紧邻 caption 且不以数字编号开头
-        if block.block_type.startswith('title_'):
-            block_text = block.units[0].text.strip() if block.units else ""
-            
-            # 检查是否是章节标题（以数字开头，如 "5.1.2"、"3.5"、"4 Why"）
-            import re
-            is_section_title = bool(re.match(r'^\d+(\.\d+)*\s', block_text))
-            
-            # 计算与 caption 的距离
-            if direction == 'below':
-                dist_from_caption = block.bbox.y0 - caption_rect.y1
-                # 检查是否靠近 clip 的底部（远端）
-                dist_from_clip_far_edge = clip_rect.y1 - block.bbox.y0
-                is_near_far_edge = dist_from_clip_far_edge < 50  # 距离 clip 底部 <50pt
-            else:
-                dist_from_caption = caption_rect.y0 - block.bbox.y1
-                # 检查是否靠近 clip 的顶部（远端）
-                dist_from_clip_far_edge = block.bbox.y1 - clip_rect.y0
-                is_near_far_edge = dist_from_clip_far_edge < 50  # 距离 clip 顶部 <50pt
-            
-            # 排除条件（满足任一）：
-            # 1. 以数字编号开头且距离 caption 较远（>50pt）
-            # 2. 靠近 clip 远端边界（<50pt）且距离 caption 较远（>100pt）
-            #    这可以捕获不以数字开头的章节标题（如 "Performance of Audio→Text"）
-            should_exclude = False
-            exclude_reason = ""
-            
-            if is_section_title and dist_from_caption > 50:
-                should_exclude = True
-                exclude_reason = "section title (numbered)"
-            elif is_near_far_edge and dist_from_caption > 100:
-                should_exclude = True
-                exclude_reason = "title near clip far edge"
-            
-            if should_exclude:
-                external_blocks.append(block)
-                if debug:
-                    print(f"  [SECTION TITLE EXCLUDED: {exclude_reason}] {block.block_type}: '{block_text[:50]}...' at y={block.bbox.y0:.1f}, dist_caption={dist_from_caption:.1f}pt, dist_far_edge={dist_from_clip_far_edge:.1f}pt")
-                continue
-            elif debug and (is_section_title or is_near_far_edge):
-                print(f"  [TITLE KEPT] {block.block_type}: '{block_text[:50]}...' at y={block.bbox.y0:.1f}, dist_caption={dist_from_caption:.1f}pt, dist_far_edge={dist_from_clip_far_edge:.1f}pt")
-        
         if direction == 'below':
             # 图在下方，caption在上方
             # 内容区块：在 caption 下方且与 clip 重叠度>50%
@@ -6860,41 +6130,33 @@ def _adjust_clip_with_layout(
     # ===== 优先处理：内容区块边界保护（即使外部重叠度低也要执行） =====
     # 特殊处理：如果有内容区块被部分切断，扩展clip以包含完整内容
     # 这主要解决表格内文字被切断的问题（如 Table 4 的表头）
-    # 
-    # P0-1 约束（2025-12-30）：
-    # 只允许向 **近端**（靠近 caption）方向扩展，禁止向 **远端** 扩展
-    # - direction='above'（caption在clip下方）：近端=bottom，远端=top
-    # - direction='below'（caption在clip上方）：近端=top，远端=bottom
     content_adjusted = False
     for block in content_blocks:
         if direction == 'below':
-            # 图在下方，caption在上方
-            # 近端 = top (y0)，远端 = bottom (y1)
-            # 只允许向上扩展（近端），禁止向下扩展（远端）
+            # 图在下方，检查上边界是否切断了内容区块
             if block.bbox.y0 < adjusted_clip.y0 < block.bbox.y1:
-                adjusted_clip.y0 = block.bbox.y0 - 2  # 向上扩展（近端）✅ 允许
+                adjusted_clip.y0 = block.bbox.y0 - 2  # 向上扩展，留2pt间隙
                 content_adjusted = True
                 if debug:
-                    print(f"  -> Expanding top boundary (near-side) to include content block at {block.bbox.y0:.1f}pt")
-            # 检查下边界 - P0-1: 禁止向远端扩展
-            # if block.bbox.y0 < adjusted_clip.y1 < block.bbox.y1:
-            #     # 远端扩展被禁止，跳过
-            #     if debug:
-            #         print(f"  -> [P0-1] Skipped expanding bottom boundary (far-side) at {block.bbox.y1:.1f}pt")
-        else:  # direction == 'above'
-            # 图在上方，caption在下方
-            # 近端 = bottom (y1)，远端 = top (y0)
-            # 只允许向下扩展（近端），禁止向上扩展（远端）
+                    print(f"  -> Expanding top boundary to include content block at {block.bbox.y0:.1f}pt")
+            # 检查下边界
             if block.bbox.y0 < adjusted_clip.y1 < block.bbox.y1:
-                adjusted_clip.y1 = block.bbox.y1 + 2  # 向下扩展（近端）✅ 允许
+                adjusted_clip.y1 = block.bbox.y1 + 2  # 向下扩展
                 content_adjusted = True
                 if debug:
-                    print(f"  -> Expanding bottom boundary (near-side) to include content block at {block.bbox.y1:.1f}pt")
-            # 检查上边界 - P0-1: 禁止向远端扩展
-            # if block.bbox.y0 < adjusted_clip.y0 < block.bbox.y1:
-            #     # 远端扩展被禁止，跳过
-            #     if debug:
-            #         print(f"  -> [P0-1] Skipped expanding top boundary (far-side) at {block.bbox.y0:.1f}pt")
+                    print(f"  -> Expanding bottom boundary to include content block at {block.bbox.y1:.1f}pt")
+        else:  # direction == 'above'
+            # 图在上方，检查边界是否切断了内容区块
+            if block.bbox.y0 < adjusted_clip.y1 < block.bbox.y1:
+                adjusted_clip.y1 = block.bbox.y1 + 2  # 向下扩展
+                content_adjusted = True
+                if debug:
+                    print(f"  -> Expanding bottom boundary to include content block at {block.bbox.y1:.1f}pt")
+            if block.bbox.y0 < adjusted_clip.y0 < block.bbox.y1:
+                adjusted_clip.y0 = block.bbox.y0 - 2  # 向上扩展
+                content_adjusted = True
+                if debug:
+                    print(f"  -> Expanding top boundary to include content block at {block.bbox.y0:.1f}pt")
     
     # 如果进行了内容区块调整，直接返回（不需要检查外部重叠）
     if content_adjusted:
@@ -6911,74 +6173,10 @@ def _adjust_clip_with_layout(
             has_title_overlap = True
             break
     
-    # ============================================================
-    # P1-2: “边缘敏感”裁剪（Edge-Sensitive Layout Guidance）
-    # ============================================================
-    # 背景：有些页面只多 1-2 行正文，整体 overlap < 20% 会导致完全不触发，
-    #       但这 1-2 行往往刚好贴在 clip 的远端边缘，影响最终 PNG 观感。
-    #
-    # 策略：在 clip 远端边缘建立一个 strip（≈ 3×行高，至少 30pt），
-    #       若 strip 内命中正文/列表/标题文本块（宽度覆盖足够大），
-    #       则直接把远端边界向内推，哪怕总 overlap 不到 20%。
-    #
-    # 注意：这里不能依赖 content/external 的初始分类（可能误把正文当 content），
-    #       因此使用 protected_blocks 全量扫描，但通过宽度+位置门槛控风险。
-    # ============================================================
-    try:
-        typical_lh = getattr(layout_model, "typical_line_height", None)
-        edge_strip_h = max(30.0, (3.0 * typical_lh) if (typical_lh and typical_lh > 0) else 45.0)
-    except Exception:
-        edge_strip_h = 45.0
-
-    # 远端 strip（只用于 y 向裁剪）
-    if direction == 'above':
-        # 图在上方，caption 在下方，远端 = 顶部
-        far_strip = fitz.Rect(adjusted_clip.x0, adjusted_clip.y0, adjusted_clip.x1, min(adjusted_clip.y1, adjusted_clip.y0 + edge_strip_h))
-        # 远端在上方：需要把顶部向下推
-        candidate_blocks = []
-        for b in protected_blocks:
-            inter = b.bbox & far_strip
-            if inter.is_empty:
-                continue
-            # 宽度覆盖足够大才认为是“正文/标题行干扰”
-            w_ratio = inter.width / max(1.0, adjusted_clip.width)
-            if w_ratio >= 0.35:
-                candidate_blocks.append((b, w_ratio))
-        if candidate_blocks:
-            # 推到最下方那条文本块之后（+gap）
-            new_y0 = max(b.bbox.y1 for (b, _) in candidate_blocks) + 6.0
-            if new_y0 > adjusted_clip.y0 + 1e-3:
-                if debug:
-                    sample = candidate_blocks[0][0].units[0].text.strip()[:50] if candidate_blocks[0][0].units else ""
-                    print(f"  [P1-2 EDGE] Trim top by far-strip blocks (n={len(candidate_blocks)}), sample='{sample}...' -> y0 {adjusted_clip.y0:.1f} -> {new_y0:.1f}")
-                adjusted_clip.y0 = min(new_y0, adjusted_clip.y1 - 10.0)
-    else:
-        # direction == 'below'
-        # 图在下方，caption 在上方，远端 = 底部
-        far_strip = fitz.Rect(adjusted_clip.x0, max(adjusted_clip.y0, adjusted_clip.y1 - edge_strip_h), adjusted_clip.x1, adjusted_clip.y1)
-        candidate_blocks = []
-        for b in protected_blocks:
-            inter = b.bbox & far_strip
-            if inter.is_empty:
-                continue
-            w_ratio = inter.width / max(1.0, adjusted_clip.width)
-            if w_ratio >= 0.35:
-                candidate_blocks.append((b, w_ratio))
-        if candidate_blocks:
-            new_y1 = min(b.bbox.y0 for (b, _) in candidate_blocks) - 6.0
-            if new_y1 < adjusted_clip.y1 - 1e-3:
-                if debug:
-                    sample = candidate_blocks[0][0].units[0].text.strip()[:50] if candidate_blocks[0][0].units else ""
-                    print(f"  [P1-2 EDGE] Trim bottom by far-strip blocks (n={len(candidate_blocks)}), sample='{sample}...' -> y1 {adjusted_clip.y1:.1f} -> {new_y1:.1f}")
-                adjusted_clip.y1 = max(new_y1, adjusted_clip.y0 + 10.0)
-
-    # 如果 P1-2 已经做了边缘收缩，则继续走“合理性检查”，不必强依赖 overlap>=20%
-    edge_changed = (abs(adjusted_clip.y0 - clip_rect.y0) > 1e-3) or (abs(adjusted_clip.y1 - clip_rect.y1) > 1e-3)
-
-    # 如果重叠不严重（<20%）且没有标题重叠且没有边缘变化，直接返回
-    if overlap_ratio_total < 0.20 and not has_title_overlap and not edge_changed:
+    # 如果重叠不严重（<20%）且没有标题重叠，直接返回
+    if overlap_ratio_total < 0.20 and not has_title_overlap:
         if debug:
-            print(f"  -> No adjustment needed (overlap < 20%, no title overlap, no edge change)")
+            print(f"  -> No adjustment needed (overlap < 20%, no title overlap)")
         return clip_rect
     
     if direction == 'above':
@@ -7052,8 +6250,6 @@ def _should_enable_layout_driven(pdf_path: str, debug: bool = False) -> Tuple[bo
     2. 图表附近存在密集正文段落
     3. 页面文本区块复杂度高
     
-    P2-3 改进：采样策略从"前5页"改为"含 Figure/Table 的页面 + 首/中/尾分布"
-    
     Args:
         pdf_path: PDF 文件路径
         debug: 调试模式
@@ -7067,46 +6263,15 @@ def _should_enable_layout_driven(pdf_path: str, debug: bool = False) -> Tuple[bo
         return False, f"cannot open PDF: {e}"
     
     try:
-        # P2-3 改进：智能采样策略
-        # 1. 首先找出含 Figure/Table 的页面
-        # 2. 加上首/中/尾各 1 页
-        # 3. 去重后采样
-        figure_table_pages = set()
-        total_pages = len(doc)
-        
-        # 快速扫描找出含图表的页面
-        fig_table_pattern = re.compile(r'(Figure|Fig\.?|Table|Tab\.?)\s*\d', re.IGNORECASE)
-        for pno in range(total_pages):
-            page = doc[pno]
-            text = page.get_text("text")[:2000]  # 只检查前 2000 字符
-            if fig_table_pattern.search(text):
-                figure_table_pages.add(pno)
-        
-        # 构建采样页面集合
-        sample_pages = set()
-        # 加入首/中/尾
-        sample_pages.add(0)  # 首页
-        sample_pages.add(total_pages // 2)  # 中间页
-        sample_pages.add(total_pages - 1)  # 末页
-        # 加入最多 3 个含图表的页面
-        for pno in sorted(figure_table_pages)[:3]:
-            sample_pages.add(pno)
-        # 确保不超过 total_pages
-        sample_pages = {p for p in sample_pages if 0 <= p < total_pages}
-        
-        sample_count = len(sample_pages)
-        sample_pages_list = sorted(sample_pages)
-        
-        if debug:
-            print(f"[P2-3] Sampling pages: {sample_pages_list} (figure/table pages: {sorted(figure_table_pages)[:5]})")
+        # 采样前 5 页（或全部，取较小者）
+        sample_count = min(5, len(doc))
         
         # 统计双栏特征
         dual_column_pages = 0
         dense_text_pages = 0
         figure_with_dense_text = 0
         
-        # P2-3: 使用智能采样的页面列表
-        for pno in sample_pages_list:
+        for pno in range(sample_count):
             page = doc[pno]
             page_rect = page.rect
             page_width = page_rect.width
@@ -7824,10 +6989,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     
     # Layout-driven extraction (V2 Architecture - NEW)
     # P1-01: Layout-driven extraction with three-state control (auto|on|off)
-    # 2025-12-29: 默认改为 'on'，因为 layout-driven 对于正确排除章节标题等非常重要
     # nargs='?' + const='on' 保持向后兼容：--layout-driven (无值) 等价于 --layout-driven on
-    p.add_argument("--layout-driven", nargs='?', const="on", default="on", choices=["auto", "on", "off"],
-                   help="Layout-driven extraction mode (V2): 'on'=always enable (default), 'auto'=enable for complex layouts, 'off'=disable; flag-style '--layout-driven' equals '--layout-driven on'")
+    p.add_argument("--layout-driven", nargs='?', const="on", default="auto", choices=["auto", "on", "off"],
+                   help="Layout-driven extraction mode (V2): 'auto'=enable for complex layouts (dual-column/dense text near figures), 'on'=always enable, 'off'=disable; flag-style '--layout-driven' equals '--layout-driven on' (default: auto)")
     p.add_argument("--layout-json", default=None, help="Path to save/load layout model JSON (default: <out_dir>/layout_model.json)")
     
     # Adaptive line height
@@ -7846,8 +7010,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--far-text-th", type=float, default=300.0, help="Maximum distance to detect far text (pt)")
     p.add_argument("--far-text-para-min-ratio", type=float, default=0.30, help="Minimum paragraph coverage ratio to trigger far-text trim")
     p.add_argument("--far-text-trim-mode", type=str, default="aggressive", choices=["aggressive", "conservative"], help="Far-text trim mode")
-    p.add_argument("--far-side-min-dist", type=float, default=50.0, help="P1-1: Minimum distance to detect far-side text (pt)")
-    p.add_argument("--far-side-para-min-ratio", type=float, default=0.12, help="P1-1: Minimum paragraph coverage ratio to trigger far-side trim")
+    p.add_argument("--far-side-min-dist", type=float, default=100.0, help="Minimum distance to detect far-side text (pt)")
+    p.add_argument("--far-side-para-min-ratio", type=float, default=0.20, help="Minimum paragraph coverage ratio to trigger far-side trim")
     # B) object connectivity options
     p.add_argument("--object-pad", type=float, default=8.0, help="Padding (pt) added around chosen object component")
     p.add_argument("--object-min-area-ratio", type=float, default=0.012, help="Min area ratio of object region within clip to be considered (lower=more sensitive to small panels)")
@@ -7942,12 +7106,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         return 2
 
-    # P3 fix: layout_driven 是三态字符串 ("on"|"auto"|"off")，不能用 bool() 转换
-    # bool("off") == True，会导致日志中 layout_driven 始终记录为 True
-    # 正确做法：直接记录原始字符串值，或转换为实际启用状态
-    layout_driven_value = getattr(args, "layout_driven", "off")
-    layout_driven_enabled = layout_driven_value != "off"  # 只有 "off" 才是禁用
-    
     log_event(
         "run_start",
         level="info",
@@ -7959,8 +7117,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         out_text=os.path.abspath(out_text).replace("\\", "/"),
         preset=getattr(args, "preset", None),
         anchor_mode=getattr(args, "anchor_mode", None),
-        layout_driven=layout_driven_value,  # 记录原始三态值：on/auto/off
-        layout_driven_enabled=layout_driven_enabled,  # 记录实际启用状态
+        layout_driven=bool(getattr(args, "layout_driven", False)),
         debug_captions=bool(getattr(args, "debug_captions", False)),
         debug_visual=bool(getattr(args, "debug_visual", False)),
     )
@@ -8096,17 +7253,16 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Build layout model if --layout-driven is enabled (V2 Architecture)
     # P1-01: Build layout model with three-state control (auto|on|off)
-    # 2025-12-29: 默认改为 'on'，因为 layout-driven 对于正确排除章节标题等非常重要
     layout_model: Optional[DocumentLayoutModel] = None
-    layout_driven_mode = getattr(args, 'layout_driven', 'on')  # 默认启用
+    layout_driven_mode = getattr(args, 'layout_driven', 'auto')
     enable_layout_driven = False
     
     if layout_driven_mode == 'on':
         enable_layout_driven = True
-        # 不再打印冗余信息，默认启用是常态
+        print("[INFO] Layout-driven extraction: ENABLED (explicit --layout-driven on)")
     elif layout_driven_mode == 'off':
         enable_layout_driven = False
-        print("[INFO] Layout-driven extraction: DISABLED (--layout-driven off)")
+        print("[INFO] Layout-driven extraction: DISABLED (explicit --layout-driven off)")
     elif layout_driven_mode == 'auto':
         # P1-01: Auto-detect whether to enable layout-driven extraction
         # Criteria: dual-column layout, or dense text near figure/table areas
@@ -8176,8 +7332,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         far_text_th=getattr(args, 'far_text_th', 300.0),
         far_text_para_min_ratio=getattr(args, 'far_text_para_min_ratio', 0.30),
         far_text_trim_mode=getattr(args, 'far_text_trim_mode', 'aggressive'),
-        far_side_min_dist=getattr(args, 'far_side_min_dist', 50.0),  # P1-1
-        far_side_para_min_ratio=getattr(args, 'far_side_para_min_ratio', 0.12),  # P1-1
+        far_side_min_dist=getattr(args, 'far_side_min_dist', 100.0),
+        far_side_para_min_ratio=getattr(args, 'far_side_para_min_ratio', 0.20),
         object_pad=args.object_pad,
         object_min_area_ratio=args.object_min_area_ratio,
         object_merge_gap=args.object_merge_gap,
@@ -8233,8 +7389,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             far_text_th=getattr(args, 'far_text_th', 300.0),
             far_text_para_min_ratio=getattr(args, 'far_text_para_min_ratio', 0.30),
             far_text_trim_mode=getattr(args, 'far_text_trim_mode', 'aggressive'),
-            far_side_min_dist=getattr(args, 'far_side_min_dist', 50.0),  # P1-1
-            far_side_para_min_ratio=getattr(args, 'far_side_para_min_ratio', 0.12),  # P1-1
+            far_side_min_dist=getattr(args, 'far_side_min_dist', 100.0),
+            far_side_para_min_ratio=getattr(args, 'far_side_para_min_ratio', 0.20),
             object_pad=getattr(args, 'object_pad', 8.0),
             object_min_area_ratio=getattr(args, 'table_object_min_area_ratio', 0.005),
             object_merge_gap=getattr(args, 'table_object_merge_gap', 4.0),
