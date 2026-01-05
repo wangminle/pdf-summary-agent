@@ -6891,11 +6891,48 @@ def _adjust_clip_with_layout(
         # 3. 章节标题通常靠近 clip 的远端边界（与 caption 相对的一侧）
         # 4. 表头行通常紧邻 caption 且不以数字编号开头
         if block.block_type.startswith('title_'):
-            block_text = block.units[0].text.strip() if block.units else ""
-            
-            # 检查是否是章节标题（以数字开头，如 "5.1.2"、"3.5"、"4 Why"）
             import re
-            is_section_title = bool(re.match(r'^\d+(\.\d+)*\s', block_text))
+
+            block_text = block.units[0].text.strip() if block.units else ""
+
+            def _looks_like_table_numeric_cell(s: str) -> bool:
+                t = (s or "").strip()
+                # 允许纯编号（如 "4"、"6"）继续走标题逻辑
+                if len(t) <= 4 and re.fullmatch(r"[\d\.]+", t):
+                    return False
+
+                t_norm = (
+                    t.replace("×", "x")
+                    .replace("·", "x")
+                    .replace("−", "-")
+                )
+                t_compact = re.sub(r"\s+", "", t_norm)
+
+                # 科学计数法：3.3x10^18 / 2.3e19
+                if re.match(r"^\d+(?:\.\d+)?x10(?:\^?\d+)?$", t_compact, re.IGNORECASE):
+                    return True
+                if re.match(r"^\d+(?:\.\d+)?e[+-]?\d+$", t_compact, re.IGNORECASE):
+                    return True
+
+                # 纯数字/符号（常见于表格单元格）
+                if re.fullmatch(r"[\d\.,\-\+\%/]+", t_compact):
+                    return True
+
+                return False
+
+            # 检查是否是章节标题（编号 + 空格 + 真实标题文本）
+            # 避免把表格中的科学计数法/数字单元格误判为章节标题（如 "3.3 × 10^18"）
+            is_section_title = False
+            if block_text and not _looks_like_table_numeric_cell(block_text):
+                m = re.match(r"^(\d+(?:\.\d+)*)\s+(.*)$", block_text)
+                if m:
+                    after = (m.group(2) or "").strip()
+                    if after:
+                        after_norm = after.replace("×", "x").replace("·", "x")
+                        after_compact = re.sub(r"\s+", "", after_norm)
+                        # 过滤 "x10^18" 这类科学计数法后缀
+                        if not re.match(r"^[xX]10(?:\^?\d+)?", after_compact):
+                            is_section_title = after[0].isalpha()
             
             # 计算与 caption 的距离
             if direction == 'below':
@@ -6919,7 +6956,7 @@ def _adjust_clip_with_layout(
             if is_section_title and dist_from_caption > 50:
                 should_exclude = True
                 exclude_reason = "section title (numbered)"
-            elif is_near_far_edge and dist_from_caption > 100:
+            elif (not _looks_like_table_numeric_cell(block_text)) and is_near_far_edge and dist_from_caption > 100:
                 should_exclude = True
                 exclude_reason = "title near clip far edge"
             
