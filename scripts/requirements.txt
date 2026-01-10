@@ -1,2 +1,8 @@
+# PDF 处理核心依赖
 pymupdf
 
+# 可选依赖（表格结构分析增强）
+# pdfplumber
+
+# 可选依赖（LLM 优化输出）
+# pymupdf4llm
