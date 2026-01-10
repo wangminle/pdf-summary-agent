@@ -1,0 +1,754 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Commit 07: 精裁与验收
+
+从 extract_pdf_assets.py 抽离的精裁和验收相关代码。
+
+包含：
+- detect_content_bbox_pixels: 像素级内容包围盒检测
+- estimate_ink_ratio: 墨迹密度估算
+- merge_rects: 合并重叠矩形
+- refine_clip_by_objects: 基于对象的裁剪优化
+- build_text_masks_px: 构建文本遮罩
+- detect_far_side_text_evidence: 远端正文检测
+- trim_far_side_text_post_autocrop: 远端正文后处理裁切
+- adaptive_acceptance_thresholds: 动态验收阈值
+- snap_clip_edges: 对齐裁剪边缘到绘图线
+- trim_clip_head_by_text: 文本裁切（Phase A）
+- trim_clip_head_by_text_v2: 增强文本裁切（Phase A/B/C）
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+
+# 尝试导入 fitz
+try:
+    import fitz
+except ImportError:
+    fitz = None  # type: ignore
+
+# 避免循环导入
+if TYPE_CHECKING:
+    from .models import AcceptanceThresholds, DrawItem
+
+# 模块日志器
+logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# 像素级内容检测
+# ============================================================================
+
+def detect_content_bbox_pixels(
+    pix: "fitz.Pixmap",
+    white_threshold: int = 250,
+    pad: int = 30,
+    mask_rects_px: Optional[List[Tuple[int, int, int, int]]] = None,
+) -> Tuple[int, int, int, int]:
+    """
+    在像素级估计非白色区域包围盒（带少量 padding），用于 autocrop 去除白边。
+    
+    Args:
+        pix: PyMuPDF 位图对象
+        white_threshold: 白色阈值（0-255）
+        pad: 边界 padding（像素）
+        mask_rects_px: 可选的掩码矩形列表（像素坐标），这些区域将被忽略
+    
+    Returns:
+        (left, top, right, bottom) 像素坐标的边界框
+    """
+    if fitz is None:
+        return (0, 0, pix.width, pix.height) if pix else (0, 0, 0, 0)
+    
+    w, h = pix.width, pix.height
+    n = pix.n
+    
+    # 转换为 RGB 避免 alpha 复杂性
+    if pix.alpha:
+        tmp = fitz.Pixmap(fitz.csRGB, pix)
+        pix = tmp
+        n = pix.n
+    
+    samples = memoryview(pix.samples)
+    stride = pix.stride
+
+    def in_mask(x: int, y: int) -> bool:
+        if not mask_rects_px:
+            return False
+        for (lx, ty, rx, by) in mask_rects_px:
+            if lx <= x < rx and ty <= y < by:
+                return True
+        return False
+
+    def row_has_ink(y: int) -> bool:
+        row = samples[y * stride:(y + 1) * stride]
+        step = max(1, w // 1000)
+        for x in range(0, w, step):
+            off = x * n
+            r = row[off + 0]
+            g = row[off + 1] if n > 1 else r
+            b = row[off + 2] if n > 2 else r
+            if in_mask(x, y):
+                continue
+            if r < white_threshold or g < white_threshold or b < white_threshold:
+                return True
+        return False
+
+    def col_has_ink(x: int) -> bool:
+        step = max(1, h // 1000)
+        off0 = x * n
+        for y in range(0, h, step):
+            row = samples[y * stride:(y + 1) * stride]
+            r = row[off0 + 0]
+            g = row[off0 + 1] if n > 1 else r
+            b = row[off0 + 2] if n > 2 else r
+            if in_mask(x, y):
+                continue
+            if r < white_threshold or g < white_threshold or b < white_threshold:
+                return True
+        return False
+
+    top = 0
+    while top < h and not row_has_ink(top):
+        top += 1
+    bottom = h - 1
+    while bottom >= 0 and not row_has_ink(bottom):
+        bottom -= 1
+    left = 0
+    while left < w and not col_has_ink(left):
+        left += 1
+    right = w - 1
+    while right >= 0 and not col_has_ink(right):
+        right -= 1
+
+    if left >= right or top >= bottom:
+        return (0, 0, w, h)
+
+    # pad & clamp
+    left = max(0, left - pad)
+    top = max(0, top - pad)
+    right = min(w, right + 1 + pad)
+    bottom = min(h, bottom + 1 + pad)
+    return (left, top, right, bottom)
+
+
+def estimate_ink_ratio(pix: "fitz.Pixmap", white_threshold: int = 250) -> float:
+    """
+    估计位图中"有墨迹"的像素比例（0~1），通过子采样快速近似。
+    值越大表示内容越密集。
+    
+    Args:
+        pix: PyMuPDF 位图对象
+        white_threshold: 白色阈值（0-255）
+    
+    Returns:
+        墨迹比例（0.0~1.0）
+    """
+    if fitz is None:
+        return 0.0
+    
+    w, h = pix.width, pix.height
+    n = pix.n
+    
+    if pix.alpha:
+        tmp = fitz.Pixmap(fitz.csRGB, pix)
+        pix = tmp
+        n = pix.n
+    
+    samples = memoryview(pix.samples)
+    stride = pix.stride
+    step_x = max(1, w // 800)
+    step_y = max(1, h // 800)
+    nonwhite = 0
+    total = 0
+    
+    for y in range(0, h, step_y):
+        row = samples[y * stride:(y + 1) * stride]
+        for x in range(0, w, step_x):
+            off = x * n
+            r = row[off + 0]
+            g = row[off + 1] if n > 1 else r
+            b = row[off + 2] if n > 2 else r
+            if r < white_threshold or g < white_threshold or b < white_threshold:
+                nonwhite += 1
+            total += 1
+    
+    if total == 0:
+        return 0.0
+    return nonwhite / float(total)
+
+
+# ============================================================================
+# 矩形合并
+# ============================================================================
+
+def merge_rects(rects: List[Any], merge_gap: float = 6.0) -> List[Any]:
+    """
+    合并重叠的矩形。
+    
+    通过先扩展再合并相交框的方式迭代处理。
+    
+    Args:
+        rects: fitz.Rect 列表
+        merge_gap: 合并间隙（pt）
+    
+    Returns:
+        合并后的矩形列表
+    """
+    if not rects or fitz is None:
+        return []
+    
+    # 扩展后合并相交框
+    expanded = [fitz.Rect(r.x0 - merge_gap, r.y0 - merge_gap, r.x1 + merge_gap, r.y1 + merge_gap) for r in rects]
+    changed = True
+    while changed:
+        changed = False
+        out: List[Any] = []
+        for r in expanded:
+            merged = False
+            for i, o in enumerate(out):
+                if (r & o).width > 0 and (r & o).height > 0:
+                    out[i] = o | r
+                    merged = True
+                    changed = True
+                    break
+            if not merged:
+                out.append(r)
+        expanded = out
+    return expanded
+
+
+# ============================================================================
+# 基于对象的裁剪优化
+# ============================================================================
+
+def refine_clip_by_objects(
+    clip: Any,
+    caption_rect: Any,
+    direction: str,
+    image_rects: List[Any],
+    vector_rects: List[Any],
+    *,
+    object_pad: float = 8.0,
+    min_area_ratio: float = 0.015,
+    merge_gap: float = 6.0,
+    near_edge_only: bool = True,
+    use_axis_union: bool = True,
+    use_horizontal_union: bool = False,
+) -> Any:
+    """
+    使用对象组件优化裁剪区域。
+    
+    Args:
+        clip: 当前裁剪区域
+        caption_rect: 图注边界框
+        direction: 方向 ('above' | 'below')
+        image_rects: 图像边界框列表
+        vector_rects: 矢量图形边界框列表
+        object_pad: 对象 padding
+        min_area_ratio: 最小面积比
+        merge_gap: 合并间隙
+        near_edge_only: 是否只调整靠近图注的边界
+        use_axis_union: 是否使用垂直轴联合
+        use_horizontal_union: 是否使用水平轴联合
+    
+    Returns:
+        优化后的裁剪区域
+    """
+    if fitz is None:
+        return clip
+    
+    area = max(1.0, clip.width * clip.height)
+    cand: List[Any] = []
+    
+    for r in image_rects + vector_rects:
+        inter = r & clip
+        if inter.width > 0 and inter.height > 0:
+            if (inter.width * inter.height) / area >= min_area_ratio:
+                cand.append(inter)
+    
+    if not cand:
+        return clip
+
+    comps = merge_rects(cand, merge_gap=merge_gap)
+    if not comps:
+        return clip
+
+    # 选择最靠近图注的组件
+    def comp_score(r: Any) -> float:
+        if direction == 'above':
+            dist = max(0.0, caption_rect.y0 - r.y1)
+        else:
+            dist = max(0.0, r.y0 - caption_rect.y1)
+        return dist + (-0.0001 * r.width * r.height)
+
+    comps.sort(key=comp_score)
+    chosen = comps[0]
+    
+    # 垂直堆叠组件联合
+    if use_axis_union and len(comps) >= 2:
+        overlaps = []
+        for r in comps:
+            inter_w = max(0.0, min(r.x1, chosen.x1) - max(r.x0, chosen.x0))
+            overlaps.append(inter_w / max(1.0, min(r.width, chosen.width)))
+        if sum(1 for v in overlaps if v >= 0.6) >= 2:
+            union = comps[0]
+            for r in comps[1:]:
+                union = union | r
+            chosen = union
+
+    # 水平并列组件联合
+    if use_horizontal_union and len(comps) >= 2:
+        y_overlaps = []
+        for r in comps:
+            inter_h = max(0.0, min(r.y1, chosen.y1) - max(r.y0, chosen.y0))
+            y_overlaps.append(inter_h / max(1.0, min(r.height, chosen.height)))
+        if sum(1 for v in y_overlaps if v >= 0.6) >= 2:
+            union = comps[0]
+            for r in comps[1:]:
+                union = union | r
+            chosen = union
+
+    # 应用 padding
+    chosen = fitz.Rect(
+        chosen.x0 - object_pad,
+        chosen.y0 - object_pad,
+        chosen.x1 + object_pad,
+        chosen.y1 + object_pad,
+    )
+
+    # 非对称更新：只调整靠近图注的边界
+    result = fitz.Rect(clip)
+    if near_edge_only:
+        if direction == 'above':
+            result.y1 = min(clip.y1, max(chosen.y1, clip.y0 + 40.0))
+        else:
+            result.y0 = max(clip.y0, min(chosen.y0, clip.y1 - 40.0))
+        result.x0 = min(result.x0, chosen.x0)
+        result.x1 = max(result.x1, chosen.x1)
+        result = result & clip
+        return result if result.height >= 40 else clip
+    else:
+        result = (chosen & clip)
+        return result if result.height >= 40 else clip
+
+
+# ============================================================================
+# 文本遮罩构建
+# ============================================================================
+
+def build_text_masks_px(
+    clip: Any,
+    text_lines: List[Tuple[Any, float, str]],
+    *,
+    scale: float,
+    direction: str = 'above',
+    near_frac: float = 0.6,
+    width_ratio: float = 0.5,
+    font_max: float = 14.0,
+    mask_mode: str = 'auto',
+    far_edge_zone: float = 40.0,
+) -> List[Tuple[int, int, int, int]]:
+    """
+    将选定的文本行转换为像素空间遮罩。
+    
+    Args:
+        clip: 裁剪区域
+        text_lines: 文本行列表 [(rect, font_size, text), ...]
+        scale: 缩放比例（pt -> px）
+        direction: 方向 ('above' | 'below')
+        near_frac: 近端区域比例
+        width_ratio: 宽度比例阈值
+        font_max: 最大字号
+        mask_mode: 遮罩模式 ('near' | 'both' | 'auto')
+        far_edge_zone: 远端边缘检测区域（pt）
+    
+    Returns:
+        像素坐标的遮罩矩形列表 [(left, top, right, bottom), ...]
+    """
+    if fitz is None:
+        return []
+    
+    masks: List[Tuple[int, int, int, int]] = []
+    y_thresh_top = clip.y0 + near_frac * clip.height
+    y_thresh_bot = clip.y1 - near_frac * clip.height
+    
+    mask_near = True
+    mask_far = (mask_mode == 'both')
+    
+    # 'auto' 模式：检测远端是否有正文行
+    far_side_lines: List[Tuple[Any, float, str]] = []
+    if mask_mode == 'auto':
+        far_is_top = (direction == 'above')
+        for (lb, fs, text) in text_lines:
+            txt = text.strip()
+            if not txt:
+                continue
+            if fs > font_max:
+                continue
+            inter = lb & clip
+            if inter.width <= 0 or inter.height <= 0:
+                continue
+            if (inter.width / max(1.0, clip.width)) < width_ratio:
+                continue
+            if len(txt) < 10:
+                continue
+            if far_is_top:
+                dist = lb.y0 - clip.y0
+                if dist < far_edge_zone:
+                    far_side_lines.append((lb, fs, text))
+            else:
+                dist = clip.y1 - lb.y1
+                if dist < far_edge_zone:
+                    far_side_lines.append((lb, fs, text))
+        
+        mask_far = len(far_side_lines) > 0
+    
+    for (lb, fs, text) in text_lines:
+        if not text.strip():
+            continue
+        if fs > font_max:
+            continue
+        inter = lb & clip
+        if inter.width <= 0 or inter.height <= 0:
+            continue
+        if (inter.width / max(1.0, clip.width)) < width_ratio:
+            continue
+        
+        in_near_side = False
+        in_far_side = False
+        
+        if direction == 'above':
+            if inter.y0 >= y_thresh_bot:
+                in_near_side = True
+            if inter.y1 <= y_thresh_top:
+                in_far_side = True
+        else:
+            if inter.y1 <= y_thresh_top:
+                in_near_side = True
+            if inter.y0 >= y_thresh_bot:
+                in_far_side = True
+        
+        should_mask = False
+        if mask_near and in_near_side:
+            should_mask = True
+        if mask_far and in_far_side:
+            should_mask = True
+        
+        if not should_mask:
+            continue
+        
+        # 转换为像素坐标
+        l = int(max(0, (inter.x0 - clip.x0) * scale))
+        t = int(max(0, (inter.y0 - clip.y0) * scale))
+        r = int(min((clip.x1 - clip.x0) * scale, (inter.x1 - clip.x0) * scale))
+        b = int(min((clip.y1 - clip.y0) * scale, (inter.y1 - clip.y0) * scale))
+        if r - l > 1 and b - t > 1:
+            masks.append((l, t, r, b))
+    
+    return masks
+
+
+# ============================================================================
+# 远端正文检测
+# ============================================================================
+
+def detect_far_side_text_evidence(
+    clip: Any,
+    text_lines: List[Tuple[Any, float, str]],
+    direction: str,
+    edge_zone: float = 40.0,
+    min_width_ratio: float = 0.30,
+    font_min: float = 7.0,
+    font_max: float = 16.0,
+) -> Tuple[bool, float]:
+    """
+    检测远端边缘附近是否有正文行证据。
+    
+    用于单调性约束：当远端附近有正文行时，Phase D 不应该扩展到这些行的区域。
+    
+    Args:
+        clip: 当前裁剪区域
+        text_lines: 文本行列表 [(rect, font_size, text), ...]
+        direction: 方向 ('above' | 'below')
+        edge_zone: 远端边缘检测范围（pt）
+        min_width_ratio: 正文行最小宽度比例
+        font_min/font_max: 正文字号范围
+    
+    Returns:
+        (has_evidence, suggested_limit):
+        - has_evidence: 是否检测到正文证据
+        - suggested_limit: 建议的边界限制
+    """
+    if fitz is None or clip.height <= 1 or clip.width <= 1:
+        return False, 0.0
+    
+    far_is_top = (direction == 'above')
+    evidence_lines: List[Any] = []
+    
+    for (lb, fs, text) in text_lines:
+        txt = text.strip()
+        if not txt:
+            continue
+        
+        inter = lb & clip
+        if inter.width <= 0 or inter.height <= 0:
+            continue
+        
+        width_ratio = inter.width / max(1.0, clip.width)
+        if width_ratio < min_width_ratio:
+            continue
+        
+        if not (font_min <= fs <= font_max):
+            continue
+        
+        if len(txt) < 10:
+            continue
+        
+        if far_is_top:
+            dist_to_far_edge = lb.y0 - clip.y0
+            if dist_to_far_edge < edge_zone:
+                evidence_lines.append(lb)
+        else:
+            dist_to_far_edge = clip.y1 - lb.y1
+            if dist_to_far_edge < edge_zone:
+                evidence_lines.append(lb)
+    
+    if evidence_lines:
+        gap = 6.0
+        if far_is_top:
+            suggested_limit = max(lb.y1 for lb in evidence_lines) + gap
+        else:
+            suggested_limit = min(lb.y0 for lb in evidence_lines) - gap
+        return True, suggested_limit
+    
+    return False, 0.0
+
+
+def trim_far_side_text_post_autocrop(
+    clip: Any,
+    text_lines: List[Tuple[Any, float, str]],
+    direction: str,
+    *,
+    typical_line_h: Optional[float] = None,
+    scan_lines: int = 3,
+    min_width_ratio: float = 0.30,
+    min_text_len: int = 15,
+    font_min: float = 7.0,
+    font_max: float = 16.0,
+    gap: float = 6.0,
+) -> Tuple[Any, bool]:
+    """
+    Phase D 后的轻量去正文后处理。
+    
+    在 autocrop 完成后，扫描远端边缘附近的正文行，如果检测到明确的正文，
+    向内推 y0/y1（只动 y，不动 x）。
+    
+    Args:
+        clip: 当前裁剪区域
+        text_lines: 文本行列表
+        direction: 方向 ('above' | 'below')
+        typical_line_h: 典型行高
+        scan_lines: 扫描行数
+        min_width_ratio: 正文最小宽度比例
+        min_text_len: 正文最小长度
+        font_min/font_max: 正文字号范围
+        gap: 裁剪后的间隙
+    
+    Returns:
+        (new_clip, was_trimmed): 新的裁剪区域和是否进行了裁剪
+    """
+    if fitz is None or clip.height <= 1 or clip.width <= 1:
+        return clip, False
+    
+    if typical_line_h and typical_line_h > 0:
+        scan_range = typical_line_h * scan_lines
+    else:
+        scan_range = 45.0
+    
+    far_is_top = (direction == 'above')
+    text_to_trim: List[Any] = []
+    
+    for (lb, fs, text) in text_lines:
+        txt = text.strip()
+        if not txt:
+            continue
+        
+        inter = lb & clip
+        if inter.width <= 0 or inter.height <= 0:
+            continue
+        
+        width_ratio = inter.width / max(1.0, clip.width)
+        if width_ratio < min_width_ratio:
+            continue
+        if len(txt) < min_text_len:
+            continue
+        if not (font_min <= fs <= font_max):
+            continue
+        
+        if far_is_top:
+            dist = lb.y0 - clip.y0
+            if dist < scan_range:
+                text_to_trim.append(lb)
+        else:
+            dist = clip.y1 - lb.y1
+            if dist < scan_range:
+                text_to_trim.append(lb)
+    
+    if not text_to_trim:
+        return clip, False
+    
+    new_clip = fitz.Rect(clip)
+    if far_is_top:
+        max_y1 = max(lb.y1 for lb in text_to_trim)
+        new_y0 = max_y1 + gap
+        if new_y0 < clip.y0 + 0.5 * clip.height:
+            new_clip = fitz.Rect(clip.x0, new_y0, clip.x1, clip.y1)
+    else:
+        min_y0 = min(lb.y0 for lb in text_to_trim)
+        new_y1 = min_y0 - gap
+        if new_y1 > clip.y0 + 0.5 * clip.height:
+            new_clip = fitz.Rect(clip.x0, clip.y0, clip.x1, new_y1)
+    
+    was_trimmed = (new_clip != clip)
+    return new_clip, was_trimmed
+
+
+# ============================================================================
+# 动态验收阈值
+# ============================================================================
+
+def adaptive_acceptance_thresholds(
+    base_height: float,
+    *,
+    is_table: bool = False,
+    far_cov: float = 0.0,
+) -> "AcceptanceThresholds":
+    """
+    根据基线高度和远侧覆盖率动态计算验收阈值。
+    
+    策略：
+    - 大图（>400pt）：允许更激进的精裁
+    - 中等图（200-400pt）：使用默认阈值
+    - 小图（<200pt）：更保守
+    - 远侧文字覆盖率越高，允许缩小得越多
+    
+    Args:
+        base_height: 基线窗口高度（pt）
+        is_table: 是否为表格
+        far_cov: 远侧文字覆盖率（0.0-1.0）
+    
+    Returns:
+        AcceptanceThresholds 对象
+    """
+    from .models import AcceptanceThresholds as AT
+    
+    # 基础阈值（根据尺寸分层）
+    if base_height > 400:
+        base_h, base_a = (0.50, 0.45) if is_table else (0.55, 0.50)
+        base_ink, base_cov, base_text = 0.85, 0.80, 0.70
+        desc = "large"
+    elif base_height > 200:
+        base_h, base_a = (0.50, 0.45) if is_table else (0.60, 0.55)
+        base_ink, base_cov, base_text = 0.90, 0.85, 0.75
+        desc = "medium"
+    else:
+        base_h, base_a = (0.65, 0.60) if is_table else (0.70, 0.65)
+        base_ink, base_cov, base_text = 0.92, 0.88, 0.80
+        desc = "small"
+    
+    # 根据远侧覆盖率进一步调整
+    if far_cov >= 0.60:
+        base_h = min(base_h, 0.35)
+        base_a = min(base_a, 0.25)
+        base_ink = min(base_ink, 0.70)
+        base_cov = min(base_cov, 0.70)
+        base_text = min(base_text, 0.55)
+        desc += "+high_far_cov"
+    elif far_cov >= 0.30:
+        base_h = min(base_h, 0.45)
+        base_a = min(base_a, 0.35)
+        base_ink = min(base_ink, 0.75)
+        base_cov = min(base_cov, 0.75)
+        base_text = min(base_text, 0.60)
+        desc += "+med_far_cov"
+    elif far_cov >= 0.18:
+        base_h = min(base_h, 0.50)
+        base_a = min(base_a, 0.40)
+        base_ink = min(base_ink, 0.80)
+        base_cov = min(base_cov, 0.80)
+        base_text = min(base_text, 0.65)
+        desc += "+low_far_cov"
+    
+    return AT(
+        height_ratio=base_h,
+        area_ratio=base_a,
+        object_coverage=base_cov,
+        ink_density=base_ink,
+    )
+
+
+# ============================================================================
+# 边缘对齐
+# ============================================================================
+
+def snap_clip_edges(
+    clip: Any,
+    draw_items: List["DrawItem"],
+    *,
+    snap_px: float = 14.0,
+) -> Any:
+    """
+    将裁剪区域的上下边缘对齐到最近的水平线。
+    
+    Args:
+        clip: 裁剪区域
+        draw_items: 绘图元素列表
+        snap_px: 对齐距离阈值（pt）
+    
+    Returns:
+        对齐后的裁剪区域
+    """
+    if fitz is None:
+        return clip
+    
+    top = clip.y0
+    bottom = clip.y1
+    best_top = top
+    best_bot = bottom
+    best_top_dist = snap_px + 1
+    best_bot_dist = snap_px + 1
+    
+    for it in draw_items:
+        if it.orient != 'H':
+            continue
+        y_mid = 0.5 * (it.rect.y0 + it.rect.y1)
+        
+        d_top = abs(y_mid - top)
+        if d_top <= snap_px and d_top < best_top_dist:
+            best_top_dist = d_top
+            best_top = y_mid
+        
+        d_bot = abs(y_mid - bottom)
+        if d_bot <= snap_px and d_bot < best_bot_dist:
+            best_bot_dist = d_bot
+            best_bot = y_mid
+    
+    if best_bot - best_top >= 40.0:
+        return fitz.Rect(clip.x0, best_top, clip.x1, best_bot)
+    return clip
+
+
+# ============================================================================
+# 向后兼容别名
+# ============================================================================
+
+_merge_rects = merge_rects
+_refine_clip_by_objects = refine_clip_by_objects
+_build_text_masks_px = build_text_masks_px
+_detect_far_side_text_evidence = detect_far_side_text_evidence
+_trim_far_side_text_post_autocrop = trim_far_side_text_post_autocrop
+_adaptive_acceptance_thresholds = adaptive_acceptance_thresholds
