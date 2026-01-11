@@ -409,7 +409,7 @@ def _pop_engine_arg(argv_list: List[str]) -> tuple[str, List[str]]:
     """
     解析并移除 `--engine legacy|modular` 参数（不交给 argparse，避免 legacy CLI 报未知参数）。
     """
-    engine = os.environ.get("PDF_SUMMARY_AGENT_ENGINE", "legacy").strip().lower()
+    engine = os.environ.get("PDF_SUMMARY_AGENT_ENGINE", "modular").strip().lower()
     cleaned: List[str] = []
     i = 0
     while i < len(argv_list):
@@ -460,7 +460,7 @@ def _load_legacy_module():
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     """
-    兼容入口：默认走 legacy（旧版完整实现）；可用 `--engine modular` 切换到模块化主流程。
+    兼容入口：默认走模块化主流程；可用 `--engine legacy` 切换到旧版完整实现。
     """
     if argv is None:
         argv_list = sys.argv[1:]
@@ -468,16 +468,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         argv_list = list(argv)
 
     engine, cleaned = _pop_engine_arg(argv_list)
-    if engine == "modular":
-        return parse_args_modular(cleaned)
+    if engine == "legacy":
+        legacy = _load_legacy_module()
+        return legacy.parse_args(cleaned)
 
-    legacy = _load_legacy_module()
-    return legacy.parse_args(cleaned)
+    return parse_args_modular(cleaned)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     """
-    兼容入口：默认走 legacy（旧版完整实现）；可用 `--engine modular` 切换到模块化主流程。
+    兼容入口：默认走模块化主流程；可用 `--engine legacy` 切换到旧版完整实现。
     """
     if argv is None:
         argv_list = sys.argv[1:]
@@ -485,11 +485,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         argv_list = list(argv)
 
     engine, cleaned = _pop_engine_arg(argv_list)
-    if engine == "modular":
-        return main_modular(cleaned)
+    if engine == "legacy":
+        legacy = _load_legacy_module()
+        return legacy.main(cleaned)
 
-    legacy = _load_legacy_module()
-    return legacy.main(cleaned)
+    return main_modular(cleaned)
 
 
 if __name__ == "__main__":

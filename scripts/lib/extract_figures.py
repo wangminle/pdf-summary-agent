@@ -5,7 +5,7 @@ Commit 12+: Figure 提取主循环
 
 从 extract_pdf_assets.py 抽离的 Figure 提取逻辑。
 
-V0.4.0 更新：集成完整的 Phase A/B/C 文本裁切逻辑
+V0.4.0 更新：集成完整的 Phase A/B/C/D 文本裁切与验收逻辑
 
 这个模块提供 extract_figures() 函数，用于从 PDF 中提取 Figure 图像。
 
@@ -14,8 +14,9 @@ V0.4.0 更新：集成完整的 Phase A/B/C 文本裁切逻辑
 2. 自适应参数计算（基于文档行高）
 3. 全局锚点方向判定
 4. 逐页扫描 Figure Caption
-5. 裁剪窗口计算与精裁（Phase A/B/C）
-6. 渲染与保存
+5. 裁剪窗口计算与精裁（Phase A/B/C/D）
+6. 验收检查与回退机制
+7. 渲染与保存
 """
 
 from __future__ import annotations
@@ -41,14 +42,18 @@ from .refine import (
     merge_rects,
     build_text_masks_px,
     snap_clip_edges,
+    estimate_ink_ratio,
 )
 from .extract_helpers import (
     collect_draw_items,
     collect_text_lines,
-    estimate_ink_ratio,
     estimate_document_line_metrics,
     DrawItem,
 )
+from .direction import compute_global_anchor, determine_direction
+from .layout_model import adjust_clip_with_layout
+from .debug_visual import save_debug_visualization
+from .models import DebugStageInfo
 from .output import get_unique_path
 
 # 避免循环导入
@@ -127,6 +132,9 @@ def extract_figures(
     adaptive_line_height: bool = True,
     # Layout model (V2 Architecture)
     layout_model: Optional[DocumentLayoutModel] = None,
+    # Global anchor
+    global_anchor: Optional[str] = None,
+    global_anchor_margin: float = 0.02,
 ) -> List[AttachmentRecord]:
     """
     从 PDF 中提取 Figure 图像。
@@ -136,8 +144,9 @@ def extract_figures(
     2. 自适应参数计算（基于文档行高）
     3. 全局锚点方向判定
     4. 逐页扫描 Figure Caption
-    5. 裁剪窗口计算与精裁（Phase A/B/C）
-    6. 渲染与保存
+    5. 裁剪窗口计算与精裁（Phase A/B/C/D）
+    6. 验收检查与回退机制
+    7. 渲染与保存
     
     Args:
         pdf_path: PDF 文件路径
@@ -149,6 +158,7 @@ def extract_figures(
         below_figs: 强制从 caption 下方取图的 Figure 列表
         above_figs: 强制从 caption 上方取图的 Figure 列表
         text_trim: 是否启用文本裁切
+        autocrop: 是否启用白边自动裁切（Phase D）
         ... (更多参数见函数签名)
     
     Returns:
@@ -191,6 +201,23 @@ def extract_figures(
             text_trim_gap = 0.5 * typical_line_h
         if far_side_min_dist == 50.0:
             far_side_min_dist = 3.0 * typical_line_h
+    
+    # Global Anchor: 预扫描计算全局方向
+    effective_global_anchor: Optional[str] = global_anchor
+    if global_anchor == 'auto' or global_anchor is None:
+        effective_global_anchor = compute_global_anchor(
+            doc, FIGURE_LINE_RE,
+            clip_height=clip_height,
+            margin_x=margin_x,
+            caption_gap=caption_gap,
+            margin=global_anchor_margin,
+            is_table=False,
+            debug=debug_captions,
+        )
+        if debug_captions and effective_global_anchor:
+            print(f"[GLOBAL_ANCHOR] Computed: {effective_global_anchor}")
+    
+    scale = dpi / 72.0  # pt to px 转换比例
     
     # 逐页扫描
     for pno in range(len(doc)):
@@ -271,19 +298,16 @@ def extract_figures(
                 # ================================================================
                 # 方向判定：决定从 caption 上方还是下方取图
                 # ================================================================
-                direction = 'above'  # 默认：图在 caption 上方
-                
-                # 1. 用户显式指定的方向覆盖
-                if ident in below_set:
-                    direction = 'below'
-                elif ident in above_set:
-                    direction = 'above'
-                else:
-                    # 2. 简单启发式：如果 caption 在页面顶部 1/3，则从下方取图
-                    # （后续 Phase 2 会实现完整的智能方向判定）
-                    page_third = page_rect.height / 3
-                    if caption_bbox.y0 < page_rect.y0 + page_third:
-                        direction = 'below'
+                direction = determine_direction(
+                    caption_bbox,
+                    page_rect,
+                    ident,
+                    global_anchor=effective_global_anchor,
+                    forced_below=below_set,
+                    forced_above=above_set,
+                    is_table=False,
+                    page_position_heuristic=True,
+                )
                 
                 # ================================================================
                 # 计算基础裁剪窗口 (Baseline)
@@ -331,7 +355,7 @@ def extract_figures(
                 clip_after_A = create_rect(clip.x0, clip.y0, clip.x1, clip.y1)
                 
                 # ================================================================
-                # Phase B: 对象对齐（如果启用）
+                # Phase B: 对象对齐
                 # ================================================================
                 if ident not in no_refine_set:
                     clip = refine_clip_by_objects(
@@ -348,12 +372,169 @@ def extract_figures(
                         use_horizontal_union=False,
                     )
                 
+                clip_after_B = create_rect(clip.x0, clip.y0, clip.x1, clip.y1)
+                
+                # ================================================================
+                # 版式驱动裁剪（如果提供了 layout_model）
+                # ================================================================
+                if layout_model is not None and ident not in no_refine_set:
+                    clip = adjust_clip_with_layout(
+                        clip,
+                        caption_bbox,
+                        layout_model,
+                        pno,
+                        direction,
+                        debug=debug_captions,
+                    )
+                
+                # ================================================================
+                # Phase D: Autocrop（白边自动裁切）
+                # ================================================================
+                final_clip = clip
+                
+                if autocrop and ident not in no_refine_set:
+                    try:
+                        # 先渲染一版用于分析
+                        pix_for_analysis = page.get_pixmap(dpi=dpi, clip=clip)
+                        
+                        # 构建文本遮罩（可选）
+                        mask_rects_px: Optional[List[Tuple[int, int, int, int]]] = None
+                        if autocrop_mask_text:
+                            mask_rects_px = build_text_masks_px(
+                                clip, text_lines,
+                                scale=scale,
+                                direction=direction,
+                                near_frac=mask_top_frac,
+                                width_ratio=mask_width_ratio,
+                                font_max=mask_font_max,
+                                mask_mode='auto',
+                            )
+                        
+                        # 检测内容边界框
+                        content_bbox_px = detect_content_bbox_pixels(
+                            pix_for_analysis,
+                            white_threshold=autocrop_white_threshold,
+                            pad=autocrop_pad_px,
+                            mask_rects_px=mask_rects_px,
+                        )
+                        
+                        # 转换像素坐标回 pt 坐标
+                        cx0_px, cy0_px, cx1_px, cy1_px = content_bbox_px
+                        new_x0 = clip.x0 + cx0_px / scale
+                        new_y0 = clip.y0 + cy0_px / scale
+                        new_x1 = clip.x0 + cx1_px / scale
+                        new_y1 = clip.y0 + cy1_px / scale
+                        
+                        autocrop_clip = create_rect(new_x0, new_y0, new_x1, new_y1)
+                        
+                        # 单调性约束：检测远端文本证据
+                        has_far_evidence, far_limit = detect_far_side_text_evidence(
+                            clip, text_lines, direction,
+                            edge_zone=40.0,
+                            min_width_ratio=0.30,
+                        )
+                        
+                        if has_far_evidence:
+                            if direction == 'above':
+                                # 远端在顶部，不应向上扩展
+                                autocrop_clip = create_rect(
+                                    autocrop_clip.x0,
+                                    max(autocrop_clip.y0, far_limit),
+                                    autocrop_clip.x1,
+                                    autocrop_clip.y1
+                                )
+                            else:
+                                # 远端在底部，不应向下扩展
+                                autocrop_clip = create_rect(
+                                    autocrop_clip.x0,
+                                    autocrop_clip.y0,
+                                    autocrop_clip.x1,
+                                    min(autocrop_clip.y1, far_limit)
+                                )
+                        
+                        # Phase D 后处理：扫描并移除远端正文
+                        autocrop_clip, _ = trim_far_side_text_post_autocrop(
+                            autocrop_clip, text_lines, direction,
+                            typical_line_h=typical_line_h,
+                            scan_lines=3,
+                        )
+                        
+                        # 验收检查：确保 autocrop 没有过度裁切
+                        autocrop_h = autocrop_clip.height
+                        base_h = base_clip.height
+                        min_h_px = autocrop_min_height_px / scale
+                        
+                        if autocrop_h >= min_h_px and autocrop_h >= base_h * autocrop_shrink_limit:
+                            final_clip = autocrop_clip
+                        else:
+                            logger.debug(f"Figure {ident}: autocrop rejected (h={autocrop_h:.1f} < {base_h * autocrop_shrink_limit:.1f})")
+                    except Exception as e:
+                        logger.warning(f"Figure {ident}: autocrop failed: {e}")
+                
+                # ================================================================
+                # 验收检查与回退机制
+                # ================================================================
+                if refine_safe and ident not in no_refine_set:
+                    # 计算验收阈值
+                    thresholds = adaptive_acceptance_thresholds(
+                        base_clip.height,
+                        is_table=False,
+                        far_cov=0.0,  # 可扩展：计算实际远侧覆盖率
+                    )
+                    
+                    # 检查高度比
+                    height_ratio = final_clip.height / max(1.0, base_clip.height)
+                    area_ratio = (final_clip.width * final_clip.height) / max(1.0, base_clip.width * base_clip.height)
+                    
+                    accepted = True
+                    fallback_reason = ""
+                    
+                    if height_ratio < thresholds.height_ratio:
+                        accepted = False
+                        fallback_reason = f"height_ratio={height_ratio:.3f} < {thresholds.height_ratio:.3f}"
+                    elif area_ratio < thresholds.area_ratio:
+                        accepted = False
+                        fallback_reason = f"area_ratio={area_ratio:.3f} < {thresholds.area_ratio:.3f}"
+                    
+                    if not accepted:
+                        logger.info(f"Figure {ident}: refined clip rejected ({fallback_reason}), falling back")
+                        # 多级回退：先尝试 Phase A only，再回退到 baseline
+                        if clip_after_A.height >= base_clip.height * thresholds.height_ratio:
+                            final_clip = clip_after_A
+                            logger.debug(f"Figure {ident}: using Phase A clip")
+                        else:
+                            final_clip = base_clip
+                            logger.debug(f"Figure {ident}: using baseline clip")
+                
+                # ================================================================
+                # Debug 可视化（如果启用）
+                # ================================================================
+                if debug_visual:
+                    try:
+                        stages: List[DebugStageInfo] = [
+                            DebugStageInfo(stage='baseline', rect=base_clip),
+                            DebugStageInfo(stage='phase_a', rect=clip_after_A),
+                            DebugStageInfo(stage='phase_b', rect=clip_after_B),
+                            DebugStageInfo(stage='phase_d' if autocrop else 'final', rect=final_clip),
+                        ]
+                        save_debug_visualization(
+                            page,
+                            out_dir,
+                            int(ident) if ident.isdigit() else hash(ident) % 1000,
+                            pno + 1,
+                            stages=stages,
+                            caption_rect=caption_bbox,
+                            kind='figure',
+                            layout_model=layout_model,
+                        )
+                    except Exception as e:
+                        logger.debug(f"Failed to save debug visualization for Figure {ident}: {e}")
+                
                 # ================================================================
                 # 渲染与保存
                 # ================================================================
                 try:
-                    scale = dpi / 72.0
-                    pix = page.get_pixmap(dpi=dpi, clip=clip)
+                    pix = page.get_pixmap(dpi=dpi, clip=final_clip)
                     pix.save(out_path)
                     
                     records.append(AttachmentRecord(
