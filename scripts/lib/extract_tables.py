@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Commit 12: Table 提取主循环
+Commit 12+: Table 提取主循环
 
 从 extract_pdf_assets.py 抽离的 Table 提取逻辑。
 
+V0.4.0 更新：集成完整的 Phase A/B/C 文本裁切逻辑
+
 这个模块提供 extract_tables() 函数，用于从 PDF 中提取 Table 图像。
 
-注意：完整实现仍在 scripts-old/extract_pdf_assets.py 中。
-本模块提供模块化入口点，后续会逐步迁移完整逻辑。
+主要处理流程：
+1. 预扫描建立 Caption 索引（智能 Caption 检测）
+2. 自适应参数计算（基于文档行高）
+3. 全局锚点方向判定（表格通常在 caption 下方）
+4. 逐页扫描 Table Caption
+5. 裁剪窗口计算与精裁（Phase A/B/C）
+6. 渲染与保存
 """
 
 from __future__ import annotations
@@ -16,13 +23,13 @@ from __future__ import annotations
 import logging
 import os
 import re
-from typing import TYPE_CHECKING, Dict, Iterable, List, Optional
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Set, Tuple
 
 from .pdf_backend import create_rect, open_pdf
 
 # 导入本地模块
 from .models import AttachmentRecord, CaptionIndex, DocumentLayoutModel
-from .idents import extract_table_ident, sanitize_filename_from_caption
+from .idents import build_output_basename, extract_table_ident
 from .caption_detection import build_caption_index, select_best_caption, find_all_caption_candidates
 from .refine import (
     refine_clip_by_objects,
@@ -30,6 +37,10 @@ from .refine import (
     adaptive_acceptance_thresholds,
     detect_far_side_text_evidence,
     trim_far_side_text_post_autocrop,
+    trim_clip_head_by_text_v2,
+    merge_rects,
+    build_text_masks_px,
+    snap_clip_edges,
 )
 from .extract_helpers import (
     collect_draw_items,
@@ -38,12 +49,13 @@ from .extract_helpers import (
     estimate_document_line_metrics,
     estimate_column_peaks,
     line_density,
+    DrawItem,
 )
 from .output import get_unique_path
 
 # 避免循环导入
 if TYPE_CHECKING:
-    pass
+    import fitz
 
 # 模块日志器
 logger = logging.getLogger(__name__)
@@ -120,9 +132,9 @@ def extract_tables(
     这是一个复杂的函数，包含多个阶段的处理：
     1. 预扫描建立 Caption 索引（智能 Caption 检测）
     2. 自适应参数计算（基于文档行高）
-    3. 全局锚点方向判定（使用表格特定的评分机制）
+    3. 全局锚点方向判定（表格通常在 caption 下方）
     4. 逐页扫描 Table Caption
-    5. 裁剪窗口计算与精裁（Phase A/B/C/D）
+    5. 裁剪窗口计算与精裁（Phase A/B/C）
     6. 渲染与保存
     
     Args:
@@ -132,19 +144,14 @@ def extract_tables(
         table_clip_height: 裁剪窗口高度（pt）
         table_margin_x: 水平边距（pt）
         table_caption_gap: Caption 与表格之间的间隙（pt）
+        t_below: 强制从 caption 下方取表格的 Table 列表
+        t_above: 强制从 caption 上方取表格的 Table 列表
+        text_trim: 是否启用文本裁切
         ... (更多参数见函数签名)
     
     Returns:
         AttachmentRecord 列表，记录提取的每个 Table
-    
-    Note:
-        完整实现仍在 scripts-old/extract_pdf_assets.py 中。
-        本函数目前作为模块化入口点，调用原脚本中的实现。
     """
-    logger.warning(
-        "extract_tables 当前为简化实现；如需与历史版本完全一致，请以输出结果为准进行回归核对。"
-    )
-    
     # 基础实现框架
     pdf_name = os.path.basename(pdf_path)
     doc = open_pdf(pdf_path)
@@ -154,8 +161,8 @@ def extract_tables(
     seen_counts: Dict[str, int] = {}
     
     # 处理方向覆盖参数
-    t_below_set = set([str(x).strip() for x in (t_below or []) if str(x).strip()])
-    t_above_set = set([str(x).strip() for x in (t_above or []) if str(x).strip()])
+    t_below_set: Set[str] = set([str(x).strip() for x in (t_below or []) if str(x).strip()])
+    t_above_set: Set[str] = set([str(x).strip() for x in (t_above or []) if str(x).strip()])
     
     # Smart Caption Detection: 预扫描建立索引
     caption_index: Optional[CaptionIndex] = None
@@ -172,11 +179,12 @@ def extract_tables(
         )
     
     # Adaptive Line Height: 统计文档行高
+    typical_line_h: Optional[float] = None
     if adaptive_line_height:
         line_metrics = estimate_document_line_metrics(doc, sample_pages=5, debug=debug_captions)
         typical_line_h = line_metrics['typical_line_height']
         
-        # 自适应参数计算
+        # 自适应参数计算（表格使用不同的默认值）
         if adjacent_th == 28.0:
             adjacent_th = 2.0 * typical_line_h
         if far_text_th == 300.0:
@@ -191,6 +199,27 @@ def extract_tables(
         page = doc[pno]
         page_rect = page.rect
         dict_data = page.get_text("dict")
+        
+        # 收集该页的文本行和绘图项（用于 Phase A/B）
+        text_lines = collect_text_lines(dict_data)
+        draw_items = collect_draw_items(page)
+        
+        # 收集图像和矢量对象的边界框（用于 Phase B）
+        image_rects: List = []
+        vector_rects: List = []
+        for item in draw_items:
+            # 表格检测：水平/垂直线条
+            if item.orient in ('H', 'V'):
+                vector_rects.append(item.rect)
+            elif item.orient == 'O':
+                vector_rects.append(item.rect)
+        
+        # 从 dict_data 收集图像
+        for blk in dict_data.get("blocks", []):
+            if blk.get("type") == 1:  # 图像块
+                bbox = blk.get("bbox")
+                if bbox:
+                    image_rects.append(create_rect(*bbox))
         
         # 查找 Table captions
         for blk in dict_data.get("blocks", []):
@@ -223,40 +252,102 @@ def extract_tables(
                 
                 # 构建文件名
                 caption_for_name = text_stripped[:max_caption_chars]
-                basename = sanitize_filename_from_caption(
-                    caption_for_name, 
-                    prefix=f"Table_{ident}_",
-                    max_words=max_caption_words
+                basename = build_output_basename(
+                    "table",
+                    ident,
+                    caption_for_name,
+                    max_chars=max_caption_chars,
+                    max_words=max_caption_words,
                 )
                 out_path = os.path.join(out_dir, basename + ".png")
                 out_path, _ = get_unique_path(out_path)
                 
-                # 确定裁剪方向
-                # 表格通常在 caption 下方
-                go_below = True
-                if ident in t_above_set:
-                    go_below = False
-                elif ident in t_below_set:
-                    go_below = True
-                
-                # 计算裁剪窗口
+                # 获取 caption 边界框
                 caption_bbox = create_rect(*(ln.get("bbox", [0, 0, 0, 0])))
+                
+                # ================================================================
+                # 方向判定：表格通常在 caption 下方
+                # ================================================================
+                direction = 'below'  # 表格默认：在 caption 下方
+                
+                # 用户显式指定的方向覆盖
+                if ident in t_above_set:
+                    direction = 'above'
+                elif ident in t_below_set:
+                    direction = 'below'
+                else:
+                    # 简单启发式：如果 caption 在页面底部 1/4，则从上方取表格
+                    page_quarter = page_rect.height * 0.75
+                    if caption_bbox.y1 > page_rect.y0 + page_quarter:
+                        direction = 'above'
+                
+                # ================================================================
+                # 计算基础裁剪窗口 (Baseline)
+                # ================================================================
                 x_left = page_rect.x0 + table_margin_x
                 x_right = page_rect.x1 - table_margin_x
                 
-                if go_below:
-                    # 从 caption 下方取表格
+                if direction == 'below':
+                    # 表格在 caption 下方
                     y_top = caption_bbox.y1 + table_caption_gap
                     y_bottom = min(page_rect.y1, y_top + table_clip_height)
                 else:
-                    # 从 caption 上方取表格
+                    # 表格在 caption 上方
                     y_bottom = caption_bbox.y0 - table_caption_gap
                     y_top = max(page_rect.y0, y_bottom - table_clip_height)
                 
-                clip = create_rect(x_left, y_top, x_right, y_bottom)
+                base_clip = create_rect(x_left, y_top, x_right, y_bottom)
+                clip = create_rect(x_left, y_top, x_right, y_bottom)  # 工作副本
                 
-                # 渲染
+                # ================================================================
+                # Phase A: 文本裁切（表格模式：启用 skip_adjacent_sweep 保护表头）
+                # ================================================================
+                if text_trim:
+                    clip = trim_clip_head_by_text_v2(
+                        clip,
+                        page_rect,
+                        caption_bbox,
+                        direction,
+                        text_lines,
+                        width_ratio=text_trim_width_ratio,
+                        font_min=text_trim_font_min,
+                        font_max=text_trim_font_max,
+                        gap=text_trim_gap,
+                        adjacent_th=adjacent_th,
+                        far_text_th=far_text_th,
+                        far_text_para_min_ratio=far_text_para_min_ratio,
+                        far_text_trim_mode=far_text_trim_mode,
+                        far_side_min_dist=far_side_min_dist,
+                        far_side_para_min_ratio=far_side_para_min_ratio,
+                        typical_line_h=typical_line_h,
+                        skip_adjacent_sweep=True,  # 表格模式：跳过相邻扫描，保护表头
+                        debug=debug_captions,
+                    )
+                
+                clip_after_A = create_rect(clip.x0, clip.y0, clip.x1, clip.y1)
+                
+                # ================================================================
+                # Phase B: 对象对齐（表格使用不同的参数）
+                # ================================================================
+                clip = refine_clip_by_objects(
+                    clip,
+                    caption_bbox,
+                    direction,
+                    image_rects,
+                    vector_rects,
+                    object_pad=object_pad,
+                    min_area_ratio=object_min_area_ratio,
+                    merge_gap=object_merge_gap,
+                    near_edge_only=refine_near_edge_only,
+                    use_axis_union=True,
+                    use_horizontal_union=True,  # 表格可能有并排列
+                )
+                
+                # ================================================================
+                # 渲染与保存
+                # ================================================================
                 try:
+                    scale = dpi / 72.0
                     pix = page.get_pixmap(dpi=dpi, clip=clip)
                     pix.save(out_path)
                     

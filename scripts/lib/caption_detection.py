@@ -247,9 +247,6 @@ def find_all_caption_candidates(
     """
     from .models import CaptionCandidate
     
-    if fitz is None:
-        return []
-    
     candidates: List[CaptionCandidate] = []
     
     try:
@@ -284,7 +281,7 @@ def find_all_caption_candidates(
                         continue
                     
                     candidate = CaptionCandidate(
-                        rect=fitz.Rect(*ln.get("bbox", [0, 0, 0, 0])),
+                        rect=create_rect(*ln.get("bbox", [0, 0, 0, 0])),
                         text=text_stripped,
                         number=number,
                         kind=kind,

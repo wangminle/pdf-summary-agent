@@ -67,7 +67,7 @@ except ImportError:
 logger = get_logger(__name__)
 
 
-def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+def parse_args_modular(argv: Optional[List[str]] = None) -> argparse.Namespace:
     """
     命令行参数解析。
 
@@ -207,13 +207,13 @@ Examples:
     return p.parse_args(argv)
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main_modular(argv: Optional[List[str]] = None) -> int:
     """
     主入口函数。
 
     解析参数 → 文本提取 → 图像提取 → 写出索引
     """
-    args = parse_args(argv)
+    args = parse_args_modular(argv)
 
     if getattr(args, "preset", None) == "robust":
         apply_preset_robust(args)
@@ -236,6 +236,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     layout_model_json = os.path.join(out_dir, "layout_model.json")
     figure_contexts_json = os.path.join(out_dir, "figure_contexts.json")
+
+    # 与 scripts-old 行为保持一致：默认开启结构化日志落盘到 out_dir/run.log.jsonl
+    if getattr(args, "log_jsonl", None) is None:
+        args.log_jsonl = os.path.join(out_dir, "run.log.jsonl")
 
     run_id = configure_logging(level=args.log_level, log_file=args.log_file, log_jsonl=args.log_jsonl)
 
@@ -383,6 +387,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 __all__ = [
     "parse_args",
     "main",
+    "parse_args_modular",
+    "main_modular",
     "AttachmentRecord",
     "DocumentLayoutModel",
     "GatheredText",
@@ -396,6 +402,95 @@ __all__ = [
 ]
 
 
+_LEGACY_MODULE = None
+
+
+def _pop_engine_arg(argv_list: List[str]) -> tuple[str, List[str]]:
+    """
+    解析并移除 `--engine legacy|modular` 参数（不交给 argparse，避免 legacy CLI 报未知参数）。
+    """
+    engine = os.environ.get("PDF_SUMMARY_AGENT_ENGINE", "legacy").strip().lower()
+    cleaned: List[str] = []
+    i = 0
+    while i < len(argv_list):
+        a = argv_list[i]
+        if a.startswith("--engine="):
+            engine = a.split("=", 1)[1].strip().lower()
+            i += 1
+            continue
+        if a == "--engine":
+            if i + 1 < len(argv_list):
+                engine = argv_list[i + 1].strip().lower()
+                i += 2
+                continue
+            # 参数不完整时，交给后续解析报错（这里不吞掉）
+        cleaned.append(a)
+        i += 1
+    return engine, cleaned
+
+
+def _load_legacy_module():
+    """
+    过渡期委托旧版完整实现（优先 old-version/scripts-old/extract_pdf_assets.py）。
+    """
+    global _LEGACY_MODULE
+    if _LEGACY_MODULE is not None:
+        return _LEGACY_MODULE
+
+    import importlib.util
+
+    repo_root = os.path.dirname(_scripts_dir)
+    legacy_candidates = [
+        os.path.join(repo_root, "old-version", "scripts-old", "extract_pdf_assets.py"),
+        os.path.join(repo_root, "scripts-old", "extract_pdf_assets.py"),
+    ]
+    legacy_path = next((p for p in legacy_candidates if os.path.exists(p)), legacy_candidates[0])
+    if not os.path.exists(legacy_path):
+        raise RuntimeError(f"Legacy script not found: {legacy_candidates}")
+    spec = importlib.util.spec_from_file_location("_legacy_extract_pdf_assets", legacy_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Failed to load legacy module: {legacy_path}")
+    module = importlib.util.module_from_spec(spec)
+    # dataclasses 在装饰阶段会通过 sys.modules 反查 __module__ 对应的模块命名空间
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    _LEGACY_MODULE = module
+    return module
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    """
+    兼容入口：默认走 legacy（旧版完整实现）；可用 `--engine modular` 切换到模块化主流程。
+    """
+    if argv is None:
+        argv_list = sys.argv[1:]
+    else:
+        argv_list = list(argv)
+
+    engine, cleaned = _pop_engine_arg(argv_list)
+    if engine == "modular":
+        return parse_args_modular(cleaned)
+
+    legacy = _load_legacy_module()
+    return legacy.parse_args(cleaned)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """
+    兼容入口：默认走 legacy（旧版完整实现）；可用 `--engine modular` 切换到模块化主流程。
+    """
+    if argv is None:
+        argv_list = sys.argv[1:]
+    else:
+        argv_list = list(argv)
+
+    engine, cleaned = _pop_engine_arg(argv_list)
+    if engine == "modular":
+        return main_modular(cleaned)
+
+    legacy = _load_legacy_module()
+    return legacy.main(cleaned)
+
+
 if __name__ == "__main__":
     sys.exit(main())
-

@@ -114,6 +114,16 @@ from lib.refine import (
     detect_content_bbox_pixels,
     refine_clip_by_objects,
     adaptive_acceptance_thresholds,
+    trim_clip_head_by_text,
+    trim_clip_head_by_text_v2,
+    is_caption_text,
+    detect_exact_n_lines_of_text,
+    merge_rects,
+    build_text_masks_px,
+    detect_far_side_text_evidence,
+    trim_far_side_text_post_autocrop,
+    snap_clip_edges,
+    estimate_ink_ratio,
 )
 
 from lib.debug_visual import (
@@ -175,6 +185,16 @@ __all__ = [
     "detect_content_bbox_pixels",
     "refine_clip_by_objects",
     "adaptive_acceptance_thresholds",
+    "trim_clip_head_by_text",
+    "trim_clip_head_by_text_v2",
+    "is_caption_text",
+    "detect_exact_n_lines_of_text",
+    "merge_rects",
+    "build_text_masks_px",
+    "detect_far_side_text_evidence",
+    "trim_far_side_text_post_autocrop",
+    "snap_clip_edges",
+    "estimate_ink_ratio",
     # 调试
     "save_debug_visualization",
     "draw_rects_on_pix",

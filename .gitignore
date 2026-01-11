@@ -53,7 +53,8 @@ __pypackages__/
 cython_debug/
 
 # Test files and PDFs
-tests/
+tests-basic-benchmark/
+
 
 # Reference files and documents
 ref/

@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Commit 12: Figure 提取主循环
+Commit 12+: Figure 提取主循环
 
 从 extract_pdf_assets.py 抽离的 Figure 提取逻辑。
 
+V0.4.0 更新：集成完整的 Phase A/B/C 文本裁切逻辑
+
 这个模块提供 extract_figures() 函数，用于从 PDF 中提取 Figure 图像。
 
-注意：完整实现仍在 scripts-old/extract_pdf_assets.py 中。
-本模块提供模块化入口点，后续会逐步迁移完整逻辑。
+主要处理流程：
+1. 预扫描建立 Caption 索引（智能 Caption 检测）
+2. 自适应参数计算（基于文档行高）
+3. 全局锚点方向判定
+4. 逐页扫描 Figure Caption
+5. 裁剪窗口计算与精裁（Phase A/B/C）
+6. 渲染与保存
 """
 
 from __future__ import annotations
@@ -16,13 +23,13 @@ from __future__ import annotations
 import logging
 import os
 import re
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
 from .pdf_backend import create_rect, open_pdf
 
 # 导入本地模块
 from .models import AttachmentRecord, CaptionIndex, DocumentLayoutModel
-from .idents import extract_figure_ident, sanitize_filename_from_caption
+from .idents import build_output_basename, extract_figure_ident
 from .caption_detection import build_caption_index, select_best_caption, find_all_caption_candidates
 from .refine import (
     refine_clip_by_objects,
@@ -30,18 +37,23 @@ from .refine import (
     adaptive_acceptance_thresholds,
     detect_far_side_text_evidence,
     trim_far_side_text_post_autocrop,
+    trim_clip_head_by_text_v2,
+    merge_rects,
+    build_text_masks_px,
+    snap_clip_edges,
 )
 from .extract_helpers import (
     collect_draw_items,
     collect_text_lines,
     estimate_ink_ratio,
     estimate_document_line_metrics,
+    DrawItem,
 )
 from .output import get_unique_path
 
 # 避免循环导入
 if TYPE_CHECKING:
-    pass
+    import fitz
 
 # 模块日志器
 logger = logging.getLogger(__name__)
@@ -124,7 +136,7 @@ def extract_figures(
     2. 自适应参数计算（基于文档行高）
     3. 全局锚点方向判定
     4. 逐页扫描 Figure Caption
-    5. 裁剪窗口计算与精裁（Phase A/B/C/D）
+    5. 裁剪窗口计算与精裁（Phase A/B/C）
     6. 渲染与保存
     
     Args:
@@ -134,19 +146,14 @@ def extract_figures(
         clip_height: 裁剪窗口高度（pt）
         margin_x: 水平边距（pt）
         caption_gap: Caption 与图像之间的间隙（pt）
+        below_figs: 强制从 caption 下方取图的 Figure 列表
+        above_figs: 强制从 caption 上方取图的 Figure 列表
+        text_trim: 是否启用文本裁切
         ... (更多参数见函数签名)
     
     Returns:
         AttachmentRecord 列表，记录提取的每个 Figure
-    
-    Note:
-        完整实现仍在 scripts-old/extract_pdf_assets.py 中。
-        本函数目前作为模块化入口点，调用原脚本中的实现。
     """
-    logger.warning(
-        "extract_figures 当前为简化实现；如需与历史版本完全一致，请以输出结果为准进行回归核对。"
-    )
-    
     # 基础实现框架
     pdf_name = os.path.basename(pdf_path)
     doc = open_pdf(pdf_path)
@@ -154,6 +161,11 @@ def extract_figures(
     
     records: List[AttachmentRecord] = []
     seen_counts: Dict[str, int] = {}
+    
+    # 处理方向覆盖参数
+    below_set: Set[str] = set([str(x).strip() for x in (below_figs or []) if str(x).strip()])
+    above_set: Set[str] = set([str(x).strip() for x in (above_figs or []) if str(x).strip()])
+    no_refine_set: Set[str] = set([str(x).strip() for x in (no_refine_figs or []) if str(x).strip()])
     
     # Smart Caption Detection: 预扫描建立索引
     caption_index: Optional[CaptionIndex] = None
@@ -165,6 +177,7 @@ def extract_figures(
         caption_index = build_caption_index(doc, figure_pattern=FIGURE_LINE_RE, debug=debug_captions)
     
     # Adaptive Line Height: 统计文档行高
+    typical_line_h: Optional[float] = None
     if adaptive_line_height:
         line_metrics = estimate_document_line_metrics(doc, sample_pages=5, debug=debug_captions)
         typical_line_h = line_metrics['typical_line_height']
@@ -184,6 +197,24 @@ def extract_figures(
         page = doc[pno]
         page_rect = page.rect
         dict_data = page.get_text("dict")
+        
+        # 收集该页的文本行和绘图项（用于 Phase A/B）
+        text_lines = collect_text_lines(dict_data)
+        draw_items = collect_draw_items(page)
+        
+        # 收集图像和矢量对象的边界框（用于 Phase B）
+        image_rects: List = []
+        vector_rects: List = []
+        for item in draw_items:
+            if item.orient == 'O':  # 其他形状
+                vector_rects.append(item.rect)
+        
+        # 从 dict_data 收集图像
+        for blk in dict_data.get("blocks", []):
+            if blk.get("type") == 1:  # 图像块
+                bbox = blk.get("bbox")
+                if bbox:
+                    image_rects.append(create_rect(*bbox))
         
         # 查找 Figure captions
         for blk in dict_data.get("blocks", []):
@@ -224,25 +255,104 @@ def extract_figures(
                 
                 # 构建文件名
                 caption_for_name = text_stripped[:max_caption_chars]
-                basename = sanitize_filename_from_caption(
-                    caption_for_name, 
-                    prefix=f"Figure_{ident}_",
-                    max_words=max_caption_words
+                basename = build_output_basename(
+                    "figure",
+                    ident,
+                    caption_for_name,
+                    max_chars=max_caption_chars,
+                    max_words=max_caption_words,
                 )
                 out_path = os.path.join(out_dir, basename + ".png")
                 out_path, _ = get_unique_path(out_path)
                 
-                # 计算裁剪窗口（简化版本 - 从 caption 上方取图）
+                # 获取 caption 边界框
                 caption_bbox = create_rect(*(ln.get("bbox", [0, 0, 0, 0])))
+                
+                # ================================================================
+                # 方向判定：决定从 caption 上方还是下方取图
+                # ================================================================
+                direction = 'above'  # 默认：图在 caption 上方
+                
+                # 1. 用户显式指定的方向覆盖
+                if ident in below_set:
+                    direction = 'below'
+                elif ident in above_set:
+                    direction = 'above'
+                else:
+                    # 2. 简单启发式：如果 caption 在页面顶部 1/3，则从下方取图
+                    # （后续 Phase 2 会实现完整的智能方向判定）
+                    page_third = page_rect.height / 3
+                    if caption_bbox.y0 < page_rect.y0 + page_third:
+                        direction = 'below'
+                
+                # ================================================================
+                # 计算基础裁剪窗口 (Baseline)
+                # ================================================================
                 x_left = page_rect.x0 + margin_x
                 x_right = page_rect.x1 - margin_x
-                y_bottom = caption_bbox.y0 - caption_gap
-                y_top = max(page_rect.y0, y_bottom - clip_height)
                 
-                clip = create_rect(x_left, y_top, x_right, y_bottom)
+                if direction == 'above':
+                    # 图在 caption 上方
+                    y_bottom = caption_bbox.y0 - caption_gap
+                    y_top = max(page_rect.y0, y_bottom - clip_height)
+                else:
+                    # 图在 caption 下方
+                    y_top = caption_bbox.y1 + caption_gap
+                    y_bottom = min(page_rect.y1, y_top + clip_height)
                 
-                # 渲染
+                base_clip = create_rect(x_left, y_top, x_right, y_bottom)
+                clip = create_rect(x_left, y_top, x_right, y_bottom)  # 工作副本
+                
+                # ================================================================
+                # Phase A: 文本裁切
+                # ================================================================
+                if text_trim and ident not in no_refine_set:
+                    clip = trim_clip_head_by_text_v2(
+                        clip,
+                        page_rect,
+                        caption_bbox,
+                        direction,
+                        text_lines,
+                        width_ratio=text_trim_width_ratio,
+                        font_min=text_trim_font_min,
+                        font_max=text_trim_font_max,
+                        gap=text_trim_gap,
+                        adjacent_th=adjacent_th,
+                        far_text_th=far_text_th,
+                        far_text_para_min_ratio=far_text_para_min_ratio,
+                        far_text_trim_mode=far_text_trim_mode,
+                        far_side_min_dist=far_side_min_dist,
+                        far_side_para_min_ratio=far_side_para_min_ratio,
+                        typical_line_h=typical_line_h,
+                        skip_adjacent_sweep=False,  # Figure 不跳过
+                        debug=debug_captions,
+                    )
+                
+                clip_after_A = create_rect(clip.x0, clip.y0, clip.x1, clip.y1)
+                
+                # ================================================================
+                # Phase B: 对象对齐（如果启用）
+                # ================================================================
+                if ident not in no_refine_set:
+                    clip = refine_clip_by_objects(
+                        clip,
+                        caption_bbox,
+                        direction,
+                        image_rects,
+                        vector_rects,
+                        object_pad=object_pad,
+                        min_area_ratio=object_min_area_ratio,
+                        merge_gap=object_merge_gap,
+                        near_edge_only=refine_near_edge_only,
+                        use_axis_union=True,
+                        use_horizontal_union=False,
+                    )
+                
+                # ================================================================
+                # 渲染与保存
+                # ================================================================
                 try:
+                    scale = dpi / 72.0
                     pix = page.get_pixmap(dpi=dpi, clip=clip)
                     pix.save(out_path)
                     
