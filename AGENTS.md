@@ -4,9 +4,40 @@
 
 ## 版本信息
 
-- **版本**：V0.2.0（2026-01-09 重构版）
-- **架构**：模块化设计，核心组件位于 `scripts/lib/`
-- **主脚本**：`scripts-old/extract_pdf_assets.py`（完整功能，稳定版）
+- **版本**：V0.3.1（2026-01-10 模块化完成版）
+- **架构**：三层模块化设计
+  - `scripts/lib/`：模块化组件库（数据结构、算法、工具函数）
+  - `scripts/core/`：核心入口（CLI 解析、主流程）
+  - `scripts/extract_pdf_assets.py`：兼容导出层
+- **主脚本**：
+  - **新入口**：`scripts/extract_pdf_assets.py`（推荐，调用旧版完整实现）
+  - **旧入口**：`scripts-old/extract_pdf_assets.py`（完整功能，过渡期保留）
+
+### 代码结构
+
+```
+scripts/
+├── extract_pdf_assets.py    # 兼容导出层（新入口）
+├── core/
+│   ├── __init__.py          # 核心入口包
+│   └── extract_pdf_assets.py  # CLI + main()
+├── lib/
+│   ├── models.py            # 数据结构
+│   ├── idents.py            # 标识符与正则
+│   ├── output.py            # 输出与索引
+│   ├── caption_detection.py # Caption 检测
+│   ├── layout_model.py      # 版式模型
+│   ├── text_extract.py      # 文本提取
+│   ├── refine.py            # 精裁与验收
+│   ├── debug_visual.py      # 调试可视化
+│   ├── figure_contexts.py   # 图表上下文
+│   ├── extract_figures.py   # Figure 提取（占位）
+│   ├── extract_tables.py    # Table 提取（占位）
+│   └── pdf_backend.py       # PDF 后端抽象
+└── requirements.txt
+scripts-old/                   # 过渡期保留
+└── extract_pdf_assets.py      # 完整实现（~8500 行）
+```
 
 ---
 
@@ -73,12 +104,26 @@
 
 ### 示例：运行提取脚本
 
-**macOS/Linux**：
+**推荐（新入口）**：
+
+macOS/Linux：
+```bash
+python3 scripts/extract_pdf_assets.py --pdf "./<paper>.pdf" --preset robust
+```
+
+Windows/PowerShell：
+```powershell
+python .\scripts\extract_pdf_assets.py --pdf ".\<paper>.pdf" --preset robust
+```
+
+**兼容（旧入口）**：
+
+macOS/Linux：
 ```bash
 python3 scripts-old/extract_pdf_assets.py --pdf "./<paper>.pdf" --preset robust
 ```
 
-**Windows/PowerShell**：
+Windows/PowerShell：
 ```powershell
 python .\scripts-old\extract_pdf_assets.py --pdf ".\<paper>.pdf" --preset robust
 ```
@@ -112,12 +157,20 @@ python .\scripts-old\sync_index_after_rename.py .
 ### 基本执行
 
 ```bash
+# 新入口（推荐）
+python3 scripts/extract_pdf_assets.py --pdf <PDF_DIR>/<paper>.pdf
+
+# 旧入口（兼容）
 python3 scripts-old/extract_pdf_assets.py --pdf <PDF_DIR>/<paper>.pdf
 ```
 
 ### 推荐：使用稳健预设
 
 ```bash
+# 新入口（推荐）
+python3 scripts/extract_pdf_assets.py --pdf <PDF_DIR>/<paper>.pdf --preset robust
+
+# 旧入口（兼容）
 python3 scripts-old/extract_pdf_assets.py --pdf <PDF_DIR>/<paper>.pdf --preset robust
 ```
 
@@ -214,13 +267,13 @@ python3 scripts-old/extract_pdf_assets.py --pdf <PDF_DIR>/<paper>.pdf --preset r
 
 ```bash
 # 默认启用
-python3 scripts-old/extract_pdf_assets.py --pdf paper.pdf --preset robust
+python3 scripts/extract_pdf_assets.py --pdf paper.pdf --preset robust
 
 # 查看评分详情
-python3 scripts-old/extract_pdf_assets.py --pdf paper.pdf --preset robust --debug-captions
+python3 scripts/extract_pdf_assets.py --pdf paper.pdf --preset robust --debug-captions
 
 # 关闭智能识别
-python3 scripts-old/extract_pdf_assets.py --pdf paper.pdf --preset robust --no-smart-caption-detection
+python3 scripts/extract_pdf_assets.py --pdf paper.pdf --preset robust --no-smart-caption-detection
 ```
 
 ---
@@ -239,13 +292,13 @@ python3 scripts-old/extract_pdf_assets.py --pdf paper.pdf --preset robust --no-s
 
 ```bash
 # 默认 on
-python3 scripts-old/extract_pdf_assets.py --pdf paper.pdf --preset robust
+python3 scripts/extract_pdf_assets.py --pdf paper.pdf --preset robust
 
 # 使用 auto
-python3 scripts-old/extract_pdf_assets.py --pdf paper.pdf --preset robust --layout-driven auto
+python3 scripts/extract_pdf_assets.py --pdf paper.pdf --preset robust --layout-driven auto
 
 # 关闭（不推荐）
-python3 scripts-old/extract_pdf_assets.py --pdf paper.pdf --preset robust --layout-driven off
+python3 scripts/extract_pdf_assets.py --pdf paper.pdf --preset robust --layout-driven off
 ```
 
 ---
@@ -339,7 +392,7 @@ python3 scripts-old/sync_index_after_rename.py .
 
 ```bash
 # 步骤1：提取
-python3 scripts-old/extract_pdf_assets.py --pdf paper.pdf --preset robust --allow-continued
+python3 scripts/extract_pdf_assets.py --pdf paper.pdf --preset robust --allow-continued
 
 # 步骤2：阅读论文，理解图表含义
 

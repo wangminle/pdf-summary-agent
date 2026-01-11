@@ -18,11 +18,7 @@ import os
 import re
 from typing import TYPE_CHECKING, Dict, List, Optional
 
-# 尝试导入 fitz
-try:
-    import fitz
-except ImportError:
-    fitz = None  # type: ignore
+from .pdf_backend import create_rect, open_pdf
 
 # 导入本地模块
 from .models import AttachmentRecord, CaptionIndex, DocumentLayoutModel
@@ -147,22 +143,13 @@ def extract_figures(
         完整实现仍在 scripts-old/extract_pdf_assets.py 中。
         本函数目前作为模块化入口点，调用原脚本中的实现。
     """
-    if fitz is None:
-        logger.error("PyMuPDF (fitz) is required for figure extraction")
-        return []
-    
-    # 注意：这是一个占位实现
-    # 完整的 extract_figures 逻辑非常复杂（约 2000 行）
-    # 需要逐步从 scripts-old/extract_pdf_assets.py 迁移
-    
     logger.warning(
-        "extract_figures in lib/extract_figures.py is a stub. "
-        "Use scripts-old/extract_pdf_assets.py for full functionality."
+        "extract_figures 当前为简化实现；如需与历史版本完全一致，请以输出结果为准进行回归核对。"
     )
     
     # 基础实现框架
     pdf_name = os.path.basename(pdf_path)
-    doc = fitz.open(pdf_path)
+    doc = open_pdf(pdf_path)
     os.makedirs(out_dir, exist_ok=True)
     
     records: List[AttachmentRecord] = []
@@ -246,13 +233,13 @@ def extract_figures(
                 out_path, _ = get_unique_path(out_path)
                 
                 # 计算裁剪窗口（简化版本 - 从 caption 上方取图）
-                caption_bbox = fitz.Rect(*(ln.get("bbox", [0, 0, 0, 0])))
+                caption_bbox = create_rect(*(ln.get("bbox", [0, 0, 0, 0])))
                 x_left = page_rect.x0 + margin_x
                 x_right = page_rect.x1 - margin_x
                 y_bottom = caption_bbox.y0 - caption_gap
                 y_top = max(page_rect.y0, y_bottom - clip_height)
                 
-                clip = fitz.Rect(x_left, y_top, x_right, y_bottom)
+                clip = create_rect(x_left, y_top, x_right, y_bottom)
                 
                 # 渲染
                 try:

@@ -22,11 +22,7 @@ import re
 from collections import Counter
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
-# 尝试导入 fitz
-try:
-    import fitz
-except ImportError:
-    fitz = None  # type: ignore
+from .pdf_backend import PDFDocument, open_pdf, create_rect
 
 # 避免循环导入
 if TYPE_CHECKING:
@@ -60,17 +56,12 @@ def try_extract_text(pdf_path: str, out_text: Optional[str]) -> Optional[str]:
     Returns:
         输出文件路径，如果提取失败则返回 None
     """
-    if fitz is None:
-        logger.warning("PyMuPDF not available, cannot extract text")
-        return None
-    
     try:
-        doc = fitz.open(pdf_path)
         text_parts = []
-        for page in doc:
-            text_parts.append(page.get_text("text"))
+        with open_pdf(pdf_path) as doc:
+            for page in doc:
+                text_parts.append(page.get_text("text"))
         full_text = "\n\n".join(text_parts)
-        doc.close()
         
         if out_text:
             out_dir = os.path.dirname(out_text)
@@ -119,16 +110,9 @@ def pre_validate_pdf(pdf_path: str) -> "PDFValidationResult":
         )
     
     file_size_mb = os.path.getsize(pdf_path) / (1024 * 1024)
-    
-    if fitz is None:
-        return PDFValidationResult(
-            is_valid=False, page_count=0, has_text_layer=False,
-            text_layer_ratio=0.0, is_encrypted=False, pdf_version="",
-            file_size_mb=file_size_mb, warnings=[], errors=["PyMuPDF not available"]
-        )
-    
+
     try:
-        doc = fitz.open(pdf_path)
+        doc: PDFDocument = open_pdf(pdf_path)
     except Exception as e:
         return PDFValidationResult(
             is_valid=False, page_count=0, has_text_layer=False,
@@ -137,18 +121,19 @@ def pre_validate_pdf(pdf_path: str) -> "PDFValidationResult":
         )
     
     try:
-        page_count = len(doc)
-        is_encrypted = doc.is_encrypted
+        raw_doc = doc.raw
+        page_count = doc.page_count
+        is_encrypted = bool(getattr(raw_doc, "is_encrypted", False))
         
         try:
-            pdf_version = doc.metadata.get("format", "unknown") if doc.metadata else "unknown"
+            pdf_version = raw_doc.metadata.get("format", "unknown") if raw_doc.metadata else "unknown"
         except Exception as e:
             logger.warning(f"Failed to read PDF metadata: {e}", extra={'stage': 'pre_validate_pdf'})
             pdf_version = "unknown"
         
         if is_encrypted:
             try:
-                unlock_result = doc.authenticate("")
+                unlock_result = raw_doc.authenticate("")
                 if unlock_result:
                     warnings.append("PDF was encrypted but accessible with empty password")
                     is_encrypted = False
@@ -242,18 +227,9 @@ def gather_structured_text(
         GatheredText 结构化结果
     """
     from .models import GatheredParagraph, GatheredText
-    
-    if fitz is None:
-        return GatheredText(
-            version="1.0",
-            is_dual_column=False,
-            headers_removed=[],
-            footers_removed=[],
-            paragraphs=[]
-        )
-    
-    doc = fitz.open(pdf_path)
-    page_count = len(doc)
+
+    doc: PDFDocument = open_pdf(pdf_path)
+    page_count = doc.page_count
     
     all_blocks: List[Dict[str, Any]] = []
     header_candidates: List[str] = []
@@ -440,15 +416,12 @@ def extract_text_with_format(
         detect_vacant_regions,
     )
     
-    if fitz is None:
-        raise ImportError("PyMuPDF is required for extract_text_with_format")
-    
     if debug:
         print("\n" + "=" * 70)
         print("LAYOUT-DRIVEN EXTRACTION: Building Document Layout Model")
         print("=" * 70)
     
-    doc = fitz.open(pdf_path)
+    doc = open_pdf(pdf_path)
     
     page_rect = doc[0].rect
     page_size = (page_rect.width, page_rect.height)
@@ -495,7 +468,7 @@ def extract_text_with_format(
                     continue
                 
                 text = "".join(sp.get("text", "") for sp in spans)
-                bbox = fitz.Rect(ln["bbox"])
+                bbox = create_rect(*ln["bbox"])
                 
                 main_span = max(spans, key=lambda s: len(s.get("text", "")))
                 font_name = main_span.get("font", "unknown")
@@ -582,7 +555,7 @@ def extract_text_with_format(
     return layout_model
 
 
-def _estimate_typical_metrics(doc: "fitz.Document", debug: bool = False) -> Tuple[float, float, float]:
+def _estimate_typical_metrics(doc: Any, debug: bool = False) -> Tuple[float, float, float]:
     """
     估算文档的典型字号、行高和行距。
     

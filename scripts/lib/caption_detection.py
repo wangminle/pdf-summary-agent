@@ -17,13 +17,9 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
-# 尝试导入 fitz
-try:
-    import fitz
-except ImportError:
-    fitz = None  # type: ignore
+from .pdf_backend import PDFDocument, PDFPage, create_rect
 
 # 避免循环导入
 if TYPE_CHECKING:
@@ -40,7 +36,15 @@ logger = logging.getLogger(__name__)
 # 辅助函数
 # ============================================================================
 
-def get_page_images(page: "fitz.Page") -> List[Any]:
+def _unwrap_page(page: Union[PDFPage, Any]) -> Any:
+    return getattr(page, "raw", page)
+
+
+def _unwrap_doc(doc: Union[PDFDocument, Any]) -> Any:
+    return getattr(doc, "raw", doc)
+
+
+def get_page_images(page: Union[PDFPage, Any]) -> List[Any]:
     """
     提取页面中所有图像对象的边界框。
     
@@ -50,17 +54,15 @@ def get_page_images(page: "fitz.Page") -> List[Any]:
     Returns:
         fitz.Rect 列表
     """
-    if fitz is None:
-        return []
-    
     images: List[Any] = []
     try:
-        dict_data = page.get_text("dict")
+        raw_page = _unwrap_page(page)
+        dict_data = raw_page.get_text("dict")
         for blk in dict_data.get("blocks", []):
             if blk.get("type", 0) == 1 and "bbox" in blk:  # type=1 表示图像
-                images.append(fitz.Rect(*blk["bbox"]))
+                images.append(create_rect(*blk["bbox"]))
     except Exception as e:
-        page_no = getattr(page, "number", None)
+        page_no = getattr(_unwrap_page(page), "number", None)
         extra = {'stage': 'get_page_images'}
         if isinstance(page_no, int):
             extra['page'] = page_no + 1
@@ -68,7 +70,7 @@ def get_page_images(page: "fitz.Page") -> List[Any]:
     return images
 
 
-def get_page_drawings(page: "fitz.Page") -> List[Any]:
+def get_page_drawings(page: Union[PDFPage, Any]) -> List[Any]:
     """
     提取页面中所有绘图对象的边界框。
     
@@ -78,17 +80,15 @@ def get_page_drawings(page: "fitz.Page") -> List[Any]:
     Returns:
         fitz.Rect 列表
     """
-    if fitz is None:
-        return []
-    
     drawings: List[Any] = []
     try:
-        for dr in page.get_drawings():
+        raw_page = _unwrap_page(page)
+        for dr in raw_page.get_drawings():
             r = dr.get("rect")
-            if r and isinstance(r, fitz.Rect):
+            if r:
                 drawings.append(r)
     except Exception as e:
-        page_no = getattr(page, "number", None)
+        page_no = getattr(_unwrap_page(page), "number", None)
         extra = {'stage': 'get_page_drawings'}
         if isinstance(page_no, int):
             extra['page'] = page_no + 1
@@ -469,9 +469,9 @@ def score_caption_candidate(
 
 def select_best_caption(
     candidates: List["CaptionCandidate"],
-    page: "fitz.Page",
+    page: Union[PDFPage, Any],
     *,
-    doc: Optional["fitz.Document"] = None,
+    doc: Optional[Union[PDFDocument, Any]] = None,
     min_score_threshold: float = 25.0,
     debug: bool = False
 ) -> Optional["CaptionCandidate"]:
@@ -497,7 +497,8 @@ def select_best_caption(
         score_page = page
         if doc is not None:
             try:
-                score_page = doc[cand.page]
+                raw_doc = _unwrap_doc(doc)
+                score_page = raw_doc[cand.page]
             except Exception as e:
                 logger.warning(
                     f"Failed to access page {cand.page + 1} for caption scoring: {e}",
@@ -536,7 +537,7 @@ def select_best_caption(
 # ============================================================================
 
 def build_caption_index(
-    doc: "fitz.Document",
+    doc: Union[PDFDocument, Any],
     figure_pattern: Optional[re.Pattern] = None,
     table_pattern: Optional[re.Pattern] = None,
     debug: bool = False
@@ -580,8 +581,9 @@ def build_caption_index(
     
     all_candidates: Dict[str, List["CaptionCandidate"]] = {}
     
-    for pno in range(len(doc)):
-        page = doc[pno]
+    raw_doc = _unwrap_doc(doc)
+    for pno in range(len(raw_doc)):
+        page = raw_doc[pno]
         
         # 查找 Figure candidates
         if figure_pattern is not None:

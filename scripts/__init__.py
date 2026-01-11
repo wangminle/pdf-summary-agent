@@ -3,7 +3,10 @@
 """
 pdf-summary-agent/scripts 模块入口
 
-Commit 00: 补齐 scripts/ 兼容入口
+V0.3.x: 模块化重构完成版
+- lib/: 模块化组件库
+- core/: 核心入口
+- extract_pdf_assets.py: 兼容导出层
 """
 
-__version__ = "0.2.0"  # V2 重构版本
+__version__ = "0.3.1"  # V0.3.1 模块化完成版

@@ -255,10 +255,9 @@ def write_index_json(
             with open(pdf_path, 'rb') as f:
                 pdf_hash = f"sha256:{hashlib.sha256(f.read()).hexdigest()[:16]}"
             # 延迟导入以避免循环依赖
-            import fitz
-            doc = fitz.open(pdf_path)
-            pdf_pages = len(doc)
-            doc.close()
+            from .pdf_backend import open_pdf
+            with open_pdf(pdf_path) as doc:
+                pdf_pages = len(doc)
         except Exception as e:
             logger.warning(
                 f"Failed to compute PDF hash/pages: {e}",
